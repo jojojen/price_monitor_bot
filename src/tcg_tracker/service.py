@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
+import re
 import socket
 from pathlib import Path
 from typing import Protocol
@@ -141,6 +142,8 @@ class TcgPriceService:
                 offers.append(offer)
 
         offers.sort(key=self._offer_sort_key)
+        if spec.item_kind == "sealed_box":
+            offers = self._filter_sealed_box_offer_cluster(offers)
         return offers
 
     def seed_watchlist(
@@ -168,6 +171,8 @@ class TcgPriceService:
     def _can_calculate_fair_value(spec: TcgCardSpec, offers: tuple[MarketOffer, ...]) -> bool:
         if not offers:
             return False
+        if spec.item_kind == "sealed_box":
+            return True
         if spec.card_number:
             return True
         return len(TcgPriceService._variant_keys(offers)) == 1
@@ -183,6 +188,9 @@ class TcgPriceService:
 
         if not offers:
             notes.append("No matching offers were found on the current reference sources.")
+            if spec.item_kind == "sealed_box":
+                notes.append("Try adding the product line, such as booster pack or high-class pack, to narrow the box search.")
+                return tuple(notes)
             if not any((spec.card_number, spec.rarity, spec.set_code, spec.set_name)):
                 notes.append("Try adding card number, rarity, or set code to narrow the search.")
             return tuple(notes)
@@ -221,6 +229,27 @@ class TcgPriceService:
             normalize_text(offer.title),
         )
 
+    @staticmethod
+    def _filter_sealed_box_offer_cluster(offers: list[MarketOffer]) -> list[MarketOffer]:
+        if len(offers) <= 1:
+            return offers
+
+        clusters: dict[str, list[MarketOffer]] = {}
+        for offer in offers:
+            key = _sealed_box_cluster_key(offer.title)
+            clusters.setdefault(key, []).append(offer)
+
+        best_cluster = max(
+            clusters.values(),
+            key=lambda group: (
+                max(offer.score or 0.0 for offer in group),
+                len(group),
+                sum(offer.score or 0.0 for offer in group) / len(group),
+            ),
+        )
+        best_cluster.sort(key=TcgPriceService._offer_sort_key)
+        return best_cluster
+
 
 def _offer_summary(offer: MarketOffer) -> dict[str, object]:
     return {
@@ -234,3 +263,10 @@ def _offer_summary(offer: MarketOffer) -> dict[str, object]:
         "set_code": offer.attributes.get("version_code", "") or offer.attributes.get("set_code", ""),
         "score": offer.score,
     }
+
+
+def _sealed_box_cluster_key(title: str) -> str:
+    normalized = normalize_text(title)
+    normalized = re.sub(r"(未開封\s*box|box|ボックス)", "", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"[『』「」【】\[\]\(\)\-]", "", normalized)
+    return normalized.strip()

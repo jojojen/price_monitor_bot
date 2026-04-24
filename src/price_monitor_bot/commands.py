@@ -17,6 +17,7 @@ def build_card_spec(
     *,
     game: str,
     name: str,
+    item_kind: str = "card",
     card_number: str | None = None,
     rarity: str | None = None,
     set_code: str | None = None,
@@ -27,6 +28,7 @@ def build_card_spec(
     return TcgCardSpec(
         game=game,
         title=name,
+        item_kind=item_kind,
         card_number=card_number,
         rarity=rarity,
         set_code=set_code,
@@ -41,6 +43,7 @@ def lookup_card(
     db_path: str | Path,
     game: str,
     name: str,
+    item_kind: str = "card",
     card_number: str | None = None,
     rarity: str | None = None,
     set_code: str | None = None,
@@ -63,6 +66,7 @@ def lookup_card(
     spec = build_card_spec(
         game=game,
         name=name,
+        item_kind=item_kind,
         card_number=card_number,
         rarity=rarity,
         set_code=set_code,

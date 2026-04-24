@@ -130,6 +130,8 @@ class CardrushPokemonClient:
                 "set_code": parsed.set_code or "",
                 "image_alt": raw_text,
             }
+            if _looks_like_sealed_box_listing(raw_text):
+                attributes["product_kind"] = "sealed_box"
             if parsed.listing_count is not None:
                 attributes["listing_count"] = str(parsed.listing_count)
 
@@ -162,6 +164,11 @@ def _offer_summary(offer: MarketOffer) -> dict[str, object]:
         "rarity": offer.attributes.get("rarity", ""),
         "set_code": offer.attributes.get("version_code", "") or offer.attributes.get("set_code", ""),
     }
+
+
+def _looks_like_sealed_box_listing(text: str) -> bool:
+    lowered = text.lower()
+    return "未開封box" in lowered or "未開封 box" in lowered or "box" in lowered
 
 
 _LOG_LIMIT = 5

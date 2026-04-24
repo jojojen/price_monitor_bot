@@ -7,8 +7,26 @@ from market_monitor.normalize import normalize_card_number, normalize_text
 
 from .catalog import TcgCardSpec
 
+_SEALED_BOX_MARKERS = (
+    "未開封box",
+    "未開封 box",
+    "box",
+    "booster box",
+    "ブースターボックス",
+    "ボックス",
+)
+_SEALED_BOX_TOKEN_HINTS = {
+    "charizard": ("リザードン",),
+    "dream": ("ドリーム",),
+    "premium": ("プレミアム",),
+    "special": ("スペシャル",),
+    "starter": ("スターター",),
+}
+
 
 def minimum_match_score(spec: TcgCardSpec) -> float:
+    if spec.item_kind == "sealed_box":
+        return 30.0
     if spec.card_number:
         return 40.0
     if spec.rarity or spec.set_code:
@@ -17,6 +35,9 @@ def minimum_match_score(spec: TcgCardSpec) -> float:
 
 
 def score_tcg_offer(spec: TcgCardSpec, offer: MarketOffer) -> float:
+    if spec.item_kind == "sealed_box":
+        return _score_sealed_box_offer(spec, offer)
+
     title_norm = normalize_text(offer.title)
     alt_norm = normalize_text(offer.attributes.get("image_alt", ""))
     score = 0.0
@@ -66,6 +87,95 @@ def score_tcg_offer(spec: TcgCardSpec, offer: MarketOffer) -> float:
         if set_name_norm and set_name_norm in alt_norm:
             score += 8
 
+    return score
+
+
+def _score_sealed_box_offer(spec: TcgCardSpec, offer: MarketOffer) -> float:
+    title_norm = normalize_text(offer.title)
+    alt_norm = normalize_text(offer.attributes.get("image_alt", ""))
+    score = 0.0
+
+    canonical_title = normalize_text(spec.title)
+    title_signal = 0.0
+    if title_norm == canonical_title:
+        title_signal += 45
+    elif canonical_title and (canonical_title in title_norm or title_norm in canonical_title):
+        title_signal += 34
+    else:
+        title_signal += _shared_sealed_box_token_score(spec.title, offer.title)
+        title_signal += _shared_sealed_box_token_score(spec.title, offer.attributes.get("image_alt", ""))
+        if title_signal <= 0:
+            score -= 16
+    score += title_signal
+
+    for alias in spec.aliases:
+        alias_norm = normalize_text(alias)
+        if alias_norm and (alias_norm in title_norm or alias_norm in alt_norm):
+            score += 12
+
+    for keyword in spec.extra_keywords:
+        keyword_norm = normalize_text(keyword)
+        if keyword_norm and (keyword_norm in title_norm or keyword_norm in alt_norm):
+            score += 8
+
+    if _offer_looks_like_sealed_box(offer):
+        score += 32
+    else:
+        score -= 24
+
+    if offer.attributes.get("card_number"):
+        score -= 16
+
+    offer_set_code = normalize_text(offer.attributes.get("version_code", "") or offer.attributes.get("set_code", ""))
+    if spec.set_code:
+        if offer_set_code == normalize_text(spec.set_code):
+            score += 12
+        else:
+            score -= 4
+
+    if spec.set_name:
+        set_name_norm = normalize_text(spec.set_name)
+        if set_name_norm and (set_name_norm in title_norm or set_name_norm in alt_norm):
+            score += 8
+
+    if offer.attributes.get("is_graded") == "1":
+        score -= 40
+
+    return score
+
+
+def _offer_looks_like_sealed_box(offer: MarketOffer) -> bool:
+    if offer.attributes.get("product_kind") == "sealed_box":
+        return True
+    combined = normalize_text(" ".join(filter(None, (offer.title, offer.attributes.get("image_alt", "")))))
+    return any(marker in combined for marker in _SEALED_BOX_MARKERS)
+
+
+def _shared_sealed_box_token_score(left: str, right: str) -> float:
+    right_text = right or ""
+    left_tokens = {
+        token.lower()
+        for token in re.findall(r"[A-Za-z0-9]+", left or "")
+        if token and token.lower() not in {"box"}
+    }
+    right_tokens = {
+        token.lower()
+        for token in re.findall(r"[A-Za-z0-9]+", right or "")
+        if token and token.lower() not in {"box"}
+    }
+    score = 0.0
+    for token in left_tokens:
+        matched = token in right_tokens
+        if not matched:
+            matched = any(hint in right_text for hint in _SEALED_BOX_TOKEN_HINTS.get(token, ()))
+        if not matched:
+            continue
+        if len(token) >= 8:
+            score += 16
+        elif len(token) >= 4:
+            score += 10
+        elif token in {"ex", "gx", "v", "vmax", "vstar"}:
+            score += 4
     return score
 
 

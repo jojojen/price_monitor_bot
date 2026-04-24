@@ -6,6 +6,7 @@ from market_monitor.http import HttpClient
 from tcg_tracker.cardrush import CARDRUSH_PRODUCT_LIST_URL, CardrushPokemonClient
 from tcg_tracker.catalog import TcgCardSpec
 from tcg_tracker.magi import MAGI_PRODUCT_SEARCH_URL, MagiProductClient
+from tcg_tracker.search_terms import build_lookup_terms
 
 
 class FixtureHttpClient(HttpClient):
@@ -172,3 +173,74 @@ def test_magi_lookup_matches_pokemon_card_number() -> None:
     assert offers[0].price_jpy == 29000
     assert offers[0].attributes["card_number"] == "349/190"
     assert offers[0].attributes["rarity"] == "SAR"
+
+
+def test_cardrush_lookup_matches_pokemon_sealed_box() -> None:
+    CardrushPokemonClient.reset_temporary_disable()
+    spec = TcgCardSpec(
+        game="pokemon",
+        title="強化拡張パック ポケモンカード151",
+        item_kind="sealed_box",
+        set_code="sv2a",
+    )
+    html = """
+    <ul class="item_list">
+      <li class="list_item_cell">
+        <div class="item_data">
+          <a href="/product/46191">強化拡張パック『ポケモンカード151』(SV2a)【未開封BOX】{-} 70,800円 (税込) 在庫数 7点</a>
+        </div>
+      </li>
+      <li class="list_item_cell">
+        <div class="item_data">
+          <a href="/product/43870">ポケモンカード151 カードファイルセット フシギバナ・リザードン・カメックス【未開封BOX】{-} 9,980円 (税込) ×</a>
+        </div>
+      </li>
+    </ul>
+    """
+    client = CardrushPokemonClient(
+        FixtureHttpClient(
+            {
+                f"{CARDRUSH_PRODUCT_LIST_URL}?{urlencode({'keyword': term})}": html
+                for term in build_lookup_terms(spec)
+            }
+        )
+    )
+
+    offers = client.lookup(spec)
+
+    assert len(offers) == 1
+    assert offers[0].price_jpy == 70800
+    assert offers[0].attributes["product_kind"] == "sealed_box"
+    assert offers[0].attributes["set_code"] == "sv2a"
+    assert "70,800円" not in offers[0].title
+
+
+def test_magi_lookup_matches_pokemon_sealed_box() -> None:
+    spec = TcgCardSpec(
+        game="pokemon",
+        title="ハイクラスパック MEGAドリームex",
+        item_kind="sealed_box",
+    )
+    html = """
+    <div class="product-list__box">
+      <a href="/products/2915333">ハイクラスパック MEGAドリームex 未開封BOX ¥ 17,800 ~ 出品数 36</a>
+    </div>
+    <div class="product-list__box">
+      <a href="/products/447483">ゲンガーEX TD 010/049 ¥ 42,800 ~ 出品数 1</a>
+    </div>
+    """
+    client = MagiProductClient(
+        FixtureHttpClient(
+            {
+                f"{MAGI_PRODUCT_SEARCH_URL}?{urlencode({'forms_search_items[keyword]': term})}": html
+                for term in build_lookup_terms(spec)
+            }
+        )
+    )
+
+    offers = client.lookup(spec)
+
+    assert len(offers) == 1
+    assert offers[0].price_jpy == 17800
+    assert offers[0].attributes["product_kind"] == "sealed_box"
+    assert offers[0].attributes["card_number"] == ""

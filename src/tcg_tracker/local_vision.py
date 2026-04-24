@@ -20,6 +20,7 @@ _LOCAL_VISION_TIMEOUT_COOLDOWN_SECONDS = 15 * 60
 CARD_JSON_SCHEMA = {
     "type": "object",
     "properties": {
+        "item_kind": {"type": ["string", "null"]},
         "game": {"type": ["string", "null"]},
         "title": {"type": ["string", "null"]},
         "aliases": {
@@ -31,7 +32,7 @@ CARD_JSON_SCHEMA = {
         "set_code": {"type": ["string", "null"]},
         "confidence": {"type": ["number", "null"]},
     },
-    "required": ["game", "title", "aliases", "card_number", "rarity", "set_code", "confidence"],
+    "required": ["item_kind", "game", "title", "aliases", "card_number", "rarity", "set_code", "confidence"],
     "additionalProperties": False,
 }
 
@@ -46,6 +47,7 @@ class LocalVisionCardCandidate:
     card_number: str | None
     rarity: str | None
     set_code: str | None
+    item_kind: str | None = None
     confidence: float | None = None
     raw_response: str = ""
     warnings: tuple[str, ...] = ()
@@ -127,6 +129,19 @@ class OllamaLocalVisionClient:
             game_hint=game_hint,
         )
 
+    def analyze_sealed_box_title_focus(
+        self,
+        image_path: Path,
+        *,
+        game_hint: str | None = None,
+        title_hint: str | None = None,
+    ) -> LocalVisionCardCandidate | None:
+        return self._analyze_with_prompt(
+            image_path,
+            prompt=self._build_sealed_box_title_prompt(game_hint=game_hint, title_hint=title_hint),
+            game_hint=game_hint,
+        )
+
     def _analyze_with_prompt(
         self,
         image_path: Path,
@@ -153,6 +168,7 @@ class OllamaLocalVisionClient:
         return LocalVisionCardCandidate(
             backend=self.backend,
             model=self.model,
+            item_kind=_normalize_item_kind(candidate_payload.get("item_kind")),
             game=_normalize_game(candidate_payload.get("game"), fallback=game_hint),
             title=_normalize_text_field(candidate_payload.get("title")),
             aliases=_normalize_aliases(candidate_payload.get("aliases")),
@@ -171,16 +187,21 @@ class OllamaLocalVisionClient:
             hints.append(f"title_hint={title_hint}")
         hint_text = "\n".join(hints) if hints else "no external hints"
         return (
-            "Identify the trading card in this image and return only JSON.\n"
-            "If the image does not show exactly one identifiable trading card, return null for every card field instead of guessing.\n"
-            "Focus on the card name, game, card number, rarity, and set code.\n"
+            "Identify the main trading card product in this image and return only JSON.\n"
+            "The image may show either exactly one identifiable trading card or one sealed trading card box.\n"
+            "If the image does not show one clear card or one clear sealed box, return null for every field instead of guessing.\n"
+            "Use item_kind=card for a single card and item_kind=sealed_box for an unopened or box-style sealed product.\n"
+            "For sealed boxes, return the full product title and keep card_number and rarity null.\n"
+            "Do not merge multiple products from the same photo into one answer.\n"
             "Do not merge multiple cards from the same photo into one answer.\n"
-            "Prefer the printed card face and footer over slab labels whenever they disagree.\n"
+            "Prefer the printed product name and pack branding over slab labels whenever they disagree.\n"
             "Ignore slab grades, cert numbers, copyright lines, attack text, and rule text.\n"
             "Never use slab grade text as the card rarity.\n"
+            "For Japanese sealed Pokemon products, include the product line when visible, such as 強化拡張パック ポケモンカード151 or ハイクラスパック MEGAドリームex.\n"
             "Pokemon collector numbers should stay in full market-friendly form when visible, such as 201/165, 020/M-P, 085/SV-P, or 764/742.\n"
             "If a Pokemon promo card shows a set code and number separately, combine them into one card_number field like 085/SV-P.\n"
             "For Japanese Start Deck 100 Battle Collection slab labels such as MC JP #764, return 764/742 when the image supports that collector number.\n"
+            'Use item_kind values "card", "sealed_box", or null.\n'
             'Use game values "pokemon", "ws", or null.\n'
             "Preserve the Japanese title when visible.\n"
             "Use null for unknown values instead of guessing.\n"
@@ -203,6 +224,28 @@ class OllamaLocalVisionClient:
             "If you are unsure about the title, keep title null but still return card_number, rarity, and set_code when visible.\n"
             "For Pokemon cards, prefer collector numbers like 201/165, 110/080, 085/SV-P, or 020/M-P.\n"
             'Use game values "pokemon", "ws", or null.\n'
+            "Hints:\n"
+            f"{hint_text}\n"
+        )
+
+    def _build_sealed_box_title_prompt(self, *, game_hint: str | None, title_hint: str | None) -> str:
+        hints: list[str] = []
+        if game_hint in {"pokemon", "ws"}:
+            hints.append(f"game_hint={game_hint}")
+        if title_hint:
+            hints.append(f"title_hint={title_hint}")
+        hint_text = "\n".join(hints) if hints else "no external hints"
+        return (
+            "Read only the sealed trading card box product title from this image and return only JSON.\n"
+            "Assume the image shows one unopened trading card box or display box, not a single card.\n"
+            "Focus on the big printed product name on the front of the box.\n"
+            "Ignore chat captions, timestamps, UI chrome, seller overlays, copyright text, pack counts, and stock labels unless they are part of the official product title.\n"
+            "For sealed boxes, set item_kind=sealed_box, keep card_number and rarity null, and keep title null instead of guessing.\n"
+            "For Japanese Pokemon boxes, preserve the Japanese product line when visible, such as 強化拡張パック ポケモンカード151 or ハイクラスパック MEGAドリームex.\n"
+            "If only a strong numeric title like 151 is clearly visible, you may return that as title instead of inventing missing words.\n"
+            'Use item_kind values "sealed_box" or null.\n'
+            'Use game values "pokemon", "ws", or null.\n'
+            "aliases should contain only high-confidence alternate names.\n"
             "Hints:\n"
             f"{hint_text}\n"
         )
@@ -355,6 +398,13 @@ def _normalize_game(value: object, *, fallback: str | None) -> str | None:
         return normalized
     if fallback in {"pokemon", "ws"}:
         return fallback
+    return None
+
+
+def _normalize_item_kind(value: object) -> str | None:
+    normalized = _normalize_text_field(value)
+    if normalized in {"card", "sealed_box"}:
+        return normalized
     return None
 
 

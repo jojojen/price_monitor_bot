@@ -64,6 +64,36 @@ FULL_TEXT_RARITY_MAP = {
     "ILLUSTRATION RARE": "AR",
 }
 
+SEALED_BOX_STRONG_MARKERS = (
+    "未開封BOX",
+    "未開封 BOX",
+    "未開封ボックス",
+    "BOOSTER BOX",
+    "BOX",
+    "ボックス",
+)
+SEALED_BOX_PRODUCT_MARKERS = (
+    "強化拡張パック",
+    "拡張パック",
+    "ハイクラスパック",
+    "スタートデッキ",
+    "スターターセット",
+    "デッキビルドBOX",
+    "デッキビルド BOX",
+    "カードファイルセット",
+    "ランダム",
+    "入り",
+)
+SEALED_BOX_NOISE_PATTERNS = (
+    "ポケモンカードゲーム",
+    "スカーレット",
+    "バイオレット",
+    "ランダム",
+    "入り",
+    "BOX",
+    "未開封",
+)
+
 BLOCKED_NAME_PATTERNS = (
     "POKEMON", "GEM MT", "PSA", "CERT", "TEXTURE", "SPECIAL ART RARE",
     "ILLUSTRATION RARE", "NINTENDO", "CREATURE", "GAME FREAK", "GAMEFREAK",
@@ -95,6 +125,7 @@ class ParsedCardImage:
     set_code: str | None
     raw_text: str
     extracted_lines: tuple[str, ...]
+    item_kind: str = "card"
     warnings: tuple[str, ...] = ()
 
     def to_spec(self) -> TcgCardSpec | None:
@@ -103,6 +134,7 @@ class ParsedCardImage:
         return TcgCardSpec(
             game=self.game,
             title=self.title,
+            item_kind=self.item_kind,
             card_number=self.card_number,
             rarity=self.rarity,
             set_code=self.set_code,
@@ -246,6 +278,10 @@ class TcgImagePriceService:
             if vision_candidate is not None:
                 parsed = _merge_local_vision_candidate(parsed, vision_candidate)
         warnings = _dedupe_preserve_order([*warnings, *parsed.warnings])
+        if parsed.status == "success" and parsed.title is not None:
+            warnings = [warning for warning in warnings if warning != "Could not confidently extract a card name from the image."]
+        if parsed.status == "success" and parsed.game is not None:
+            warnings = [warning for warning in warnings if warning != "Could not determine whether the card belongs to pokemon or ws."]
         status = parsed.status
         if status == "success" and parsed.to_spec() is None:
             status = "unresolved"
@@ -259,6 +295,7 @@ class TcgImagePriceService:
             set_code=parsed.set_code,
             raw_text=parsed.raw_text,
             extracted_lines=parsed.extracted_lines,
+            item_kind=parsed.item_kind,
             warnings=tuple(warnings),
         )
 
@@ -267,9 +304,11 @@ class TcgImagePriceService:
             return False
         if parsed.game is None:
             return True
-        if parsed.card_number is None:
-            return True
         if parsed.title is None:
+            return True
+        if parsed.item_kind == "sealed_box":
+            return not _sealed_box_title_looks_usable(parsed.title)
+        if parsed.card_number is None:
             return True
         if _pokemon_ocr_metadata_looks_suspicious(parsed):
             return True
@@ -358,6 +397,18 @@ class TcgImagePriceService:
             if candidate is not None:
                 candidate = _sanitize_local_vision_candidate(candidate)
 
+            box_title_candidate = None
+            if self._should_try_sealed_box_title_probe(parsed, candidate):
+                box_title_candidate, box_title_warnings = self._run_sealed_box_title_probe(
+                    client,
+                    image_path,
+                    game_hint=game_hint,
+                    title_hint=title_hint,
+                )
+                warnings.extend(box_title_warnings)
+                if box_title_candidate is not None:
+                    box_title_candidate = _sanitize_local_vision_candidate(box_title_candidate)
+
             footer_candidate = None
             if self._should_try_footer_metadata_probe(parsed, candidate, game_hint=game_hint):
                 footer_candidate, footer_warnings = self._run_footer_metadata_probe(
@@ -371,6 +422,8 @@ class TcgImagePriceService:
                     footer_candidate = _sanitize_local_vision_candidate(footer_candidate)
 
             selected_candidates: list[LocalVisionCardCandidate] = []
+            if box_title_candidate is not None:
+                selected_candidates.append(box_title_candidate)
             if footer_candidate is not None and _should_prefer_footer_metadata_candidate(candidate, footer_candidate):
                 logger.info(
                     "Local vision footer metadata candidate selected image=%s backend=%s generic_card_number=%s footer_card_number=%s",
@@ -398,7 +451,7 @@ class TcgImagePriceService:
                 warnings.extend(selected_candidate.warnings)
             should_stop_after_footer_metadata = (
                 footer_candidate is not None
-                and selected_candidates == [footer_candidate]
+                and selected_candidates == ([box_title_candidate, footer_candidate] if box_title_candidate is not None else [footer_candidate])
                 and (
                     parsed.title is None
                     or not _title_looks_usable(parsed.title)
@@ -423,6 +476,8 @@ class TcgImagePriceService:
         *,
         game_hint: str | None,
     ) -> bool:
+        if parsed.item_kind == "sealed_box" or (candidate is not None and candidate.item_kind == "sealed_box"):
+            return False
         if game_hint != "pokemon":
             return False
         if _pokemon_ocr_metadata_looks_suspicious(parsed):
@@ -434,6 +489,73 @@ class TcgImagePriceService:
         if candidate is None:
             return True
         return _card_number_quality("pokemon", candidate.card_number) < 4
+
+    def _should_try_sealed_box_title_probe(
+        self,
+        parsed: ParsedCardImage,
+        candidate: LocalVisionCardCandidate | None,
+    ) -> bool:
+        if parsed.item_kind != "sealed_box" and (candidate is None or candidate.item_kind != "sealed_box"):
+            return False
+        if _sealed_box_title_looks_usable(parsed.title):
+            return False
+        if candidate is not None and _sealed_box_title_looks_usable(candidate.title):
+            return False
+        return True
+
+    def _run_sealed_box_title_probe(
+        self,
+        client,
+        image_path: Path,
+        *,
+        game_hint: str | None,
+        title_hint: str | None,
+    ) -> tuple[LocalVisionCardCandidate | None, tuple[str, ...]]:
+        probe = getattr(client, "analyze_sealed_box_title_focus", None)
+        if not callable(probe):
+            return None, ()
+        started_at = time.monotonic()
+        logger.info(
+            "Local vision sealed box title probe starting image=%s backend=%s game_hint=%s title_hint=%s",
+            image_path,
+            client.descriptor,
+            game_hint,
+            title_hint,
+        )
+        try:
+            candidate = probe(
+                image_path,
+                game_hint=game_hint,
+                title_hint=title_hint,
+            )
+        except LocalVisionTimeoutError as exc:
+            logger.warning(
+                "Local vision sealed box title probe timed out image=%s backend=%s elapsed_seconds=%.2f timeout_seconds=%s error=%s",
+                image_path,
+                client.descriptor,
+                time.monotonic() - started_at,
+                exc.timeout_seconds,
+                exc.detail,
+            )
+            return None, (f"Sealed box title probe via {client.descriptor} timed out.",)
+        except Exception:
+            logger.exception("Local vision sealed box title probe failed image=%s backend=%s", image_path, client.descriptor)
+            return None, (f"Sealed box title probe via {client.descriptor} failed.",)
+
+        logger.info(
+            "Local vision sealed box title probe completed image=%s backend=%s elapsed_seconds=%.2f candidate_game=%s candidate_title=%s candidate_set_code=%s",
+            image_path,
+            client.descriptor,
+            time.monotonic() - started_at,
+            None if candidate is None else candidate.game,
+            None if candidate is None else candidate.title,
+            None if candidate is None else candidate.set_code,
+        )
+        if candidate is None:
+            return None, ()
+        if candidate.item_kind is None:
+            candidate = replace(candidate, item_kind="sealed_box")
+        return candidate, (f"Ran sealed box title probe via {client.descriptor}.",)
 
     def _run_footer_metadata_probe(
         self,
@@ -521,6 +643,10 @@ class TcgImagePriceService:
         spec = parsed.to_spec()
         if parsed.status == "unavailable":
             return parsed, spec
+        if parsed.item_kind == "sealed_box":
+            if spec is not None and _sealed_box_title_looks_usable(spec.title):
+                return parsed, spec
+            return parsed, None
 
         resolved_spec = self._resolve_spec_from_ocr_metadata(parsed)
         if resolved_spec is not None:
@@ -747,6 +873,8 @@ class TcgImagePriceService:
     def _lookup_with_hot_card_fallback(self, spec: TcgCardSpec, *, persist: bool) -> TcgLookupResult:
         service = TcgPriceService(db_path=self._db_path)
         initial = service.lookup(spec, persist=False)
+        if spec.item_kind == "sealed_box":
+            return service.lookup(spec, persist=persist) if persist and initial.offers else initial
         if initial.offers:
             return service.lookup(spec, persist=persist) if persist else initial
 
@@ -876,9 +1004,9 @@ def parse_image_caption_hints(caption: str | None) -> tuple[str | None, str | No
 
     game_hint = tokens[0].lower() if tokens[0].lower() in {"pokemon", "ws"} else None
     if game_hint is not None:
-        title_hint = " ".join(tokens[1:]).strip() or None
+        title_hint = _sanitize_image_title_hint(" ".join(tokens[1:]).strip() or None)
         return game_hint, title_hint
-    return None, content
+    return None, _sanitize_image_title_hint(content)
 
 
 def parse_tcg_ocr_text(
@@ -894,24 +1022,36 @@ def parse_tcg_ocr_text(
     slab_set_code, slab_rarity, _ = _extract_slab_label_metadata(lines)
     english_name = _pick_best_title(lines, prefer_japanese=False)
     preferred_name = _pick_best_title(lines, prefer_japanese=True)
-    title = (
-        preferred_name
-        if preferred_name is not None and _title_looks_clean_japanese(preferred_name)
-        else slab_title or english_name or preferred_name
-    )
-    if title_hint and _title_looks_usable(title_hint):
-        title = title_hint
-
     card_number, number_rarity = _extract_card_number_and_rarity(lines)
     game = _detect_game(normalized_text, lines, game_hint=game_hint, card_number=card_number)
     extracted_rarity = number_rarity or _extract_rarity(normalized_text)
     rarity = _coalesce_rarity(game, extracted_rarity, slab_rarity)
     set_code = _extract_set_code(normalized_text) or slab_set_code
+    item_kind = "card"
+
+    title = (
+        preferred_name
+        if preferred_name is not None and _title_looks_clean_japanese(preferred_name)
+        else slab_title or english_name or preferred_name
+    )
+    sanitized_title_hint = _sanitize_image_title_hint(title_hint)
+    if _looks_like_sealed_box_image(normalized_text, lines, card_number=card_number):
+        item_kind = "sealed_box"
+        rarity = None
+        card_number = None
+        title = _extract_sealed_box_title(
+            lines,
+            title_hint=sanitized_title_hint,
+            preferred_name=preferred_name,
+            english_name=english_name,
+        )
+    elif sanitized_title_hint and _title_looks_usable(sanitized_title_hint):
+        title = sanitized_title_hint
 
     aliases = tuple(
         alias
         for alias in _dedupe_preserve_order(
-            [title_hint or "", english_name or ""]
+            [sanitized_title_hint or "", english_name or ""]
         )
         if alias and alias != title
     )
@@ -934,8 +1074,148 @@ def parse_tcg_ocr_text(
         set_code=set_code,
         raw_text=normalized_text,
         extracted_lines=tuple(lines),
+        item_kind=item_kind,
         warnings=tuple(warnings),
     )
+
+
+def _looks_like_sealed_box_image(
+    normalized_text: str,
+    lines: list[str],
+    *,
+    card_number: str | None,
+) -> bool:
+    if card_number is not None:
+        return False
+
+    upper_text = normalized_text.upper()
+    if any(marker in upper_text for marker in SEALED_BOX_STRONG_MARKERS):
+        return True
+
+    signal_count = sum(
+        1
+        for marker in SEALED_BOX_PRODUCT_MARKERS
+        if marker in normalized_text
+    )
+    if signal_count >= 2:
+        return True
+
+    if signal_count >= 1 and any(_looks_like_box_title_line(line) for line in lines):
+        return True
+    return False
+
+
+def _extract_sealed_box_title(
+    lines: list[str],
+    *,
+    title_hint: str | None,
+    preferred_name: str | None,
+    english_name: str | None,
+) -> str | None:
+    if title_hint and _sealed_box_title_looks_usable(title_hint):
+        return title_hint
+
+    pack_marker = next((line.strip() for line in lines if _looks_like_pack_marker_line(line)), None)
+    for line in lines:
+        if not _looks_like_box_title_line(line):
+            continue
+        cleaned = _clean_sealed_box_title_line(line)
+        if not cleaned or not _sealed_box_title_looks_usable(cleaned):
+            continue
+        if pack_marker and cleaned == pack_marker:
+            continue
+        if pack_marker and pack_marker not in cleaned:
+            return f"{pack_marker} {cleaned}".strip()
+        return cleaned
+
+    for fallback in (preferred_name, english_name):
+        if fallback and _sealed_box_title_looks_usable(fallback):
+            if pack_marker and pack_marker not in fallback:
+                return f"{pack_marker} {fallback}".strip()
+            return fallback
+    return None
+
+
+def _looks_like_pack_marker_line(line: str) -> bool:
+    compact = re.sub(r"\s+", "", line)
+    return any(marker.replace(" ", "") in compact for marker in SEALED_BOX_PRODUCT_MARKERS[:8])
+
+
+def _looks_like_box_title_line(line: str) -> bool:
+    cleaned = line.strip()
+    if not cleaned or len(cleaned) < 3:
+        return False
+    if any(char.isdigit() for char in cleaned) and "/" in cleaned:
+        return False
+    if any(
+        marker in cleaned
+        for marker in ("ポケモンカードゲーム", "スカーレット", "バイオレット", "ランダム", "入り", "©", "Nintendo", "Creatures", "GAME FREAK")
+    ):
+        return False
+    if any(marker in cleaned for marker in ("ポケモンカード", "拡張パック", "ハイクラスパック", "スタートデッキ", "スターターセット")):
+        return True
+    return _sealed_box_title_looks_usable(cleaned)
+
+
+def _clean_sealed_box_title_line(line: str) -> str:
+    cleaned = unicodedata.normalize("NFKC", line)
+    cleaned = re.sub(r"[【\[].*?(未開封\s*BOX|未開封BOX|BOX).*?[】\]]", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\(?SV\d+[A-Z]?\)?", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\(?M\d+[A-Z]?\)?", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\d+\s*枚入り", "", cleaned)
+    cleaned = re.sub(r"ランダム\s*\d+\s*枚入り", "", cleaned)
+    cleaned = cleaned.replace("ポケモンカードゲーム", "").replace("スカーレット&バイオレット", "")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -{}[]【】「」『』")
+    for noise in SEALED_BOX_NOISE_PATTERNS:
+        cleaned = cleaned.replace(noise, "").strip()
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -{}[]【】「」『』")
+    return cleaned.strip()
+
+
+def _sanitize_image_title_hint(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = re.sub(r"\s+", " ", value).strip()
+    if not cleaned:
+        return None
+
+    normalized = normalize_text(cleaned)
+    if not normalized:
+        return None
+
+    blocked_fragments = (
+        "查這個",
+        "查这个",
+        "這個box",
+        "这个box",
+        "這個盒",
+        "这个盒",
+        "box價格",
+        "box价格",
+        "市價",
+        "市价",
+        "價格",
+        "价格",
+        "多少錢",
+        "多少钱",
+        "幫我查",
+        "帮我查",
+        "查一下",
+        "看一下",
+        "price",
+        "worth",
+        "value",
+        "how much",
+        "this box",
+        "this card",
+    )
+    if any(fragment in normalized for fragment in blocked_fragments):
+        return None
+
+    # Very short generic hints like just "box" or "card" create noisy searches.
+    if normalized in {"box", "card", "盒", "卡", "boxprice"}:
+        return None
+    return cleaned
 
 
 def _resolve_tesseract_path(configured_path: str | None) -> str | None:
@@ -1496,11 +1776,90 @@ def _title_looks_usable(value: str) -> bool:
     return True
 
 
+def _sealed_box_title_looks_usable(value: str | None) -> bool:
+    if value is None:
+        return False
+    stripped = value.strip()
+    if not stripped or not _title_looks_usable(stripped):
+        return False
+    cleaned = _clean_sealed_box_title_line(stripped)
+    if not cleaned:
+        return False
+    compact_cleaned = re.sub(r"\s+", "", cleaned)
+    generic_compacts = {
+        marker.replace(" ", "")
+        for marker in (*SEALED_BOX_PRODUCT_MARKERS, *SEALED_BOX_STRONG_MARKERS)
+    }
+    if compact_cleaned in generic_compacts:
+        return False
+    if _contains_japanese(cleaned):
+        return len(compact_cleaned) >= 3
+
+    ascii_tokens = re.findall(r"[A-Za-z0-9]+", cleaned)
+    if not ascii_tokens:
+        return False
+
+    lowered_tokens = [token.lower() for token in ascii_tokens]
+    if len(ascii_tokens) == 1:
+        token = ascii_tokens[0]
+        if token.isdigit():
+            return len(token) >= 3
+        if re.fullmatch(r"(sv|s|sm|bw|xy|m)\d{1,3}[a-z]?", token.lower()):
+            return False
+        if re.fullmatch(r"[A-Za-z]{1,2}\d{1,3}[A-Za-z]?", token):
+            return False
+        return len(token) >= 8
+
+    has_numeric_signal = any(any(char.isdigit() for char in token) for token in ascii_tokens)
+    has_long_word = any(len(token) >= 5 for token in ascii_tokens)
+    long_word_count = sum(1 for token in ascii_tokens if len(token) >= 4)
+    tiny_word_count = sum(1 for token in ascii_tokens if len(token) <= 2)
+    strong_keyword = any(token in {"box", "pokemon", "dream", "charizard", "reshiram", "premium", "collection"} for token in lowered_tokens)
+    gameplay_keyword = any(token.upper() in {"EX", "GX", "VMAX", "VSTAR"} for token in ascii_tokens)
+
+    if len(ascii_tokens) == 2 and all(len(token) <= 3 for token in ascii_tokens):
+        return False
+    if tiny_word_count >= len(ascii_tokens) - 1 and not has_numeric_signal and not gameplay_keyword:
+        return False
+    if long_word_count == 0 and not has_numeric_signal and not gameplay_keyword:
+        return False
+    return has_numeric_signal or has_long_word or strong_keyword or gameplay_keyword or long_word_count >= 2
+
+
 def _merge_local_vision_candidate(
     parsed: ParsedCardImage,
     candidate: LocalVisionCardCandidate,
 ) -> ParsedCardImage:
     candidate = _sanitize_local_vision_candidate(candidate)
+    if candidate.item_kind == "sealed_box":
+        aliases = _dedupe_preserve_order([*parsed.aliases, *candidate.aliases])
+        parsed_title_usable = _sealed_box_title_looks_usable(parsed.title)
+        titles_compatible = _local_vision_metadata_is_compatible(parsed, candidate)
+        title = parsed.title
+        if _sealed_box_title_looks_usable(candidate.title):
+            if not parsed_title_usable or titles_compatible:
+                title = candidate.title
+            elif titles_compatible and candidate.title not in aliases:
+                aliases.append(candidate.title)
+        if parsed.title and title != parsed.title and parsed.title not in aliases:
+            aliases.append(parsed.title)
+        warnings = _dedupe_preserve_order(
+            [*parsed.warnings, *candidate.warnings, f"Applied local vision fallback via {candidate.descriptor}."]
+        )
+        status = "success" if (parsed.game or candidate.game) is not None and _sealed_box_title_looks_usable(title) else "unresolved"
+        return replace(
+            parsed,
+            status=status,
+            game=parsed.game or candidate.game,
+            title=title,
+            aliases=tuple(aliases),
+            card_number=None,
+            rarity=None,
+            set_code=candidate.set_code or parsed.set_code,
+            item_kind="sealed_box",
+            warnings=tuple(warnings),
+        )
+
     metadata_compatible = _local_vision_metadata_is_compatible(parsed, candidate)
     aliases = _dedupe_preserve_order([*parsed.aliases, *candidate.aliases])
     title = parsed.title
@@ -1577,6 +1936,7 @@ def _merge_local_vision_candidate(
         card_number=card_number,
         rarity=rarity,
         set_code=set_code,
+        item_kind=parsed.item_kind,
         warnings=tuple(warnings),
     )
 
@@ -1609,6 +1969,8 @@ def _select_best_local_vision_candidate(
 def _local_vision_candidate_is_complete(candidate: LocalVisionCardCandidate) -> bool:
     if candidate.game not in {"pokemon", "ws"}:
         return False
+    if candidate.item_kind == "sealed_box":
+        return _sealed_box_title_looks_usable(candidate.title)
     if candidate.title is None or not _title_looks_usable(candidate.title):
         return False
     if candidate.game == "pokemon":
@@ -1618,9 +1980,13 @@ def _local_vision_candidate_is_complete(candidate: LocalVisionCardCandidate) -> 
 
 def _score_local_vision_candidate(candidate: LocalVisionCardCandidate) -> float:
     score = 0.0
+    if candidate.item_kind == "sealed_box":
+        score += 18.0
     if candidate.game in {"pokemon", "ws"}:
         score += 20.0
-    if candidate.title and _title_looks_usable(candidate.title):
+    if candidate.item_kind == "sealed_box" and _sealed_box_title_looks_usable(candidate.title):
+        score += 40.0
+    elif candidate.title and _title_looks_usable(candidate.title):
         score += 40.0
     elif candidate.title:
         score += 8.0
@@ -1640,8 +2006,14 @@ def _local_vision_candidates_are_compatible(
     left: LocalVisionCardCandidate,
     right: LocalVisionCardCandidate,
 ) -> bool:
+    if left.item_kind and right.item_kind and left.item_kind != right.item_kind:
+        return False
     if left.game and right.game and left.game != right.game:
         return False
+    if left.item_kind == "sealed_box" and right.item_kind == "sealed_box":
+        if left.title and right.title:
+            return normalize_text(left.title) == normalize_text(right.title)
+        return True
     if left.card_number and right.card_number:
         return normalize_card_number(left.card_number) == normalize_card_number(right.card_number)
     if left.title and right.title:
@@ -1694,6 +2066,7 @@ def _merge_local_vision_candidates(
         card_number=primary.card_number if _card_number_quality(primary.game, primary.card_number) >= _card_number_quality(primary.game, secondary.card_number) else secondary.card_number,
         rarity=primary.rarity if _rarity_quality(primary.rarity) >= _rarity_quality(secondary.rarity) else secondary.rarity,
         set_code=primary.set_code if _set_code_quality(primary.set_code) >= _set_code_quality(secondary.set_code) else secondary.set_code,
+        item_kind=primary.item_kind or secondary.item_kind,
         confidence=confidence,
         raw_response=primary.raw_response or secondary.raw_response,
         warnings=tuple(warnings),
@@ -1701,6 +2074,14 @@ def _merge_local_vision_candidates(
 
 
 def _sanitize_local_vision_candidate(candidate: LocalVisionCardCandidate) -> LocalVisionCardCandidate:
+    if candidate.item_kind == "sealed_box":
+        return replace(
+            candidate,
+            title=candidate.title if _sealed_box_title_looks_usable(candidate.title) else None,
+            card_number=None,
+            rarity=None,
+            set_code=_canonicalize_pokemon_set_code(candidate.set_code) if candidate.game == "pokemon" else candidate.set_code,
+        )
     if candidate.game != "pokemon":
         return candidate
     set_code = _canonicalize_pokemon_set_code(candidate.set_code)
@@ -1862,6 +2243,13 @@ def _local_vision_metadata_is_compatible(
     parsed: ParsedCardImage,
     candidate: LocalVisionCardCandidate,
 ) -> bool:
+    if parsed.item_kind == "sealed_box" or candidate.item_kind == "sealed_box":
+        if _sealed_box_title_looks_usable(parsed.title) and _sealed_box_title_looks_usable(candidate.title):
+            parsed_name = normalize_text(parsed.title)
+            candidate_name = normalize_text(candidate.title)
+            if parsed_name and candidate_name:
+                return parsed_name == candidate_name or parsed_name in candidate_name or candidate_name in parsed_name
+        return True
     if not (parsed.title and _title_looks_usable(parsed.title)):
         return True
     if not (candidate.title and _title_looks_usable(candidate.title)):
@@ -1931,7 +2319,8 @@ def _lookup_hint_matches_spec_metadata(spec: TcgCardSpec, hint) -> bool:
 
 def _parsed_matches_spec(parsed: ParsedCardImage, spec: TcgCardSpec) -> bool:
     return (
-        parsed.game == spec.game
+        parsed.item_kind == spec.item_kind
+        and parsed.game == spec.game
         and parsed.title == spec.title
         and parsed.card_number == spec.card_number
         and parsed.rarity == spec.rarity
@@ -1959,6 +2348,7 @@ def _apply_spec_to_parsed(
         card_number=spec.card_number,
         rarity=spec.rarity,
         set_code=spec.set_code,
+        item_kind=spec.item_kind,
         warnings=tuple(warnings),
     )
 

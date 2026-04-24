@@ -31,6 +31,11 @@ def test_parse_image_caption_hints_supports_scan_prefix() -> None:
     assert parse_image_caption_hints(None) == (None, None)
 
 
+def test_parse_image_caption_hints_ignores_generic_price_request_text() -> None:
+    assert parse_image_caption_hints("查這個box市價") == (None, None)
+    assert parse_image_caption_hints("/scan pokemon 查這個box市價") == ("pokemon", None)
+
+
 def test_parse_tcg_ocr_text_extracts_charizard_reference_fields() -> None:
     raw_text = "\n".join(
         [
@@ -192,6 +197,46 @@ def test_parse_tcg_ocr_text_extracts_pokemon_promo_footer_codes() -> None:
     assert parsed.title == "Pikachu with Grey Felt Hat"
     assert parsed.card_number == "085/SV-P"
     assert parsed.set_code == "svp"
+
+
+def test_parse_tcg_ocr_text_detects_pokemon_sealed_box() -> None:
+    raw_text = "\n".join(
+        [
+            "ポケモンカードゲーム スカーレット&バイオレット",
+            "強化拡張パック",
+            "ポケモンカード151",
+            "ランダム7枚入り",
+            "SV2a",
+        ]
+    )
+
+    parsed = parse_tcg_ocr_text(raw_text, game_hint="pokemon")
+
+    assert parsed.status == "success"
+    assert parsed.game == "pokemon"
+    assert parsed.item_kind == "sealed_box"
+    assert parsed.title == "強化拡張パック ポケモンカード151"
+    assert parsed.card_number is None
+    assert parsed.rarity is None
+    assert parsed.set_code == "sv2a"
+
+
+def test_parse_tcg_ocr_text_rejects_gibberish_sealed_box_title() -> None:
+    raw_text = "\n".join(
+        [
+            "ポケモンカードゲーム スカーレット&バイオレット",
+            "強化拡張パック",
+            "mw Om",
+            "s29n",
+            "ランダム7枚入り",
+        ]
+    )
+
+    parsed = parse_tcg_ocr_text(raw_text, game_hint="pokemon")
+
+    assert parsed.item_kind == "sealed_box"
+    assert parsed.title is None
+    assert parsed.status == "unresolved"
 
 
 def test_parse_tcg_ocr_text_accepts_special_collection_number() -> None:
@@ -405,6 +450,68 @@ def test_lookup_image_uses_card_number_placeholder_to_recover_title(monkeypatch,
     assert any("Resolved the card title from OCR metadata fallback" in warning for warning in outcome.warnings)
     assert calls[0].title == "201/165"
     assert calls[-1].title == CHARIZARD_JP
+
+
+def test_lookup_image_supports_sealed_box_products(monkeypatch, tmp_path) -> None:
+    class StubService:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def lookup(self, spec: TcgCardSpec, *, persist: bool = True) -> TcgLookupResult:
+            offer = MarketOffer(
+                source="magi",
+                listing_id="box-151",
+                url="https://example.com/box-151",
+                title="強化拡張パック ポケモンカード151 未開封BOX",
+                price_jpy=70000,
+                price_kind="market",
+                captured_at=datetime.now(timezone.utc),
+                source_category="marketplace",
+                attributes={"product_kind": "sealed_box", "set_code": "sv2a"},
+            )
+            item = TrackedItem(
+                item_id="tcg-box-151",
+                item_type="tcg_sealed_box",
+                category="tcg",
+                title=spec.title,
+                attributes={"game": "pokemon", "item_kind": "sealed_box", "set_code": "sv2a"},
+            )
+            fair_value = FairValueEstimate(
+                item_id="tcg-box-151",
+                amount_jpy=70000,
+                confidence=0.8,
+                sample_count=1,
+                reasoning=("stub",),
+            )
+            return TcgLookupResult(spec=spec, item=item, offers=(offer,), fair_value=fair_value, notes=())
+
+    monkeypatch.setattr("tcg_tracker.image_lookup.TcgPriceService", StubService)
+
+    service = TcgImagePriceService(
+        db_path=tmp_path / "monitor.sqlite3",
+        tesseract_path="C:/missing/tesseract.exe",
+    )
+    parsed = ParsedCardImage(
+        status="success",
+        game="pokemon",
+        title="強化拡張パック ポケモンカード151",
+        aliases=("ポケモンカード151",),
+        card_number=None,
+        rarity=None,
+        set_code="sv2a",
+        raw_text="強化拡張パック\nポケモンカード151\nSV2a",
+        extracted_lines=("強化拡張パック", "ポケモンカード151", "SV2a"),
+        item_kind="sealed_box",
+        warnings=(),
+    )
+    monkeypatch.setattr(service, "parse_image", lambda *args, **kwargs: parsed)
+
+    outcome = service.lookup_image(tmp_path / "telegram-upload-box.jpg", persist=False)
+
+    assert outcome.status == "success"
+    assert outcome.lookup_result is not None
+    assert outcome.lookup_result.spec.item_kind == "sealed_box"
+    assert outcome.lookup_result.spec.title == "強化拡張パック ポケモンカード151"
 
 
 def test_lookup_image_trusts_card_number_recovery_when_title_is_unusable(monkeypatch, tmp_path) -> None:
@@ -859,6 +966,86 @@ def test_parse_image_escalates_when_first_local_vision_candidate_looks_slab_deri
     assert any("Applied local vision fallback via ollama:gemma3:12b." in warning for warning in parsed.warnings)
 
 
+def test_parse_image_uses_sealed_box_title_probe_when_box_title_is_weak(monkeypatch, tmp_path) -> None:
+    image_path = tmp_path / "telegram-upload-box.jpg"
+    image_path.write_bytes(b"fake-image")
+
+    service = TcgImagePriceService(
+        db_path=tmp_path / "monitor.sqlite3",
+        tesseract_path=str(tmp_path / "tesseract.exe"),
+    )
+    service._tesseract_path = "tesseract"
+    monkeypatch.setattr(
+        service,
+        "_extract_text",
+        lambda _image_path: (
+            "\n".join(
+                [
+                    "ポケモンカードゲーム スカーレット&バイオレット",
+                    "強化拡張パック",
+                    "mw Om",
+                    "s29n",
+                    "ランダム7枚入り",
+                ]
+            ),
+            (),
+        ),
+    )
+
+    class StubVisionClient:
+        descriptor = "ollama:gemma3:12b"
+
+        def analyze_card_image(
+            self,
+            image_path: Path,
+            *,
+            game_hint: str | None = None,
+            title_hint: str | None = None,
+        ) -> LocalVisionCardCandidate:
+            return LocalVisionCardCandidate(
+                backend="ollama",
+                model="gemma3:12b",
+                game="pokemon",
+                title="mw Om",
+                aliases=(),
+                card_number=None,
+                rarity=None,
+                set_code="s29n",
+                item_kind="sealed_box",
+                confidence=0.62,
+            )
+
+        def analyze_sealed_box_title_focus(
+            self,
+            image_path: Path,
+            *,
+            game_hint: str | None = None,
+            title_hint: str | None = None,
+        ) -> LocalVisionCardCandidate:
+            return LocalVisionCardCandidate(
+                backend="ollama",
+                model="gemma3:12b",
+                game="pokemon",
+                title="強化拡張パック ポケモンカード151",
+                aliases=("ポケモンカード151",),
+                card_number=None,
+                rarity=None,
+                set_code="sv2a",
+                item_kind="sealed_box",
+                confidence=0.95,
+            )
+
+    service._local_vision_clients = (StubVisionClient(),)
+
+    parsed = service.parse_image(image_path, game_hint="pokemon")
+
+    assert parsed.status == "success"
+    assert parsed.item_kind == "sealed_box"
+    assert parsed.title == "強化拡張パック ポケモンカード151"
+    assert parsed.set_code == "sv2a"
+    assert any("Ran sealed box title probe via ollama:gemma3:12b." in warning for warning in parsed.warnings)
+
+
 def test_merge_local_vision_candidate_ignores_conflicting_metadata_when_titles_disagree() -> None:
     parsed = ParsedCardImage(
         status="success",
@@ -891,6 +1078,39 @@ def test_merge_local_vision_candidate_ignores_conflicting_metadata_when_titles_d
     assert merged.rarity == "SAR"
     assert merged.set_code == "m2"
     assert any("ignored conflicting card metadata" in warning for warning in merged.warnings)
+
+
+def test_merge_local_vision_candidate_rejects_weak_sealed_box_title() -> None:
+    parsed = ParsedCardImage(
+        status="unresolved",
+        game="pokemon",
+        title=None,
+        aliases=(),
+        card_number=None,
+        rarity=None,
+        set_code=None,
+        raw_text="強化拡張パック\nmw Om\ns29n",
+        extracted_lines=("強化拡張パック", "mw Om", "s29n"),
+        item_kind="sealed_box",
+        warnings=(),
+    )
+    candidate = LocalVisionCardCandidate(
+        backend="ollama",
+        model="gemma3:12b",
+        game="pokemon",
+        title="mw Om",
+        aliases=(),
+        card_number=None,
+        rarity=None,
+        set_code="s29n",
+        item_kind="sealed_box",
+        confidence=0.71,
+    )
+
+    merged = _merge_local_vision_candidate(parsed, candidate)
+
+    assert merged.title is None
+    assert merged.status == "unresolved"
 
 
 def test_prepare_lookup_spec_uses_slab_number_to_recover_full_card_number(monkeypatch, tmp_path) -> None:

@@ -74,6 +74,7 @@ GRADING_RE = re.compile(r"^(?:【|〖)(?P<label>(?:PSA|BGS|ARS|CGC)[^】〗]*)(?
 CARDRUSH_STATE_RE = re.compile(r"^〔(?P<label>[^〕]+)〕")
 CARDRUSH_RARITY_RE = re.compile(r"【(?P<label>[^】]+)】")
 CARDRUSH_SET_CODE_RE = re.compile(r"\[\s*(?:\[[^\]]+\]\s*)?(?P<code>[A-Za-z0-9]+)\s*\]")
+CARDRUSH_PAREN_SET_CODE_RE = re.compile(r"\((?P<code>[A-Za-z0-9]+)\)")
 WS_CODE_RE = re.compile(r"(?P<code>[A-Z0-9]+/[A-Z0-9-]+-[A-Z0-9]+)$")
 POKEMON_CODE_RE = re.compile(r"\{(?P<code>[^}]+)\}")
 POKEMON_INLINE_CODE_RE = re.compile(r"(?P<code>\d{1,3}/\d{1,3})$")
@@ -1445,16 +1446,29 @@ def _parse_cardrush_text(
         condition = condition_match.group("label")
         working = working[condition_match.end():].strip()
 
-    rarity_match = CARDRUSH_RARITY_RE.search(working)
-    rarity = rarity_match.group("label") if rarity_match is not None else None
-    title = working[: rarity_match.start()].strip() if rarity_match is not None else working
-
-    card_number_match = POKEMON_CODE_RE.search(working)
-    card_number = card_number_match.group("code").strip() if card_number_match is not None else None
-    set_code_match = CARDRUSH_SET_CODE_RE.search(working)
-    set_code = set_code_match.group("code").lower() if set_code_match is not None else None
-
     price_match = JPY_PRICE_RE.search(working)
+    body_end = price_match.start() if price_match is not None else len(working)
+    body = working[:body_end].strip()
+
+    rarity_match = CARDRUSH_RARITY_RE.search(body)
+    rarity = rarity_match.group("label") if rarity_match is not None else None
+    title = body[: rarity_match.start()].strip() if rarity_match is not None else body
+    if rarity and "BOX" in rarity.upper():
+        rarity = None
+
+    card_number_match = POKEMON_CODE_RE.search(body)
+    card_number = card_number_match.group("code").strip() if card_number_match is not None else None
+    if card_number in {"", "-"}:
+        card_number = None
+    set_code_match = CARDRUSH_SET_CODE_RE.search(body)
+    if set_code_match is None:
+        set_code_match = CARDRUSH_PAREN_SET_CODE_RE.search(body)
+    set_code = set_code_match.group("code").lower() if set_code_match is not None else None
+    if card_number is None and "BOX" in body.upper():
+        title = re.sub(r"[『』「」]", " ", title)
+        title = re.sub(r"\((?:[A-Za-z0-9]+)\)\s*$", "", title).strip()
+        title = re.sub(r"\s+", " ", title)
+
     price_jpy = int(price_match.group("price").replace(",", "")) if price_match is not None else None
 
     count_match = COUNT_RE.search(working)

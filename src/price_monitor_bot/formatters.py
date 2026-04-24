@@ -154,7 +154,10 @@ def _section_reference_offer(offers: list[MarketOffer]) -> MarketOffer | None:
 
 def format_lookup_result_telegram(result: TcgLookupResult) -> str:
     spec = result.spec
-    header_parts = [f"[{spec.game}] {spec.title}"]
+    label = f"[{spec.game}]"
+    if spec.item_kind == "sealed_box":
+        label = f"[{spec.game} sealed box]"
+    header_parts = [f"{label} {spec.title}"]
     if spec.card_number:
         header_parts.append(spec.card_number)
     if spec.rarity:
@@ -164,6 +167,34 @@ def format_lookup_result_telegram(result: TcgLookupResult) -> str:
 
     if not result.offers:
         lines.append("No matching offers were found on the active reference sources.")
+        return "\n".join(lines)
+
+    if spec.item_kind == "sealed_box":
+        fair_value_text = _section_fair_value(result, list(result.offers))
+        if fair_value_text is not None:
+            lines.append(fair_value_text)
+
+        avg = _avg_price(list(result.offers))
+        bid = _best_bid(list(result.offers))
+        ask = _best_ask(list(result.offers))
+        market = _best_market(list(result.offers))
+        reference_offer = _section_reference_offer(list(result.offers))
+        if avg is not None:
+            lines.append(f"Avg Price: {format_jpy(avg)}")
+        if bid is not None:
+            lines.append(f"Best Bid: {format_jpy(bid.price_jpy)} ({bid.source})")
+        if ask is not None:
+            lines.append(f"Best Ask: {format_jpy(ask.price_jpy)} ({ask.source})")
+        if market is not None:
+            lines.append(f"Best Market: {format_jpy(market.price_jpy)} ({market.source})")
+        if reference_offer is not None:
+            lines.append(f"Source URL: {reference_offer.url}")
+
+        source_summary = ", ".join(
+            f"{source} x{count}" for source, count in sorted(Counter(offer.source for offer in result.offers).items())
+        )
+        lines.append("")
+        lines.append(f"Sources: {source_summary}")
         return "\n".join(lines)
 
     raw_offers = [offer for offer in result.offers if _offer_section(offer) == _SECTION_RAW]

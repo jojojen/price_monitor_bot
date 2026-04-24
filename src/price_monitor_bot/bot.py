@@ -16,7 +16,12 @@ from urllib.request import Request, urlopen
 
 from market_monitor.http import HttpClient
 from tcg_tracker.hot_cards import HotCardBoard, TcgHotCardService
-from tcg_tracker.image_lookup import TcgImageLookupOutcome, TcgImagePriceService, TcgVisionSettings
+from tcg_tracker.image_lookup import (
+    TcgImageLookupOutcome,
+    TcgImagePriceService,
+    TcgVisionSettings,
+    _sanitize_image_title_hint,
+)
 
 from .commands import lookup_card
 from .formatters import format_jpy, format_lookup_result_telegram
@@ -988,8 +993,8 @@ def _parse_photo_caption_for_lookup(caption: str | None) -> tuple[str | None, st
     first = tokens[0].lower()
     if first in {"pokemon", "ws"}:
         remainder = " ".join(tokens[1:]).strip()
-        return first, remainder or None
-    return None, content
+        return first, _sanitize_image_title_hint(remainder or None)
+    return None, _sanitize_image_title_hint(content)
 
 
 def _format_lookup_ack_command(query: TelegramLookupQuery) -> str:

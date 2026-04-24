@@ -338,6 +338,33 @@ def test_handle_telegram_message_sends_ack_then_text_result() -> None:
     assert client.sent_messages == list(replies)
 
 
+def test_handle_telegram_message_ignores_generic_price_caption_as_title_hint() -> None:
+    sample_path = get_image_lookup_live_case("pokemon-pikachu-partial-s40").image_path
+    client = FakeTelegramClient(sample_path=sample_path)
+    processor = TelegramCommandProcessor(
+        allowed_chat_id="123",
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+    )
+
+    replies = handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: f"photo:{query.game_hint}:{query.title_hint}:{query.image_path.suffix}",
+        message={
+            "chat": {"id": "123"},
+            "photo": [{"file_id": "photo-1", "file_size": 128}],
+            "caption": "查這個box市價",
+        },
+    )
+
+    assert replies == (
+        build_processing_ack(has_photo=True),
+        "photo:None:None:.jpg",
+    )
+
+
 def test_handle_telegram_message_sends_snapshot_ack_then_result(tmp_path: Path) -> None:
     client = FakeTelegramClient()
     pdf_path = tmp_path / "proof_123.pdf"
@@ -592,6 +619,48 @@ def test_format_lookup_result_telegram_detects_psa10_from_title_with_spacing() -
 
     assert "PSA 10" in text
     assert "其他鑑定卡" not in text
+
+
+def test_format_lookup_result_telegram_supports_sealed_box_products() -> None:
+    now = datetime.now(timezone.utc)
+    lookup_result = TcgLookupResult(
+        spec=TcgCardSpec(game="pokemon", title="強化拡張パック ポケモンカード151", item_kind="sealed_box", set_code="sv2a"),
+        item=TrackedItem(item_id="box151", item_type="tcg_sealed_box", category="tcg", title="強化拡張パック ポケモンカード151"),
+        offers=(
+            MarketOffer(
+                source="cardrush_pokemon",
+                listing_id="c1",
+                url="https://cardrush.example/box151",
+                title="強化拡張パック ポケモンカード151 未開封BOX",
+                price_jpy=70800,
+                price_kind="ask",
+                captured_at=now,
+                source_category="specialty_store",
+                attributes={"product_kind": "sealed_box", "set_code": "sv2a"},
+            ),
+            MarketOffer(
+                source="magi",
+                listing_id="m1",
+                url="https://magi.example/box151",
+                title="強化拡張パック ポケモンカード151 未開封BOX",
+                price_jpy=70000,
+                price_kind="market",
+                captured_at=now,
+                source_category="marketplace",
+                attributes={"product_kind": "sealed_box", "set_code": "sv2a"},
+            ),
+        ),
+        fair_value=FairValueEstimate(item_id="box151", amount_jpy=70400, confidence=0.78, sample_count=2, reasoning=()),
+    )
+
+    text = format_lookup_result_telegram(lookup_result)
+
+    assert "[pokemon sealed box] 強化拡張パック ポケモンカード151" in text
+    assert "Raw" not in text
+    assert "Fair Value:" in text
+    assert "Best Ask:" in text
+    assert "Best Market:" in text
+    assert "Source URL: https://magi.example/box151" in text
 
 
 def test_format_liquidity_board_includes_reference_url() -> None:

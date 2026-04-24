@@ -10,10 +10,19 @@ GAME_CODES = {
     "pokemon": "poc",
     "ws": "ws",
 }
+ITEM_KINDS = {"card", "sealed_box"}
 
 
-def build_tcg_item_id(game: str, title: str, card_number: str | None, rarity: str | None, set_code: str | None) -> str:
-    payload = "|".join([game, title, card_number or "", rarity or "", set_code or ""])
+def build_tcg_item_id(
+    game: str,
+    title: str,
+    card_number: str | None,
+    rarity: str | None,
+    set_code: str | None,
+    *,
+    item_kind: str = "card",
+) -> str:
+    payload = "|".join([item_kind, game, title, card_number or "", rarity or "", set_code or ""])
     digest = sha1(payload.encode("utf-8")).hexdigest()[:16]
     return f"tcg-{digest}"
 
@@ -22,6 +31,7 @@ def build_tcg_item_id(game: str, title: str, card_number: str | None, rarity: st
 class TcgCardSpec:
     game: str
     title: str
+    item_kind: str = "card"
     card_number: str | None = None
     rarity: str | None = None
     set_code: str | None = None
@@ -33,6 +43,8 @@ class TcgCardSpec:
     def __post_init__(self) -> None:
         if self.game not in GAME_CODES:
             raise ValueError(f"unsupported game: {self.game}")
+        if self.item_kind not in ITEM_KINDS:
+            raise ValueError(f"unsupported item kind: {self.item_kind}")
 
     @property
     def source_code(self) -> str:
@@ -49,6 +61,7 @@ class TcgCardSpec:
             self.card_number,
             self.rarity,
             self.set_code,
+            item_kind=self.item_kind,
         )
 
     def keywords(self) -> tuple[str, ...]:
@@ -63,6 +76,7 @@ class TcgCardSpec:
         attributes = {
             "game": self.game,
             "source_code": self.source_code,
+            "item_kind": self.item_kind,
         }
         if self.card_number:
             attributes["card_number"] = self.card_number
@@ -75,7 +89,7 @@ class TcgCardSpec:
 
         return TrackedItem(
             item_id=self.resolved_item_id(),
-            item_type="tcg_card",
+            item_type="tcg_sealed_box" if self.item_kind == "sealed_box" else "tcg_card",
             category="tcg",
             title=self.title,
             aliases=self.aliases,
