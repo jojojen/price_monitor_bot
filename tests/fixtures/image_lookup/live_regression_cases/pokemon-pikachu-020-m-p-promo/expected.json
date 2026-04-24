@@ -1,0 +1,22 @@
+{
+  "case_id": "pokemon-pikachu-020-m-p-promo",
+  "original_filename": "PICKACHU2.jpg",
+  "expected": {
+    "status": "success",
+    "parsed": {
+      "game": "pokemon",
+      "title": "ピカチュウ",
+      "card_number": "020/M-P",
+      "rarity": "PROMO",
+      "set_code": "mpromo-100"
+    },
+    "lookup_spec": {
+      "title": "ピカチュウ",
+      "card_number": "020/M-P",
+      "rarity": "PROMO",
+      "set_code": "mpromo-100"
+    },
+    "min_offer_count": 5,
+    "required_sources": ["cardrush_pokemon"]
+  }
+}

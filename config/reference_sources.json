@@ -1,0 +1,134 @@
+[
+  {
+    "id": "pokemon_official_card_search",
+    "name": "Pokemon Card Game Official Card Search",
+    "games": ["pokemon"],
+    "source_kind": "official_metadata",
+    "reference_roles": ["canonical_name", "card_number", "set_name", "regulation"],
+    "price_weight": 0.0,
+    "trust_score": 1.0,
+    "url": "https://www.pokemon-card.com/card-search/",
+    "notes": "Use for card normalization and metadata verification, not price estimation."
+  },
+  {
+    "id": "ws_official_cardlist",
+    "name": "Weiss Schwarz Official Card List",
+    "games": ["ws"],
+    "source_kind": "official_metadata",
+    "reference_roles": ["canonical_name", "card_number", "title", "product_line"],
+    "price_weight": 0.0,
+    "trust_score": 1.0,
+    "url": "https://ws-tcg.com/cardlist/search",
+    "notes": "Use for card normalization and title verification, not price estimation."
+  },
+  {
+    "id": "yuyutei",
+    "name": "Yuyu-Tei",
+    "games": ["pokemon", "ws"],
+    "source_kind": "specialty_store",
+    "reference_roles": ["ask_price", "bid_price", "inventory_signal"],
+    "price_weight": 0.9,
+    "trust_score": 0.93,
+    "url": "https://yuyu-tei.jp/",
+    "notes": "Primary phase-one store reference already implemented."
+  },
+  {
+    "id": "snkrdunk",
+    "name": "SNKRDUNK",
+    "games": ["pokemon", "ws"],
+    "source_kind": "market_content",
+    "reference_roles": ["market_price", "trend_signal", "article_signal"],
+    "price_weight": 0.72,
+    "trust_score": 0.8,
+    "url": "https://snkrdunk.com/",
+    "notes": "Prefer product and market pages. Guide articles should be secondary context only."
+  },
+  {
+    "id": "cardrush_pokemon_sell",
+    "name": "Card Rush Pokemon Sell",
+    "games": ["pokemon"],
+    "source_kind": "specialty_store",
+    "reference_roles": ["ask_price", "inventory_signal"],
+    "price_weight": 0.88,
+    "trust_score": 0.9,
+    "url": "https://www.cardrush-pokemon.jp/",
+    "notes": "Useful Pokemon single-card retail reference."
+  },
+  {
+    "id": "cardrush_pokemon_buy",
+    "name": "Card Rush Pokemon Buylist",
+    "games": ["pokemon"],
+    "source_kind": "specialty_store",
+    "reference_roles": ["bid_price"],
+    "price_weight": 0.8,
+    "trust_score": 0.87,
+    "url": "https://www.cardrush-pokemon.jp/page/41",
+    "notes": "Buylist reference. Their page warns cache may affect freshness, so scrape carefully."
+  },
+  {
+    "id": "hareruya2_buy",
+    "name": "Hareruya 2 Buylist",
+    "games": ["pokemon"],
+    "source_kind": "specialty_store",
+    "reference_roles": ["bid_price", "catalog_signal"],
+    "price_weight": 0.78,
+    "trust_score": 0.86,
+    "url": "https://www.hareruya2.com/pages/buying",
+    "notes": "Pokemon-specialty store. Good secondary buy-side reference."
+  },
+  {
+    "id": "magi_pokemon",
+    "name": "Magi Pokemon Market",
+    "games": ["pokemon"],
+    "source_kind": "marketplace",
+    "reference_roles": ["listing_price", "market_depth", "supply_signal"],
+    "price_weight": 0.7,
+    "trust_score": 0.76,
+    "url": "https://magi.camp/series/31/products",
+    "notes": "Useful for secondary-market depth and live listing ranges."
+  },
+  {
+    "id": "magi_ws",
+    "name": "Magi Weiss Schwarz Market",
+    "games": ["ws"],
+    "source_kind": "marketplace",
+    "reference_roles": ["listing_price", "market_depth", "supply_signal"],
+    "price_weight": 0.7,
+    "trust_score": 0.76,
+    "url": "https://magi.camp/series/7/products",
+    "notes": "Useful WS secondary-market source when store references are thin."
+  },
+  {
+    "id": "mercari",
+    "name": "Mercari JP",
+    "games": ["pokemon", "ws"],
+    "source_kind": "marketplace",
+    "reference_roles": ["listing_price", "new_listing_alert", "seller_signal"],
+    "price_weight": 0.82,
+    "trust_score": 0.74,
+    "url": "https://jp.mercari.com/",
+    "notes": "Primary deal-alert source, but requires strong risk filters."
+  },
+  {
+    "id": "yahoo_fleamarket",
+    "name": "Yahoo Flea Market",
+    "games": ["pokemon", "ws"],
+    "source_kind": "marketplace",
+    "reference_roles": ["listing_price", "market_depth"],
+    "price_weight": 0.68,
+    "trust_score": 0.71,
+    "url": "https://paypayfleamarket.yahoo.co.jp/",
+    "notes": "Useful secondary C2C source with broad item coverage."
+  },
+  {
+    "id": "rakuma",
+    "name": "Rakuma",
+    "games": ["pokemon", "ws"],
+    "source_kind": "marketplace",
+    "reference_roles": ["listing_price", "market_depth"],
+    "price_weight": 0.65,
+    "trust_score": 0.69,
+    "url": "https://fril.jp/",
+    "notes": "Useful secondary C2C source, especially for older cards and boxed items."
+  }
+]

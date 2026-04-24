@@ -1,0 +1,22 @@
+{
+  "case_id": "pokemon-charizard-ex-201-165-sar-sv2a",
+  "original_filename": "IMG_failed2.jpeg",
+  "expected": {
+    "status": "success",
+    "parsed": {
+      "game": "pokemon",
+      "title": "リザードンex",
+      "card_number": "201/165",
+      "rarity": "SAR",
+      "set_code": "sv2a"
+    },
+    "lookup_spec": {
+      "title": "リザードンex",
+      "card_number": "201/165",
+      "rarity": "SAR",
+      "set_code": "sv2a"
+    },
+    "min_offer_count": 5,
+    "required_sources": ["cardrush_pokemon"]
+  }
+}

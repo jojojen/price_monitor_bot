@@ -1,0 +1,22 @@
+{
+  "case_id": "pokemon-lillies-clefairy-ex-126-100-sar-sv9",
+  "original_filename": "ririe.jpg",
+  "expected": {
+    "status": "success",
+    "parsed": {
+      "game": "pokemon",
+      "title": "リーリエのピッピex",
+      "card_number": "126/100",
+      "rarity": "SAR",
+      "set_code": "sv9"
+    },
+    "lookup_spec": {
+      "title": "リーリエのピッピex",
+      "card_number": "126/100",
+      "rarity": "SAR",
+      "set_code": "sv9"
+    },
+    "min_offer_count": 5,
+    "required_sources": ["cardrush_pokemon"]
+  }
+}

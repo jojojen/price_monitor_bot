@@ -1,0 +1,11 @@
+{
+  "case_id": "pokemon-pikachu-partial-s40",
+  "original_filename": "pikachu.jpg",
+  "expected": {
+    "status": "partial",
+    "parsed": {
+      "game": "pokemon"
+    },
+    "offer_count": 0
+  }
+}

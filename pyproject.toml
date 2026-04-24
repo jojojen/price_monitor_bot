@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "price-monitor-bot"
+version = "0.1.0"
+description = "Standalone TCG price-monitoring and Telegram bot module."
+requires-python = ">=3.12"
+dependencies = [
+  "beautifulsoup4>=4.14,<5",
+  "Pillow>=11,<12",
+  "truststore>=0.10,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=9,<10",
+]
+ocr = [
+  "easyocr>=1.7,<2",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+markers = [
+  "live_image_lookup: verifies live image lookup regression fixtures against current OCR and marketplace sources.",
+]

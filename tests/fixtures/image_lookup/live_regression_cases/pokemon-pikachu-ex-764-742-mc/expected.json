@@ -1,0 +1,22 @@
+{
+  "case_id": "pokemon-pikachu-ex-764-742-mc",
+  "original_filename": "PICKACHU3.jpg",
+  "expected": {
+    "status": "success",
+    "parsed": {
+      "game": "pokemon",
+      "title": "ピカチュウex(SAR仕様)",
+      "card_number": "764/742",
+      "rarity": "-",
+      "set_code": "mc"
+    },
+    "lookup_spec": {
+      "title": "ピカチュウex(SAR仕様)",
+      "card_number": "764/742",
+      "rarity": "-",
+      "set_code": "mc"
+    },
+    "min_offer_count": 3,
+    "required_sources": ["cardrush_pokemon"]
+  }
+}

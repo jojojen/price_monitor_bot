@@ -1,0 +1,22 @@
+{
+  "case_id": "pokemon-mega-charizard-x-ex-223-193-ma-m2a",
+  "original_filename": "charizard.jpg",
+  "expected": {
+    "status": "success",
+    "parsed": {
+      "game": "pokemon",
+      "title": "メガリザードンXex",
+      "card_number": "223/193",
+      "rarity": "MA",
+      "set_code": "m2a"
+    },
+    "lookup_spec": {
+      "title": "メガリザードンXex",
+      "card_number": "223/193",
+      "rarity": "MA",
+      "set_code": "m2a"
+    },
+    "min_offer_count": 5,
+    "required_sources": ["cardrush_pokemon"]
+  }
+}
