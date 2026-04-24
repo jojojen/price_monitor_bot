@@ -11,7 +11,7 @@ from tcg_tracker.service import TcgLookupResult
 from tests.image_lookup_case_fixtures import get_image_lookup_live_case
 
 from price_monitor_bot.formatters import format_lookup_result_telegram
-from price_monitor_bot.natural_language import TelegramNaturalLanguageIntent
+from price_monitor_bot.natural_language import TelegramNaturalLanguageIntent, fallback_route_telegram_natural_language
 from price_monitor_bot.bot import (
     TelegramCommandProcessor,
     TelegramFileAttachment,
@@ -603,3 +603,39 @@ def test_format_liquidity_board_includes_reference_url() -> None:
     assert "support 90.08" in text
     assert "buy-up" in text
     assert "stub methodology" not in text
+
+
+def test_fallback_router_infers_ws_game_surrounded_by_cjk() -> None:
+    intent = fallback_route_telegram_natural_language("查熱門ws前三")
+
+    assert intent is not None
+    assert intent.intent == "trend_board"
+    assert intent.game == "ws"
+    assert intent.limit == 3
+
+
+def test_fallback_router_infers_ws_game_with_arabic_limit() -> None:
+    intent = fallback_route_telegram_natural_language("ws熱門前5")
+
+    assert intent is not None
+    assert intent.intent == "trend_board"
+    assert intent.game == "ws"
+    assert intent.limit == 5
+
+
+def test_fallback_router_infers_chinese_numeral_limit() -> None:
+    intent = fallback_route_telegram_natural_language("pokemon 熱門前十")
+
+    assert intent is not None
+    assert intent.intent == "trend_board"
+    assert intent.game == "pokemon"
+    assert intent.limit == 10
+
+
+def test_fallback_router_defaults_limit_when_no_number_given() -> None:
+    intent = fallback_route_telegram_natural_language("ws 熱門")
+
+    assert intent is not None
+    assert intent.intent == "trend_board"
+    assert intent.game == "ws"
+    assert intent.limit == 5

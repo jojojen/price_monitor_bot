@@ -11,6 +11,11 @@ from urllib.request import Request, urlopen
 
 logger = logging.getLogger(__name__)
 
+_CHINESE_DIGIT_MAP: dict[str, int] = {
+    "一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+    "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
+}
+
 _ROUTER_JSON_SCHEMA = {
     "type": "object",
     "properties": {
@@ -183,7 +188,11 @@ def fallback_route_telegram_natural_language(text: str) -> TelegramNaturalLangua
         if game is None:
             return None
         limit_match = re.search(r"(?:top|前)\s*(?P<limit>\d{1,2})", lowered)
-        limit = int(limit_match.group("limit")) if limit_match else 5
+        if limit_match:
+            limit = int(limit_match.group("limit"))
+        else:
+            chinese_match = re.search(r"前\s*(?P<digit>[一二三四五六七八九十])", content)
+            limit = _CHINESE_DIGIT_MAP.get(chinese_match.group("digit"), 5) if chinese_match else 5
         return TelegramNaturalLanguageIntent(
             intent="trend_board",
             game=game,
@@ -338,6 +347,8 @@ def _infer_game(text: str) -> str | None:
     lowered = text.lower()
     if any(token in lowered for token in ("pokemon", "ptcg", "寶可夢", "寶可卡")):
         return "pokemon"
-    if any(token in lowered for token in ("weiss", "schwarz", "ヴァイス")) or re.search(r"\bws\b", lowered):
+    # \bws\b fails when "ws" is surrounded by CJK characters (which are also \w in Python).
+    # Use ASCII-only lookaround so "熱門ws前三" is matched correctly.
+    if any(token in lowered for token in ("weiss", "schwarz", "ヴァイス")) or re.search(r"(?<![a-z])ws(?![a-z])", lowered):
         return "ws"
     return None
