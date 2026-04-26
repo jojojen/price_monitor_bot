@@ -14,7 +14,10 @@ from typing import Callable
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from hashlib import sha1
+
 from market_monitor.http import HttpClient
+from market_monitor.storage import MercariWatch, MonitorDatabase
 from tcg_tracker.hot_cards import HotCardBoard, TcgHotCardService
 from tcg_tracker.image_lookup import (
     TcgImageLookupOutcome,
@@ -37,11 +40,15 @@ PhotoLookupRenderer = Callable[["TelegramPhotoQuery"], str]
 ReputationRenderer = Callable[["TelegramReputationQuery"], object]
 BoardLoader = Callable[[], tuple[HotCardBoard, ...]]
 CatalogRenderer = Callable[[], str]
+WatchlistStore = object  # MonitorDatabase or None
 
 PRICE_LOOKUP_COMMANDS = {"/lookup", "/price"}
 TREND_BOARD_COMMANDS = {"/trend", "/trending", "/hot", "/heat", "/liquidity"}
 PHOTO_SCAN_COMMANDS = {"/scan", "/image", "/photo"}
 REPUTATION_SNAPSHOT_COMMANDS = {"/snapshot", "/proof", "/repcheck", "/reputation"}
+WATCH_COMMANDS = {"/watch"}
+WATCHLIST_COMMANDS = {"/watchlist", "/watches"}
+UNWATCH_COMMANDS = {"/unwatch", "/stopwatch"}
 HEAVY_COMMANDS = PRICE_LOOKUP_COMMANDS | TREND_BOARD_COMMANDS | REPUTATION_SNAPSHOT_COMMANDS
 
 logger = logging.getLogger(__name__)
@@ -236,6 +243,7 @@ class TelegramCommandProcessor:
         natural_language_router: TelegramNaturalLanguageRouter | None = None,
         allowed_chat_id: str | None = None,
         status_renderer: Callable[[], str] | None = None,
+        watch_db: MonitorDatabase | None = None,
     ) -> None:
         self._lookup_renderer = lookup_renderer
         self._board_loader = board_loader
@@ -244,6 +252,7 @@ class TelegramCommandProcessor:
         self._natural_language_router = natural_language_router
         self._allowed_chat_id = allowed_chat_id
         self._status_renderer = status_renderer
+        self._watch_db = watch_db
 
     def is_allowed_chat(self, chat_id: str | int) -> bool:
         if self._allowed_chat_id is None:
@@ -303,6 +312,19 @@ class TelegramCommandProcessor:
                 ack=build_processing_ack(text=content),
                 reply=None,
                 reply_factory=lambda remainder=remainder: self._handle_reputation_snapshot(remainder),
+            )
+        if command in WATCH_COMMANDS:
+            return TelegramTextReplyPlan(
+                ack="收到追蹤指令，正在設定…",
+                reply=None,
+                reply_factory=lambda remainder=remainder, cid=chat_id: self._handle_watch(remainder, str(cid)),
+            )
+        if command in WATCHLIST_COMMANDS:
+            return TelegramTextReplyPlan(ack=None, reply=self._handle_watchlist())
+        if command in UNWATCH_COMMANDS:
+            return TelegramTextReplyPlan(
+                ack=None,
+                reply=self._handle_unwatch(remainder),
             )
         if not content.startswith("/"):
             intent = self._route_natural_language(content)
@@ -364,6 +386,65 @@ class TelegramCommandProcessor:
 
     def _handle_reputation_snapshot(self, raw: str) -> str:
         return self.build_reputation_delivery(raw).summary_text
+
+    def _handle_watch(self, raw: str, chat_id: str) -> str:
+        if self._watch_db is None:
+            return "追蹤功能尚未啟用（watch_db 未設定）。"
+        try:
+            query, threshold = parse_watch_command(raw)
+        except ValueError as exc:
+            return f"{exc}\n格式範例：/watch 想いが重なる場所で 初音ミク SSP on 300000"
+        watch_id = sha1(f"{chat_id}|{query}".encode()).hexdigest()[:16]
+        watch = MercariWatch(
+            watch_id=watch_id,
+            query=query,
+            price_threshold_jpy=threshold,
+            enabled=True,
+            chat_id=chat_id,
+            last_checked_at=None,
+            created_at="",
+            updated_at="",
+        )
+        self._watch_db.add_mercari_watch(watch)
+        logger.info("Watch added watch_id=%s query=%s threshold=%d chat_id=%s", watch_id, query, threshold, chat_id)
+        return (
+            f"已新增追蹤\n"
+            f"ID: {watch_id}\n"
+            f"關鍵字：{query}\n"
+            f"價格上限：¥{threshold:,}\n"
+            f"將每分鐘在 Mercari 搜尋，發現新商品時通知你。"
+        )
+
+    def _handle_watchlist(self) -> str:
+        if self._watch_db is None:
+            return "追蹤功能尚未啟用（watch_db 未設定）。"
+        watches = self._watch_db.list_mercari_watchlist()
+        if not watches:
+            return "目前沒有任何追蹤項目。\n使用 /watch 關鍵字 on 價格 來新增。"
+        lines = [f"目前追蹤清單（共 {len(watches)} 項）："]
+        for w in watches:
+            status = "✓ 啟用" if w.enabled else "✗ 停用"
+            checked = w.last_checked_at[:16].replace("T", " ") if w.last_checked_at else "尚未檢查"
+            lines.append(
+                f"\n[{w.watch_id}] {status}\n"
+                f"  關鍵字：{w.query}\n"
+                f"  上限：¥{w.price_threshold_jpy:,}\n"
+                f"  最後檢查：{checked}"
+            )
+        lines.append("\n/unwatch <ID> 可移除追蹤")
+        return "\n".join(lines)
+
+    def _handle_unwatch(self, raw: str) -> str:
+        if self._watch_db is None:
+            return "追蹤功能尚未啟用（watch_db 未設定）。"
+        watch_id = raw.strip()
+        if not watch_id:
+            return "請提供追蹤 ID。格式：/unwatch <ID>\n可用 /watchlist 查看所有 ID。"
+        deleted = self._watch_db.delete_mercari_watch(watch_id)
+        if deleted:
+            logger.info("Watch deleted watch_id=%s", watch_id)
+            return f"已移除追蹤 [{watch_id}]"
+        return f"找不到追蹤 ID [{watch_id}]，請用 /watchlist 確認。"
 
     def build_reputation_delivery(self, raw: str) -> TelegramReputationDelivery:
         if self._reputation_renderer is None:
@@ -499,10 +580,43 @@ class TelegramCommandProcessor:
                 "/liquidity ws 5",
                 "/snapshot https://jp.mercari.com/item/m123456789",
                 "Send a photo with caption: /scan pokemon",
+                "--- Mercari 追蹤 ---",
+                "/watch 想いが重なる場所で 初音ミク SSP on 300000",
+                "/watchlist",
+                "/unwatch <ID>",
                 "You can also ask things like: 幫我查 pokemon Pikachu ex 132/106",
                 "Or: pokemon 熱門前 5",
             ]
         )
+
+
+def parse_watch_command(raw: str) -> tuple[str, int]:
+    """Parse '/watch <query> on <price>' → (query, price_threshold_jpy).
+
+    Accepts both bracket notation from the docs:
+      /watch [商品名] on [300000]
+    and plain:
+      /watch 商品名 on 300000
+    """
+    body = raw.strip().strip("[]")
+    # Remove surrounding brackets from whole body if present
+    lower = body.lower()
+    # Find last occurrence of " on " to split
+    sep = " on "
+    idx = lower.rfind(sep)
+    if idx == -1:
+        raise ValueError("格式錯誤：需要 'on 價格' 部分。")
+    query_part = body[:idx].strip().strip("[]").strip()
+    price_part = body[idx + len(sep):].strip().strip("[]").strip()
+    if not query_part:
+        raise ValueError("關鍵字不可為空。")
+    try:
+        threshold = int(price_part.replace(",", "").replace("，", ""))
+    except ValueError:
+        raise ValueError(f"價格格式錯誤：'{price_part}'，請填入整數日幣金額。")
+    if threshold <= 0:
+        raise ValueError("價格上限必須大於 0。")
+    return query_part, threshold
 
 
 def parse_lookup_command(raw: str) -> TelegramLookupQuery:
@@ -744,6 +858,7 @@ def run_telegram_polling(
     ssl_context: ssl.SSLContext | None = None,
     allowed_chat_id: str | None = None,
     status_renderer: Callable[[], str] | None = None,
+    watch_db: MonitorDatabase | None = None,
     poll_timeout: int = 20,
     notify_startup: bool = False,
     drop_pending_updates: bool = True,
@@ -773,6 +888,7 @@ def run_telegram_polling(
         natural_language_router=natural_language_router,
         allowed_chat_id=allowed_chat_id,
         status_renderer=status_renderer,
+        watch_db=watch_db,
     )
     resolved_photo_renderer = photo_renderer or default_photo_renderer()
 
