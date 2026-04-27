@@ -90,6 +90,15 @@ _WATCH_REMOVE_KEYWORDS = (
     "unwatch",
     "stopwatch",
 )
+_WATCH_UPDATE_PRICE_KEYWORDS = (
+    "改成",
+    "改為",
+    "更新",
+    "調整",
+    "修改",
+    "setprice",
+    "updatewatch",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,13 +158,14 @@ class TelegramNaturalLanguageRouter:
     def _build_prompt(self, text: str) -> str:
         return (
             "You route Telegram messages for a trading-card price assistant and must return only JSON.\n"
-            "Allowed intents: lookup_card, trend_board, add_watch, list_watches, remove_watch, help, unknown.\n"
+            "Allowed intents: lookup_card, trend_board, add_watch, list_watches, remove_watch, update_watch_price, help, unknown.\n"
             "Use lookup_card when the user wants the price, value, or card lookup of one specific card.\n"
             "Use trend_board when the user asks for hot, trending, liquidity, or ranking cards.\n"
             "Use add_watch when the user wants to track/monitor a product and be notified below a price threshold.\n"
             "  Set watch_query to the product name/keywords, watch_price_threshold to the integer JPY limit.\n"
             "Use list_watches when the user wants to see their watchlist / tracked items.\n"
             "Use remove_watch when the user wants to stop tracking / unwatch an item. Set watch_id if mentioned.\n"
+            "Use update_watch_price when the user wants to change the price threshold of an existing watch. Set watch_id and watch_price_threshold.\n"
             "Use help when the user asks what the bot can do.\n"
             "Use unknown when the request is unrelated or too ambiguous.\n"
             'Game must be "pokemon", "ws", or null.\n'
@@ -172,6 +182,7 @@ class TelegramNaturalLanguageRouter:
             '- "追蹤 初音ミク SSP 5万以下" -> add_watch, watch_query="初音ミク SSP", watch_price_threshold=50000\n'
             '- "看我的追蹤清單" -> list_watches\n'
             '- "取消追蹤 abc12345" -> remove_watch, watch_id="abc12345"\n'
+            '- "把 abc12345 改成 4萬" -> update_watch_price, watch_id="abc12345", watch_price_threshold=40000\n'
             '- "你會什麼" -> help\n'
             '- "明天天氣如何" -> unknown\n'
             f"User message:\n{text}\n"
@@ -304,7 +315,6 @@ def fallback_route_telegram_natural_language(text: str) -> TelegramNaturalLangua
 
     # remove_watch: "取消追蹤 abc123" / "unwatch abc123"
     if any(kw in lowered for kw in _WATCH_REMOVE_KEYWORDS):
-        # Try to extract a watch_id token (hex-like short id)
         id_match = re.search(r"\b([0-9a-f]{8,16})\b", lowered)
         watch_id = id_match.group(1) if id_match else None
         return TelegramNaturalLanguageIntent(
@@ -312,6 +322,19 @@ def fallback_route_telegram_natural_language(text: str) -> TelegramNaturalLangua
             watch_id=watch_id,
             confidence=0.7,
         )
+
+    # update_watch_price: "把 abc12345 改成 4萬" / "setprice abc12345 40000"
+    # Requires both a watch_id (hex) and an update keyword in the same message.
+    _id_match = re.search(r"\b([0-9a-f]{8,16})\b", lowered)
+    if _id_match and any(kw in lowered for kw in _WATCH_UPDATE_PRICE_KEYWORDS):
+        threshold = _parse_price_threshold(content)
+        if threshold:
+            return TelegramNaturalLanguageIntent(
+                intent="update_watch_price",
+                watch_id=_id_match.group(1),
+                watch_price_threshold=threshold,
+                confidence=0.7,
+            )
 
     # list_watches: "追蹤清單" / "我的追蹤" / "watchlist"
     if any(kw in lowered for kw in _WATCH_LIST_KEYWORDS):
@@ -419,7 +442,7 @@ def _load_json_fragment(value: str) -> object:
 
 def _normalize_intent(payload: dict[str, object]) -> TelegramNaturalLanguageIntent:
     intent = str(payload.get("intent", "unknown")).strip().lower()
-    if intent not in {"lookup_card", "trend_board", "add_watch", "list_watches", "remove_watch", "help", "unknown"}:
+    if intent not in {"lookup_card", "trend_board", "add_watch", "list_watches", "remove_watch", "update_watch_price", "help", "unknown"}:
         intent = "unknown"
 
     game = _normalize_game(payload.get("game"))

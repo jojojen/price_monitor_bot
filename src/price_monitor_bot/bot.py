@@ -49,6 +49,7 @@ REPUTATION_SNAPSHOT_COMMANDS = {"/snapshot", "/proof", "/repcheck", "/reputation
 WATCH_COMMANDS = {"/watch"}
 WATCHLIST_COMMANDS = {"/watchlist", "/watches"}
 UNWATCH_COMMANDS = {"/unwatch", "/stopwatch"}
+SET_PRICE_COMMANDS = {"/setprice", "/updatewatch"}
 HEAVY_COMMANDS = PRICE_LOOKUP_COMMANDS | TREND_BOARD_COMMANDS | REPUTATION_SNAPSHOT_COMMANDS
 
 logger = logging.getLogger(__name__)
@@ -241,7 +242,7 @@ class TelegramCommandProcessor:
         catalog_renderer: CatalogRenderer,
         reputation_renderer: ReputationRenderer | None = None,
         natural_language_router: TelegramNaturalLanguageRouter | None = None,
-        allowed_chat_id: str | None = None,
+        allowed_chat_ids: frozenset[str] | None = None,
         status_renderer: Callable[[], str] | None = None,
         watch_db: MonitorDatabase | None = None,
     ) -> None:
@@ -250,14 +251,14 @@ class TelegramCommandProcessor:
         self._catalog_renderer = catalog_renderer
         self._reputation_renderer = reputation_renderer
         self._natural_language_router = natural_language_router
-        self._allowed_chat_id = allowed_chat_id
+        self._allowed_chat_ids: frozenset[str] = allowed_chat_ids or frozenset()
         self._status_renderer = status_renderer
         self._watch_db = watch_db
 
     def is_allowed_chat(self, chat_id: str | int) -> bool:
-        if self._allowed_chat_id is None:
+        if not self._allowed_chat_ids:
             return True
-        return str(chat_id) == str(self._allowed_chat_id)
+        return str(chat_id) in self._allowed_chat_ids
 
     def build_reply(self, *, chat_id: str | int, text: str | None) -> str | None:
         return self.build_reply_plan(chat_id=chat_id, text=text).execute()
@@ -325,6 +326,11 @@ class TelegramCommandProcessor:
             return TelegramTextReplyPlan(
                 ack=None,
                 reply=self._handle_unwatch(remainder),
+            )
+        if command in SET_PRICE_COMMANDS:
+            return TelegramTextReplyPlan(
+                ack=None,
+                reply=self._handle_set_price(remainder),
             )
         if not content.startswith("/"):
             intent = self._route_natural_language(content)
@@ -445,6 +451,26 @@ class TelegramCommandProcessor:
             logger.info("Watch deleted watch_id=%s", watch_id)
             return f"已移除追蹤 [{watch_id}]"
         return f"找不到追蹤 ID [{watch_id}]，請用 /watchlist 確認。"
+
+    def _handle_set_price(self, raw: str) -> str:
+        if self._watch_db is None:
+            return "追蹤功能尚未啟用（watch_db 未設定）。"
+        try:
+            watch_id, new_price = parse_set_price_command(raw)
+        except ValueError as exc:
+            return f"{exc}\n格式範例：/setprice abc12345 50000"
+        watch = self._watch_db.get_mercari_watch(watch_id)
+        if watch is None:
+            return f"找不到追蹤 ID [{watch_id}]，請用 /watchlist 確認。"
+        old_price = watch.price_threshold_jpy
+        self._watch_db.update_mercari_watch(watch_id, price_threshold_jpy=new_price)
+        logger.info("Watch price updated watch_id=%s old=%d new=%d", watch_id, old_price, new_price)
+        return (
+            f"已更新追蹤目標價\n"
+            f"ID: {watch_id}\n"
+            f"關鍵字：{watch.query}\n"
+            f"價格上限：¥{old_price:,} → ¥{new_price:,}"
+        )
 
     def build_reputation_delivery(self, raw: str) -> TelegramReputationDelivery:
         if self._reputation_renderer is None:
@@ -573,6 +599,23 @@ class TelegramCommandProcessor:
                 reply=None,
                 reply_factory=lambda wid=wid: self._handle_unwatch(wid),
             )
+        if intent.intent == "update_watch_price":
+            if not intent.watch_id or not intent.watch_price_threshold:
+                return TelegramTextReplyPlan(
+                    ack=None,
+                    reply="請提供追蹤 ID 和新的目標價。例如：把 abc12345 改成 4萬\n可用 /watchlist 查看所有 ID。",
+                )
+            wid = intent.watch_id
+            p = intent.watch_price_threshold
+            logger.info(
+                "Telegram natural-language routed intent=update_watch_price watch_id=%s new_price=%d confidence=%s",
+                wid, p, intent.confidence,
+            )
+            return TelegramTextReplyPlan(
+                ack=f"已理解查詢內容，相當於 /setprice {wid} {p}，正在更新。",
+                reply=None,
+                reply_factory=lambda wid=wid, p=p: self._handle_set_price(f"{wid} {p}"),
+            )
         return None
 
     def _route_natural_language(self, text: str) -> TelegramNaturalLanguageIntent | None:
@@ -622,6 +665,7 @@ class TelegramCommandProcessor:
                 "/watch 想いが重なる場所で 初音ミク SSP on 300000",
                 "/watchlist",
                 "/unwatch <ID>",
+                "/setprice <ID> <新價格>",
                 "You can also ask things like: 幫我查 pokemon Pikachu ex 132/106",
                 "Or: pokemon 熱門前 5",
             ]
@@ -655,6 +699,22 @@ def parse_watch_command(raw: str) -> tuple[str, int]:
     if threshold <= 0:
         raise ValueError("價格上限必須大於 0。")
     return query_part, threshold
+
+
+def parse_set_price_command(raw: str) -> tuple[str, int]:
+    """Parse '/setprice <watch_id> <new_price>' → (watch_id, new_price_jpy)."""
+    parts = raw.strip().split()
+    if len(parts) < 2:
+        raise ValueError("格式錯誤：需要追蹤 ID 和新價格。")
+    watch_id = parts[0]
+    price_str = "".join(parts[1:]).replace(",", "").replace("，", "")
+    try:
+        threshold = int(price_str)
+    except ValueError:
+        raise ValueError(f"價格格式錯誤：'{parts[1]}'，請填入整數日幣金額。")
+    if threshold <= 0:
+        raise ValueError("價格上限必須大於 0。")
+    return watch_id, threshold
 
 
 def parse_lookup_command(raw: str) -> TelegramLookupQuery:
@@ -894,7 +954,7 @@ def run_telegram_polling(
     reputation_renderer: ReputationRenderer | None = None,
     natural_language_router: TelegramNaturalLanguageRouter | None = None,
     ssl_context: ssl.SSLContext | None = None,
-    allowed_chat_id: str | None = None,
+    allowed_chat_ids: frozenset[str] | None = None,
     status_renderer: Callable[[], str] | None = None,
     watch_db: MonitorDatabase | None = None,
     poll_timeout: int = 20,
@@ -905,11 +965,11 @@ def run_telegram_polling(
     me = client.get_me()
     username = me.get("username", "<unknown>")
     logger.info(
-        "Telegram polling starting username=%s notify_startup=%s drop_pending_updates=%s allowed_chat=%s",
+        "Telegram polling starting username=%s notify_startup=%s drop_pending_updates=%s allowed_chats=%s",
         username,
         notify_startup,
         drop_pending_updates,
-        mask_identifier(allowed_chat_id),
+        sorted(allowed_chat_ids or []),
     )
 
     offset: int | None = None
@@ -924,16 +984,17 @@ def run_telegram_polling(
         catalog_renderer=catalog_renderer,
         reputation_renderer=reputation_renderer,
         natural_language_router=natural_language_router,
-        allowed_chat_id=allowed_chat_id,
+        allowed_chat_ids=allowed_chat_ids,
         status_renderer=status_renderer,
         watch_db=watch_db,
     )
     resolved_photo_renderer = photo_renderer or default_photo_renderer()
 
     print(f"OpenClaw Telegram bot polling as @{username}")
-    if notify_startup and allowed_chat_id is not None:
-        client.send_message(chat_id=allowed_chat_id, text="OpenClaw Telegram bot is online.")
-        logger.info("Telegram startup notification sent chat_id=%s", mask_identifier(allowed_chat_id))
+    if notify_startup and allowed_chat_ids:
+        for cid in allowed_chat_ids:
+            client.send_message(chat_id=cid, text="OpenClaw Telegram bot is online.")
+            logger.info("Telegram startup notification sent chat_id=%s", mask_identifier(cid))
 
     try:
         while True:

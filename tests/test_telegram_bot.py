@@ -125,7 +125,7 @@ def test_parse_lookup_command_supports_simple_format() -> None:
 
 def test_command_processor_restricts_unconfigured_chat() -> None:
     processor = TelegramCommandProcessor(
-        allowed_chat_id="999",
+        allowed_chat_ids=frozenset({"999"}),
         lookup_renderer=lambda query: query.name,
         board_loader=lambda: (_stub_board(),),
         catalog_renderer=lambda: "catalog",
@@ -136,7 +136,7 @@ def test_command_processor_restricts_unconfigured_chat() -> None:
 
 def test_command_processor_handles_price_and_trend_aliases() -> None:
     processor = TelegramCommandProcessor(
-        allowed_chat_id="123",
+        allowed_chat_ids=frozenset({"123"}),
         lookup_renderer=lambda query: f"{query.game}:{query.name}:{query.card_number}",
         board_loader=lambda: (_stub_board(),),
         catalog_renderer=lambda: "catalog",
@@ -157,7 +157,7 @@ def test_command_processor_handles_price_and_trend_aliases() -> None:
 
 def test_command_processor_help_lists_trend_and_scan_commands() -> None:
     processor = TelegramCommandProcessor(
-        allowed_chat_id="123",
+        allowed_chat_ids=frozenset({"123"}),
         lookup_renderer=lambda query: query.name,
         board_loader=lambda: (_stub_board(),),
         catalog_renderer=lambda: "catalog",
@@ -179,7 +179,7 @@ def test_parse_reputation_snapshot_command_requires_url() -> None:
 
 def test_command_processor_handles_snapshot_command() -> None:
     processor = TelegramCommandProcessor(
-        allowed_chat_id="123",
+        allowed_chat_ids=frozenset({"123"}),
         lookup_renderer=lambda query: query.name,
         board_loader=lambda: (_stub_board(),),
         catalog_renderer=lambda: "catalog",
@@ -204,7 +204,7 @@ def test_command_processor_handles_natural_language_lookup_via_router() -> None:
         )
     )
     processor = TelegramCommandProcessor(
-        allowed_chat_id="123",
+        allowed_chat_ids=frozenset({"123"}),
         lookup_renderer=lambda query: f"{query.game}:{query.name}:{query.card_number}:{query.rarity}:{query.set_code}",
         board_loader=lambda: (_stub_board(),),
         catalog_renderer=lambda: "catalog",
@@ -227,7 +227,7 @@ def test_command_processor_handles_natural_language_trend_via_router() -> None:
         )
     )
     processor = TelegramCommandProcessor(
-        allowed_chat_id="123",
+        allowed_chat_ids=frozenset({"123"}),
         lookup_renderer=lambda query: query.name,
         board_loader=lambda: (_stub_board(),),
         catalog_renderer=lambda: "catalog",
@@ -250,7 +250,7 @@ def test_command_processor_builds_ack_for_natural_language_trend() -> None:
         )
     )
     processor = TelegramCommandProcessor(
-        allowed_chat_id="123",
+        allowed_chat_ids=frozenset({"123"}),
         lookup_renderer=lambda query: query.name,
         board_loader=lambda: (
             HotCardBoard(
@@ -288,7 +288,7 @@ def test_handle_telegram_message_sends_ack_then_photo_result() -> None:
     sample_path = get_image_lookup_live_case("pokemon-pikachu-partial-s40").image_path
     client = FakeTelegramClient(sample_path=sample_path)
     processor = TelegramCommandProcessor(
-        allowed_chat_id="123",
+        allowed_chat_ids=frozenset({"123"}),
         lookup_renderer=lambda query: query.name,
         board_loader=lambda: (_stub_board(),),
         catalog_renderer=lambda: "catalog",
@@ -315,7 +315,7 @@ def test_handle_telegram_message_sends_ack_then_photo_result() -> None:
 def test_handle_telegram_message_sends_ack_then_text_result() -> None:
     client = FakeTelegramClient()
     processor = TelegramCommandProcessor(
-        allowed_chat_id="123",
+        allowed_chat_ids=frozenset({"123"}),
         lookup_renderer=lambda query: f"{query.game}:{query.name}",
         board_loader=lambda: (_stub_board(),),
         catalog_renderer=lambda: "catalog",
@@ -342,7 +342,7 @@ def test_handle_telegram_message_ignores_generic_price_caption_as_title_hint() -
     sample_path = get_image_lookup_live_case("pokemon-pikachu-partial-s40").image_path
     client = FakeTelegramClient(sample_path=sample_path)
     processor = TelegramCommandProcessor(
-        allowed_chat_id="123",
+        allowed_chat_ids=frozenset({"123"}),
         lookup_renderer=lambda query: query.name,
         board_loader=lambda: (_stub_board(),),
         catalog_renderer=lambda: "catalog",
@@ -372,7 +372,7 @@ def test_handle_telegram_message_sends_snapshot_ack_then_result(tmp_path: Path) 
     pdf_path.write_bytes(b"%PDF-1.4 stub")
     png_path.write_bytes(b"\x89PNG\r\n\x1a\nstub")
     processor = TelegramCommandProcessor(
-        allowed_chat_id="123",
+        allowed_chat_ids=frozenset({"123"}),
         lookup_renderer=lambda query: f"{query.game}:{query.name}",
         board_loader=lambda: (_stub_board(),),
         catalog_renderer=lambda: "catalog",
@@ -418,7 +418,7 @@ def test_handle_telegram_message_sends_natural_language_ack_then_result() -> Non
         )
     )
     processor = TelegramCommandProcessor(
-        allowed_chat_id="123",
+        allowed_chat_ids=frozenset({"123"}),
         lookup_renderer=lambda query: f"{query.game}:{query.name}",
         board_loader=lambda: (
             HotCardBoard(
@@ -472,7 +472,7 @@ def test_handle_telegram_message_sends_natural_language_ack_before_running_heavy
         )
 
     processor = TelegramCommandProcessor(
-        allowed_chat_id="123",
+        allowed_chat_ids=frozenset({"123"}),
         lookup_renderer=lambda query: f"{query.game}:{query.name}",
         board_loader=board_loader,
         catalog_renderer=lambda: "catalog",

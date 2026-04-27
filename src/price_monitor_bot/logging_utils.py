@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-_MASK_IDENTIFIERS_IN_LOGS = True
+import logging
 
 
 def mask_identifier(value: str | int | None) -> str:
     if value is None:
         return "n/a"
     text = str(value)
-    if not _MASK_IDENTIFIERS_IN_LOGS:
+    if logging.root.level <= logging.DEBUG:
         return text
     if len(text) <= 4:
         return "*" * len(text)
