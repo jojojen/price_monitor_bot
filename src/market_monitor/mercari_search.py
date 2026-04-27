@@ -64,11 +64,14 @@ def search_mercari(
                 page.wait_for_timeout(2000)
 
             raw_items = _extract_items(page, max_results=max_results * 3)
-            items = _filter_by_query(raw_items, query)
+            query_matched = _filter_by_query(raw_items, query)
+            items = [item for item in query_matched if int(item.get("price_jpy") or 0) <= price_max]
+            dropped_price = len(query_matched) - len(items)
             logger.info(
-                "Mercari search raw=%d matched=%d query=%s",
+                "Mercari search raw=%d matched=%d price_filtered=%d query=%s",
                 len(raw_items),
                 len(items),
+                dropped_price,
                 query,
             )
             return items[:max_results]
