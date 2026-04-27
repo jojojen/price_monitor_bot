@@ -27,8 +27,15 @@ _ROUTER_JSON_SCHEMA = {
         "set_code": {"type": ["string", "null"]},
         "limit": {"type": ["integer", "null"]},
         "confidence": {"type": ["number", "null"]},
+        # watch fields
+        "watch_query": {"type": ["string", "null"]},
+        "watch_price_threshold": {"type": ["integer", "null"]},
+        "watch_id": {"type": ["string", "null"]},
     },
-    "required": ["intent", "game", "name", "card_number", "rarity", "set_code", "limit", "confidence"],
+    "required": [
+        "intent", "game", "name", "card_number", "rarity", "set_code", "limit", "confidence",
+        "watch_query", "watch_price_threshold", "watch_id",
+    ],
     "additionalProperties": False,
 }
 
@@ -53,6 +60,36 @@ _TREND_KEYWORDS = (
     "heat",
     "liquidity",
 )
+_WATCH_ADD_KEYWORDS = (
+    "追蹤",
+    "監控",
+    "盯",
+    "watch",
+    "提醒",
+    "通知我",
+    "低於",
+    "以下",
+    "以內",
+    "watcher",
+    "alert",
+)
+_WATCH_LIST_KEYWORDS = (
+    "追蹤清單",
+    "追蹤列表",
+    "我的追蹤",
+    "追蹤了什麼",
+    "watchlist",
+    "watches",
+    "清單",
+)
+_WATCH_REMOVE_KEYWORDS = (
+    "取消追蹤",
+    "停止追蹤",
+    "移除追蹤",
+    "刪除追蹤",
+    "unwatch",
+    "stopwatch",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +102,10 @@ class TelegramNaturalLanguageIntent:
     set_code: str | None = None
     limit: int | None = None
     confidence: float | None = None
+    # watch-specific fields
+    watch_query: str | None = None
+    watch_price_threshold: int | None = None
+    watch_id: str | None = None
 
 
 class TelegramNaturalLanguageRouter:
@@ -107,10 +148,14 @@ class TelegramNaturalLanguageRouter:
 
     def _build_prompt(self, text: str) -> str:
         return (
-            "You route Telegram messages for a trading-card assistant and must return only JSON.\n"
-            "Allowed intents: lookup_card, trend_board, help, unknown.\n"
+            "You route Telegram messages for a trading-card price assistant and must return only JSON.\n"
+            "Allowed intents: lookup_card, trend_board, add_watch, list_watches, remove_watch, help, unknown.\n"
             "Use lookup_card when the user wants the price, value, or card lookup of one specific card.\n"
             "Use trend_board when the user asks for hot, trending, liquidity, or ranking cards.\n"
+            "Use add_watch when the user wants to track/monitor a product and be notified below a price threshold.\n"
+            "  Set watch_query to the product name/keywords, watch_price_threshold to the integer JPY limit.\n"
+            "Use list_watches when the user wants to see their watchlist / tracked items.\n"
+            "Use remove_watch when the user wants to stop tracking / unwatch an item. Set watch_id if mentioned.\n"
             "Use help when the user asks what the bot can do.\n"
             "Use unknown when the request is unrelated or too ambiguous.\n"
             'Game must be "pokemon", "ws", or null.\n'
@@ -118,11 +163,15 @@ class TelegramNaturalLanguageRouter:
             "Infer ws for wording like Weiss, WS, Weiß Schwarz, ヴァイス.\n"
             "Extract only high-confidence structured fields.\n"
             "Do not invent card numbers, rarity, or set codes.\n"
-            "For trend_board, name/card_number/rarity/set_code should be null and limit should be 1-10 when specified, otherwise 5.\n"
-            "For lookup_card, keep the card name concise and leave missing metadata null.\n"
+            "For trend_board, limit should be 1-10 when specified, otherwise 5.\n"
+            "For add_watch, watch_price_threshold is an integer JPY amount (e.g. 50000 for 5万).\n"
+            "For fields not applicable to the intent, return null.\n"
             "Examples:\n"
             '- "幫我查寶可夢 リザードンex 201/165 SAR" -> lookup_card\n'
             '- "pokemon 熱門前5" -> trend_board\n'
+            '- "追蹤 初音ミク SSP 5万以下" -> add_watch, watch_query="初音ミク SSP", watch_price_threshold=50000\n'
+            '- "看我的追蹤清單" -> list_watches\n'
+            '- "取消追蹤 abc12345" -> remove_watch, watch_id="abc12345"\n'
             '- "你會什麼" -> help\n'
             '- "明天天氣如何" -> unknown\n'
             f"User message:\n{text}\n"
@@ -174,11 +223,113 @@ def build_telegram_natural_language_router(
     )
 
 
+_KANJI_MAN: dict[str, int] = {
+    "一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+    "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
+    "百": 100, "千": 1000,
+}
+
+
+def _parse_price_threshold(text: str) -> int | None:
+    """Extract a JPY price threshold from natural language.
+
+    Handles patterns like: 50000, 5万, 50,000, ¥300000, 三十万, 五万, 30万, etc.
+    Returns the integer JPY value, or None if not found.
+    """
+    # Strip currency symbols and commas
+    cleaned = text.replace("¥", "").replace("，", "").replace(",", "").replace("円", "").replace("日幣", "").replace("日元", "").replace("日圓", "").replace("以下", "").replace("以內", "").replace("以内", "").replace("低於", "").replace("不超過", "")
+
+    # Pattern: digits optionally followed by 万/萬 (man = 10,000)
+    man_match = re.search(r"(\d+(?:\.\d+)?)\s*[万萬]", cleaned)
+    if man_match:
+        return int(float(man_match.group(1)) * 10000)
+
+    # Pattern: kanji number + 万/萬, e.g. 三十万, 五万
+    kanji_man_match = re.search(r"([一二三四五六七八九十百千]+)\s*[万萬]", cleaned)
+    if kanji_man_match:
+        kanji_val = _parse_kanji_number(kanji_man_match.group(1))
+        if kanji_val is not None:
+            return kanji_val * 10000
+
+    # Pattern: plain digits (must be >= 100 to avoid false positives)
+    digit_match = re.search(r"\b(\d{3,7})\b", cleaned)
+    if digit_match:
+        return int(digit_match.group(1))
+
+    return None
+
+
+def _parse_kanji_number(kanji: str) -> int | None:
+    """Parse a simple kanji numeral like 三十, 五, 百二十 into an integer."""
+    if not kanji:
+        return None
+    result = 0
+    current = 0
+    for ch in kanji:
+        val = _KANJI_MAN.get(ch)
+        if val is None:
+            return None
+        if val >= 10:
+            if current == 0:
+                current = 1
+            result += current * val
+            current = 0
+        else:
+            current = val
+    return result + current if result + current > 0 else None
+
+
+def _extract_watch_query(text: str) -> str | None:
+    """Strip watch-command keywords and price part, return the remaining product query."""
+    # Remove trigger keywords
+    stripped = text
+    for kw in (*_WATCH_ADD_KEYWORDS, "幫我", "我想", "請", "幫", "要"):
+        stripped = re.sub(re.escape(kw), " ", stripped, flags=re.IGNORECASE)
+    # Remove price portion: digits + 万/萬 or plain digits near threshold words
+    stripped = re.sub(r"\d+(?:\.\d+)?\s*[万萬]?", " ", stripped)
+    stripped = re.sub(r"[一二三四五六七八九十百千]+\s*[万萬]", " ", stripped)
+    # Remove stray punctuation
+    stripped = re.sub(r"[，、。！？!?¥￥]", " ", stripped)
+    query = " ".join(stripped.split()).strip()
+    return query if len(query) >= 2 else None
+
+
 def fallback_route_telegram_natural_language(text: str) -> TelegramNaturalLanguageIntent | None:
     content = text.strip()
     if not content:
         return None
     lowered = content.lower()
+
+    # ── Watch intents (check before generic lookup so keywords don't conflict) ──
+
+    # remove_watch: "取消追蹤 abc123" / "unwatch abc123"
+    if any(kw in lowered for kw in _WATCH_REMOVE_KEYWORDS):
+        # Try to extract a watch_id token (hex-like short id)
+        id_match = re.search(r"\b([0-9a-f]{8,16})\b", lowered)
+        watch_id = id_match.group(1) if id_match else None
+        return TelegramNaturalLanguageIntent(
+            intent="remove_watch",
+            watch_id=watch_id,
+            confidence=0.7,
+        )
+
+    # list_watches: "追蹤清單" / "我的追蹤" / "watchlist"
+    if any(kw in lowered for kw in _WATCH_LIST_KEYWORDS):
+        return TelegramNaturalLanguageIntent(intent="list_watches", confidence=0.75)
+
+    # add_watch: "追蹤 初音ミク SSP 5萬以下" / "提醒我 xxx 低於 50000"
+    if any(kw in lowered for kw in _WATCH_ADD_KEYWORDS):
+        threshold = _parse_price_threshold(content)
+        query = _extract_watch_query(content)
+        if query or threshold:
+            return TelegramNaturalLanguageIntent(
+                intent="add_watch",
+                watch_query=query,
+                watch_price_threshold=threshold,
+                confidence=0.55 if (query and threshold) else 0.35,
+            )
+
+    # ── Original intents ──────────────────────────────────────────────────────
 
     if any(keyword in lowered for keyword in ("help", "指令", "怎麼用", "會什麼")):
         return TelegramNaturalLanguageIntent(intent="help", confidence=0.35)
@@ -268,7 +419,7 @@ def _load_json_fragment(value: str) -> object:
 
 def _normalize_intent(payload: dict[str, object]) -> TelegramNaturalLanguageIntent:
     intent = str(payload.get("intent", "unknown")).strip().lower()
-    if intent not in {"lookup_card", "trend_board", "help", "unknown"}:
+    if intent not in {"lookup_card", "trend_board", "add_watch", "list_watches", "remove_watch", "help", "unknown"}:
         intent = "unknown"
 
     game = _normalize_game(payload.get("game"))
@@ -278,6 +429,9 @@ def _normalize_intent(payload: dict[str, object]) -> TelegramNaturalLanguageInte
     set_code = _normalize_token(payload.get("set_code"), uppercase=False)
     limit = _normalize_limit(payload.get("limit"))
     confidence = _normalize_confidence(payload.get("confidence"))
+    watch_query = _normalize_text_field(payload.get("watch_query"))
+    watch_price_threshold = _normalize_price_threshold(payload.get("watch_price_threshold"))
+    watch_id = _normalize_text_field(payload.get("watch_id"))
 
     if intent == "trend_board" and limit is None:
         limit = 5
@@ -290,6 +444,9 @@ def _normalize_intent(payload: dict[str, object]) -> TelegramNaturalLanguageInte
         set_code=set_code,
         limit=limit,
         confidence=confidence,
+        watch_query=watch_query,
+        watch_price_threshold=watch_price_threshold,
+        watch_id=watch_id,
     )
 
 
@@ -338,6 +495,23 @@ def _normalize_confidence(value: object) -> float | None:
     if isinstance(value, str):
         try:
             return float(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _normalize_price_threshold(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        v = int(value)
+        return v if v > 0 else None
+    if isinstance(value, str):
+        try:
+            v = int(value.strip().replace(",", "").replace("，", ""))
+            return v if v > 0 else None
         except ValueError:
             return None
     return None

@@ -328,7 +328,7 @@ class TelegramCommandProcessor:
             )
         if not content.startswith("/"):
             intent = self._route_natural_language(content)
-            natural_language_plan = self._build_natural_language_reply_plan(intent)
+            natural_language_plan = self._build_natural_language_reply_plan(intent, chat_id=chat_id)
             if natural_language_plan is not None:
                 return natural_language_plan
 
@@ -471,6 +471,8 @@ class TelegramCommandProcessor:
     def _build_natural_language_reply_plan(
         self,
         intent: TelegramNaturalLanguageIntent | None,
+        *,
+        chat_id: str | int = "",
     ) -> TelegramTextReplyPlan | None:
         if intent is None:
             return None
@@ -535,6 +537,42 @@ class TelegramCommandProcessor:
                     ack=None,
                     reply=f"Lookup failed: {exc}",
                 )
+        if intent.intent == "add_watch":
+            if not intent.watch_query or not intent.watch_price_threshold:
+                return TelegramTextReplyPlan(
+                    ack=None,
+                    reply="請提供追蹤關鍵字和價格上限。例如：追蹤 初音ミク SSP 5萬以下",
+                )
+            q = intent.watch_query
+            p = intent.watch_price_threshold
+            logger.info(
+                "Telegram natural-language routed intent=add_watch watch_query=%s watch_price_threshold=%d confidence=%s",
+                q, p, intent.confidence,
+            )
+            return TelegramTextReplyPlan(
+                ack=f"已理解查詢內容，相當於 /watch {q} on {p}，開始設定。",
+                reply=None,
+                reply_factory=lambda q=q, p=p, cid=chat_id: self._handle_watch(f"{q} on {p}", str(cid)),
+            )
+        if intent.intent == "list_watches":
+            logger.info("Telegram natural-language routed intent=list_watches confidence=%s", intent.confidence)
+            return TelegramTextReplyPlan(ack=None, reply=self._handle_watchlist())
+        if intent.intent == "remove_watch":
+            if not intent.watch_id:
+                return TelegramTextReplyPlan(
+                    ack=None,
+                    reply="請提供要取消的追蹤 ID。例如：取消追蹤 abc12345\n可用 /watchlist 查看所有 ID。",
+                )
+            wid = intent.watch_id
+            logger.info(
+                "Telegram natural-language routed intent=remove_watch watch_id=%s confidence=%s",
+                wid, intent.confidence,
+            )
+            return TelegramTextReplyPlan(
+                ack=f"已理解查詢內容，相當於 /unwatch {wid}，正在移除。",
+                reply=None,
+                reply_factory=lambda wid=wid: self._handle_unwatch(wid),
+            )
         return None
 
     def _route_natural_language(self, text: str) -> TelegramNaturalLanguageIntent | None:
