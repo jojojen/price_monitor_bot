@@ -13,6 +13,7 @@ from market_monitor.storage import MercariWatch, MonitorDatabase
 logger = logging.getLogger(__name__)
 
 NotifyFn = Callable[[str, str], None]  # (chat_id, text)
+SnapshotFn = Callable[[str, list[str]], None]  # (chat_id, item_urls)
 
 
 class MercariWatchMonitor:
@@ -21,10 +22,12 @@ class MercariWatchMonitor:
         *,
         db_path: str | Path,
         notify_fn: NotifyFn,
+        snapshot_fn: SnapshotFn | None = None,
         interval_seconds: int = 60,
     ) -> None:
         self._db = MonitorDatabase(db_path)
         self._notify_fn = notify_fn
+        self._snapshot_fn = snapshot_fn
         self._interval = interval_seconds
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -120,6 +123,20 @@ class MercariWatchMonitor:
                     [str(item.get("item_id", "")) for item in new_or_changed
                      if item.get("item_id")],
                 )
+                if self._snapshot_fn:
+                    new_urls = [
+                        str(item.get("url") or "")
+                        for item in new_or_changed[:3]
+                        if item.get("_event") != "price_changed" and item.get("url")
+                    ]
+                    if new_urls:
+                        try:
+                            self._snapshot_fn(watch.chat_id, new_urls)
+                        except Exception:
+                            logger.exception(
+                                "MercariWatchMonitor: snapshot callback failed watch_id=%s",
+                                watch.watch_id,
+                            )
         else:
             logger.debug("MercariWatchMonitor: no new or changed items watch_id=%s", watch.watch_id)
 
@@ -165,6 +182,7 @@ def ensure_monitor(
     *,
     db_path: str | Path,
     notify_fn: NotifyFn,
+    snapshot_fn: SnapshotFn | None = None,
     interval_seconds: int = 60,
 ) -> tuple[MercariWatchMonitor, bool]:
     """Return the running monitor singleton, starting it if needed. Returns (monitor, started_now)."""
@@ -175,6 +193,7 @@ def ensure_monitor(
         _monitor = MercariWatchMonitor(
             db_path=db_path,
             notify_fn=notify_fn,
+            snapshot_fn=snapshot_fn,
             interval_seconds=interval_seconds,
         )
         _monitor.start()

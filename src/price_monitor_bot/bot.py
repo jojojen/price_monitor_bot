@@ -9,6 +9,7 @@ import time
 import threading
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Callable
 from urllib.error import HTTPError, URLError
@@ -98,6 +99,7 @@ class TelegramTextReplyPlan:
     ack: str | None
     reply: str | None
     reply_factory: Callable[[], str] | None = None
+    reputation_delivery_factory: "Callable[[], TelegramReputationDelivery] | None" = None
 
     def execute(self) -> str | None:
         if self.reply is not None:
@@ -430,7 +432,7 @@ class TelegramCommandProcessor:
         lines = [f"目前追蹤清單（共 {len(watches)} 項）："]
         for w in watches:
             status = "✓ 啟用" if w.enabled else "✗ 停用"
-            checked = w.last_checked_at[:16].replace("T", " ") if w.last_checked_at else "尚未檢查"
+            checked = _format_local_time(w.last_checked_at) if w.last_checked_at else "尚未檢查"
             lines.append(
                 f"\n[{w.watch_id}] {status}\n"
                 f"  關鍵字：{w.query}\n"
@@ -616,6 +618,23 @@ class TelegramCommandProcessor:
                 reply=None,
                 reply_factory=lambda wid=wid, p=p: self._handle_set_price(f"{wid} {p}"),
             )
+        if intent.intent == "reputation_snapshot":
+            if not intent.query_url:
+                return TelegramTextReplyPlan(
+                    ack=None,
+                    reply="請提供商品或賣家的網址。\n例如：查詢信用 https://jp.mercari.com/item/m123456789",
+                )
+            url = intent.query_url
+            logger.info(
+                "Telegram natural-language routed intent=reputation_snapshot query_url=%s confidence=%s",
+                trim_for_log(url, limit=240),
+                intent.confidence,
+            )
+            return TelegramTextReplyPlan(
+                ack=f"已理解查詢內容，相當於 /snapshot {url}，正在建立信譽快照…",
+                reply=None,
+                reputation_delivery_factory=lambda url=url: self.build_reputation_delivery(url),
+            )
         return None
 
     def _route_natural_language(self, text: str) -> TelegramNaturalLanguageIntent | None:
@@ -623,18 +642,20 @@ class TelegramCommandProcessor:
             try:
                 intent = self._natural_language_router.route(text)
             except Exception:
-                logger.exception("Telegram natural-language router failed text=%s", trim_for_log(text, limit=240))
+                logger.exception("Telegram natural-language router failed, falling back to keyword rules text=%s", trim_for_log(text, limit=240))
             else:
+                # LLM responded successfully — trust its answer, even if "unknown"
                 if intent is not None and intent.intent != "unknown":
                     return intent
+                logger.debug("Telegram natural-language LLM returned unknown, not overriding with keyword rules")
+                return None
+
+        # LLM not configured, or LLM threw an exception — use keyword fallback as last resort
         fallback_intent = fallback_route_telegram_natural_language(text)
         if fallback_intent is not None and fallback_intent.intent != "unknown":
             logger.info(
-                "Telegram natural-language fallback intent=%s game=%s name=%s limit=%s confidence=%s",
+                "Telegram natural-language fallback (no LLM) intent=%s confidence=%s",
                 fallback_intent.intent,
-                fallback_intent.game,
-                fallback_intent.name,
-                fallback_intent.limit,
                 fallback_intent.confidence,
             )
             return fallback_intent
@@ -670,6 +691,14 @@ class TelegramCommandProcessor:
                 "Or: pokemon 熱門前 5",
             ]
         )
+
+
+def _format_local_time(ts: str) -> str:
+    """Convert a UTC ISO timestamp from DB to local timezone for display."""
+    try:
+        return datetime.fromisoformat(ts).astimezone().strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return ts[:16].replace("T", " ")
 
 
 def parse_watch_command(raw: str) -> tuple[str, int]:
@@ -1068,6 +1097,12 @@ def handle_telegram_message(
     if plan.ack:
         client.send_message(chat_id=chat_id, text=plan.ack)
         replies.append(plan.ack)
+
+    if plan.reputation_delivery_factory is not None:
+        delivery = plan.reputation_delivery_factory()
+        _send_reputation_delivery(client=client, chat_id=chat_id, delivery=delivery)
+        replies.append(delivery.summary_text)
+        return tuple(replies)
 
     reply = plan.execute()
     if reply:

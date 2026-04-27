@@ -31,10 +31,12 @@ _ROUTER_JSON_SCHEMA = {
         "watch_query": {"type": ["string", "null"]},
         "watch_price_threshold": {"type": ["integer", "null"]},
         "watch_id": {"type": ["string", "null"]},
+        # reputation snapshot field
+        "query_url": {"type": ["string", "null"]},
     },
     "required": [
         "intent", "game", "name", "card_number", "rarity", "set_code", "limit", "confidence",
-        "watch_query", "watch_price_threshold", "watch_id",
+        "watch_query", "watch_price_threshold", "watch_id", "query_url",
     ],
     "additionalProperties": False,
 }
@@ -99,6 +101,19 @@ _WATCH_UPDATE_PRICE_KEYWORDS = (
     "setprice",
     "updatewatch",
 )
+_REPUTATION_KEYWORDS = (
+    "信用",
+    "信譽",
+    "信頼",
+    "查信",
+    "查賣家",
+    "reputation",
+    "repcheck",
+    "snapshot",
+    "快照",
+    "proof",
+)
+_URL_PATTERN = re.compile(r"https?://\S+")
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +130,8 @@ class TelegramNaturalLanguageIntent:
     watch_query: str | None = None
     watch_price_threshold: int | None = None
     watch_id: str | None = None
+    # reputation snapshot field
+    query_url: str | None = None
 
 
 class TelegramNaturalLanguageRouter:
@@ -158,7 +175,7 @@ class TelegramNaturalLanguageRouter:
     def _build_prompt(self, text: str) -> str:
         return (
             "You route Telegram messages for a trading-card price assistant and must return only JSON.\n"
-            "Allowed intents: lookup_card, trend_board, add_watch, list_watches, remove_watch, update_watch_price, help, unknown.\n"
+            "Allowed intents: lookup_card, trend_board, add_watch, list_watches, remove_watch, update_watch_price, reputation_snapshot, help, unknown.\n"
             "Use lookup_card when the user wants the price, value, or card lookup of one specific card.\n"
             "Use trend_board when the user asks for hot, trending, liquidity, or ranking cards.\n"
             "Use add_watch when the user wants to track/monitor a product and be notified below a price threshold.\n"
@@ -166,6 +183,8 @@ class TelegramNaturalLanguageRouter:
             "Use list_watches when the user wants to see their watchlist / tracked items.\n"
             "Use remove_watch when the user wants to stop tracking / unwatch an item. Set watch_id if mentioned.\n"
             "Use update_watch_price when the user wants to change the price threshold of an existing watch. Set watch_id and watch_price_threshold.\n"
+            "Use reputation_snapshot when the user wants to check a seller's reputation/trust/credit or take a snapshot of a URL.\n"
+            "  Set query_url to the URL found in the message (Mercari item or profile URL).\n"
             "Use help when the user asks what the bot can do.\n"
             "Use unknown when the request is unrelated or too ambiguous.\n"
             'Game must be "pokemon", "ws", or null.\n'
@@ -183,6 +202,8 @@ class TelegramNaturalLanguageRouter:
             '- "看我的追蹤清單" -> list_watches\n'
             '- "取消追蹤 abc12345" -> remove_watch, watch_id="abc12345"\n'
             '- "把 abc12345 改成 4萬" -> update_watch_price, watch_id="abc12345", watch_price_threshold=40000\n'
+            '- "查詢信用 https://jp.mercari.com/item/m12345" -> reputation_snapshot, query_url="https://jp.mercari.com/item/m12345"\n'
+            '- "這個賣家信譽如何 https://jp.mercari.com/item/m12345" -> reputation_snapshot, query_url="https://jp.mercari.com/item/m12345"\n'
             '- "你會什麼" -> help\n'
             '- "明天天氣如何" -> unknown\n'
             f"User message:\n{text}\n"
@@ -310,6 +331,15 @@ def fallback_route_telegram_natural_language(text: str) -> TelegramNaturalLangua
     if not content:
         return None
     lowered = content.lower()
+
+    # ── Reputation snapshot: URL present + reputation-related keyword ──────────
+    url_match = _URL_PATTERN.search(content)
+    if url_match and any(kw in lowered for kw in _REPUTATION_KEYWORDS):
+        return TelegramNaturalLanguageIntent(
+            intent="reputation_snapshot",
+            query_url=url_match.group(0),
+            confidence=0.85,
+        )
 
     # ── Watch intents (check before generic lookup so keywords don't conflict) ──
 
@@ -442,7 +472,7 @@ def _load_json_fragment(value: str) -> object:
 
 def _normalize_intent(payload: dict[str, object]) -> TelegramNaturalLanguageIntent:
     intent = str(payload.get("intent", "unknown")).strip().lower()
-    if intent not in {"lookup_card", "trend_board", "add_watch", "list_watches", "remove_watch", "update_watch_price", "help", "unknown"}:
+    if intent not in {"lookup_card", "trend_board", "add_watch", "list_watches", "remove_watch", "update_watch_price", "reputation_snapshot", "help", "unknown"}:
         intent = "unknown"
 
     game = _normalize_game(payload.get("game"))
@@ -455,6 +485,7 @@ def _normalize_intent(payload: dict[str, object]) -> TelegramNaturalLanguageInte
     watch_query = _normalize_text_field(payload.get("watch_query"))
     watch_price_threshold = _normalize_price_threshold(payload.get("watch_price_threshold"))
     watch_id = _normalize_text_field(payload.get("watch_id"))
+    query_url = _normalize_text_field(payload.get("query_url"))
 
     if intent == "trend_board" and limit is None:
         limit = 5
@@ -470,6 +501,7 @@ def _normalize_intent(payload: dict[str, object]) -> TelegramNaturalLanguageInte
         watch_query=watch_query,
         watch_price_threshold=watch_price_threshold,
         watch_id=watch_id,
+        query_url=query_url,
     )
 
 
