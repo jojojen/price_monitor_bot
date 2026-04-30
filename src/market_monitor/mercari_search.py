@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
+import shutil
 from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
@@ -32,14 +34,14 @@ def search_mercari(
         from playwright.sync_api import sync_playwright
     except ImportError as exc:
         raise RuntimeError(
-            "playwright is not installed — run: pip install playwright && playwright install chromium"
+            "playwright is not installed; run: pip install playwright && playwright install chromium"
         ) from exc
 
     url = build_search_url(query, price_max=price_max)
     logger.info("Mercari search query=%s price_max=%d url=%s", query, price_max, url)
 
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True)
+        browser = playwright.chromium.launch(**_chromium_launch_options())
         context = browser.new_context(
             locale="ja-JP",
             user_agent=(
@@ -81,6 +83,25 @@ def search_mercari(
 
 
 # ── Relevance filter ──────────────────────────────────────────────────────────
+
+def _chromium_launch_options() -> dict[str, object]:
+    options: dict[str, object] = {"headless": True}
+    executable_path = _resolve_chromium_executable()
+    if executable_path:
+        options["executable_path"] = executable_path
+    return options
+
+
+def _resolve_chromium_executable() -> str | None:
+    configured = os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH")
+    if configured:
+        return configured
+    for candidate in ("chromium", "chromium-browser", "google-chrome-stable"):
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+    return None
+
 
 def _normalise(text: str) -> str:
     """Lower-case and normalise spaces/full-width chars for substring matching."""

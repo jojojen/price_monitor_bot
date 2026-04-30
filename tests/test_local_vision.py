@@ -35,6 +35,17 @@ def test_build_local_vision_clients_supports_comma_separated_models() -> None:
     assert [client.model for client in clients] == ["qwen2.5vl:3b", "gemma3:4b"]
 
 
+def test_build_local_vision_clients_allows_disabled_backend_with_stale_model() -> None:
+    clients = build_local_vision_clients(
+        endpoint="http://127.0.0.1:11434",
+        model_list="qwen2.5vl:3b",
+        backend=None,
+        timeout_seconds=75,
+    )
+
+    assert clients == ()
+
+
 def test_ollama_local_vision_client_parses_structured_card_response(monkeypatch, tmp_path) -> None:
     image_path = tmp_path / "charizard.jpg"
     image_path.write_bytes(b"fake-image")

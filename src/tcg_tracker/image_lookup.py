@@ -158,7 +158,20 @@ class TcgImagePriceService:
         tesseract_path: str | None = None,
         tessdata_dir: str | None = None,
         vision_settings: TcgVisionSettings | None = None,
+        settings: object | None = None,
     ) -> None:
+        if settings is not None:
+            db_path = db_path or getattr(settings, "monitor_db_path", None)
+            tesseract_path = tesseract_path or getattr(settings, "openclaw_tesseract_path", None)
+            tessdata_dir = tessdata_dir or getattr(settings, "openclaw_tessdata_dir", None)
+            if vision_settings is None:
+                vision_settings = TcgVisionSettings(
+                    backend=getattr(settings, "openclaw_local_vision_backend", "ollama") or "",
+                    endpoint=getattr(settings, "openclaw_local_vision_endpoint", "http://127.0.0.1:11434"),
+                    model=getattr(settings, "openclaw_local_vision_model", None),
+                    timeout_seconds=getattr(settings, "openclaw_local_vision_timeout_seconds", 180),
+                    ssl_context=getattr(settings, "openclaw_ssl_context", None),
+                )
         self._db_path = Path(db_path or "data/monitor.sqlite3")
         self._tesseract_path = _resolve_tesseract_path(tesseract_path)
         self._tessdata_dir = _resolve_tessdata_dir(tessdata_dir)

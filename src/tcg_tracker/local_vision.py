@@ -319,13 +319,21 @@ class OllamaLocalVisionClient:
 
 
 def build_local_vision_client(
+    settings: object | None = None,
     *,
-    endpoint: str,
-    model_list: str | None,
+    endpoint: str = "http://127.0.0.1:11434",
+    model_list: str | None = None,
     backend: str = "ollama",
     timeout_seconds: int = 180,
     ssl_context: ssl.SSLContext | None = None,
 ) -> OllamaLocalVisionClient | None:
+    if settings is not None:
+        endpoint = getattr(settings, "openclaw_local_vision_endpoint", endpoint)
+        model_list = getattr(settings, "openclaw_local_vision_model", model_list)
+        backend = getattr(settings, "openclaw_local_vision_backend", backend)
+        if backend is None:
+            backend = "ollama"
+        timeout_seconds = getattr(settings, "openclaw_local_vision_timeout_seconds", timeout_seconds)
     clients = build_local_vision_clients(
         endpoint=endpoint,
         model_list=model_list,
@@ -339,18 +347,28 @@ def build_local_vision_client(
 
 
 def build_local_vision_clients(
+    settings: object | None = None,
     *,
-    endpoint: str,
-    model_list: str | None,
-    backend: str = "ollama",
+    endpoint: str = "http://127.0.0.1:11434",
+    model_list: str | None = None,
+    backend: str | None = "ollama",
     timeout_seconds: int = 180,
     ssl_context: ssl.SSLContext | None = None,
 ) -> tuple[OllamaLocalVisionClient, ...]:
+    if settings is not None:
+        endpoint = getattr(settings, "openclaw_local_vision_endpoint", endpoint)
+        model_list = getattr(settings, "openclaw_local_vision_model", model_list)
+        backend = getattr(settings, "openclaw_local_vision_backend", backend)
+        if backend is None:
+            backend = "ollama"
+        timeout_seconds = getattr(settings, "openclaw_local_vision_timeout_seconds", timeout_seconds)
     models = _parse_model_list(model_list)
     if not models:
         return ()
 
-    resolved_backend = backend.strip().lower()
+    resolved_backend = (backend or "").strip().lower()
+    if not resolved_backend:
+        return ()
     if resolved_backend != "ollama":
         logger.warning("Unsupported local vision backend=%s", resolved_backend)
         return ()
