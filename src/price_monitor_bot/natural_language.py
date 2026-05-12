@@ -113,6 +113,45 @@ _REPUTATION_KEYWORDS = (
     "快照",
     "proof",
 )
+_STATUS_KEYWORDS = (
+    "status",
+    "狀態",
+    "状态",
+    "目前狀況",
+    "目前状态",
+    "現在狀況",
+    "現在状态",
+    "模型",
+    "運行",
+    "运行",
+    "健康",
+    "health",
+)
+_TOOLS_KEYWORDS = (
+    "tools",
+    "tool",
+    "工具",
+    "功能清單",
+    "功能列表",
+    "工具清單",
+    "工具列表",
+    "所有工具",
+    "可用工具",
+    "capabilities",
+    "catalog",
+)
+_SCAN_KEYWORDS = (
+    "scan",
+    "掃圖",
+    "扫图",
+    "圖片查價",
+    "图片查价",
+    "照片查價",
+    "照片查价",
+    "image lookup",
+    "photo lookup",
+    "ocr",
+)
 _URL_PATTERN = re.compile(r"https?://\S+")
 
 
@@ -143,11 +182,13 @@ class TelegramNaturalLanguageRouter:
         endpoint: str,
         model: str,
         timeout_seconds: int,
+        tool_spec: str | None = None,
         ssl_context: ssl.SSLContext | None = None,
     ) -> None:
         self.endpoint = endpoint.rstrip("/")
         self.model = model
         self.timeout_seconds = timeout_seconds
+        self.tool_spec = tool_spec.strip() if tool_spec else ""
         self._ssl_context = ssl_context if self.endpoint.startswith("https://") else None
 
     @property
@@ -173,9 +214,11 @@ class TelegramNaturalLanguageRouter:
         return _normalize_intent(parsed)
 
     def _build_prompt(self, text: str) -> str:
+        tool_spec_block = f"Tool spec:\n{self.tool_spec}\n\n" if self.tool_spec else ""
         return (
             "You route Telegram messages for a trading-card price assistant and must return only JSON.\n"
-            "Allowed intents: lookup_card, trend_board, add_watch, list_watches, remove_watch, update_watch_price, reputation_snapshot, help, unknown.\n"
+            "Allowed intents: lookup_card, trend_board, add_watch, list_watches, remove_watch, update_watch_price, reputation_snapshot, help, status, tools, scan_help, unknown.\n"
+            + tool_spec_block +
             "Use lookup_card when the user wants the price, value, or card lookup of one specific card.\n"
             "Use trend_board when the user asks for hot, trending, liquidity, or ranking cards.\n"
             "Use add_watch when the user wants to track/monitor a product and be notified below a price threshold.\n"
@@ -186,6 +229,9 @@ class TelegramNaturalLanguageRouter:
             "Use reputation_snapshot when the user wants to check a seller's reputation/trust/credit or take a snapshot of a URL.\n"
             "  Set query_url to the URL found in the message (Mercari item or profile URL).\n"
             "Use help when the user asks what the bot can do.\n"
+            "Use status when the user asks about current runtime state, models, or service health.\n"
+            "Use tools when the user explicitly asks for the full tool catalog or list of available tools.\n"
+            "Use scan_help when the user asks how to scan a card from a photo or wants image-lookup instructions before sending a photo.\n"
             "Use unknown when the request is unrelated or too ambiguous.\n"
             'Game must be "pokemon", "ws", or null.\n'
             "Infer pokemon for wording like Pokemon, PTCG, 寶可夢, 寶可卡.\n"
@@ -205,6 +251,9 @@ class TelegramNaturalLanguageRouter:
             '- "查詢信用 https://jp.mercari.com/item/m12345" -> reputation_snapshot, query_url="https://jp.mercari.com/item/m12345"\n'
             '- "這個賣家信譽如何 https://jp.mercari.com/item/m12345" -> reputation_snapshot, query_url="https://jp.mercari.com/item/m12345"\n'
             '- "你會什麼" -> help\n'
+            '- "你現在狀態如何" -> status\n'
+            '- "列出所有工具" -> tools\n'
+            '- "我要怎麼用照片查價" -> scan_help\n'
             '- "明天天氣如何" -> unknown\n'
             f"User message:\n{text}\n"
         )
@@ -239,6 +288,7 @@ def build_telegram_natural_language_router(
     model: str | None = None,
     backend: str = "ollama",
     timeout_seconds: int = 180,
+    tool_spec: str | None = None,
     ssl_context: ssl.SSLContext | None = None,
 ) -> TelegramNaturalLanguageRouter | None:
     if not model:
@@ -251,6 +301,7 @@ def build_telegram_natural_language_router(
         endpoint=endpoint,
         model=model,
         timeout_seconds=max(1, timeout_seconds),
+        tool_spec=tool_spec,
         ssl_context=ssl_context,
     )
 
@@ -387,6 +438,15 @@ def fallback_route_telegram_natural_language(text: str) -> TelegramNaturalLangua
     if any(keyword in lowered for keyword in ("help", "指令", "怎麼用", "會什麼")):
         return TelegramNaturalLanguageIntent(intent="help", confidence=0.35)
 
+    if any(keyword in lowered for keyword in _TOOLS_KEYWORDS):
+        return TelegramNaturalLanguageIntent(intent="tools", confidence=0.45)
+
+    if any(keyword in lowered for keyword in _STATUS_KEYWORDS):
+        return TelegramNaturalLanguageIntent(intent="status", confidence=0.45)
+
+    if any(keyword in lowered for keyword in _SCAN_KEYWORDS):
+        return TelegramNaturalLanguageIntent(intent="scan_help", confidence=0.45)
+
     if any(keyword in lowered for keyword in _TREND_KEYWORDS):
         game = _infer_game(content)
         if game is None:
@@ -472,7 +532,7 @@ def _load_json_fragment(value: str) -> object:
 
 def _normalize_intent(payload: dict[str, object]) -> TelegramNaturalLanguageIntent:
     intent = str(payload.get("intent", "unknown")).strip().lower()
-    if intent not in {"lookup_card", "trend_board", "add_watch", "list_watches", "remove_watch", "update_watch_price", "reputation_snapshot", "help", "unknown"}:
+    if intent not in {"lookup_card", "trend_board", "add_watch", "list_watches", "remove_watch", "update_watch_price", "reputation_snapshot", "help", "status", "tools", "scan_help", "unknown"}:
         intent = "unknown"
 
     game = _normalize_game(payload.get("game"))

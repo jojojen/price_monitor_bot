@@ -507,6 +507,18 @@ class TelegramCommandProcessor:
         if intent.intent == "help":
             logger.info("Telegram natural-language routed intent=help")
             return TelegramTextReplyPlan(ack=None, reply=self._help_text())
+        if intent.intent == "status":
+            logger.info("Telegram natural-language routed intent=status")
+            return TelegramTextReplyPlan(ack=None, reply=self._status_text())
+        if intent.intent == "tools":
+            logger.info("Telegram natural-language routed intent=tools")
+            return TelegramTextReplyPlan(ack=None, reply=self._catalog_renderer())
+        if intent.intent == "scan_help":
+            logger.info("Telegram natural-language routed intent=scan_help")
+            return TelegramTextReplyPlan(
+                ack=None,
+                reply="Send a card photo with the caption /scan pokemon or /scan ws, and I will parse it and then look up the price.",
+            )
         if intent.intent == "trend_board":
             if intent.game not in {"pokemon", "ws"}:
                 return TelegramTextReplyPlan(
