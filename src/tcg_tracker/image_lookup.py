@@ -1233,7 +1233,11 @@ def _sanitize_image_title_hint(value: str | None) -> str | None:
 
 def _resolve_tesseract_path(configured_path: str | None) -> str | None:
     if configured_path:
-        path = Path(configured_path)
+        configured = configured_path.strip()
+        if configured.lower() != "auto":
+            path = Path(configured)
+            return str(path) if path.exists() else None
+        path = Path(configured)
         if path.exists():
             return str(path)
     discovered = shutil.which("tesseract")
