@@ -82,7 +82,6 @@ _WATCH_LIST_KEYWORDS = (
     "追蹤了什麼",
     "watchlist",
     "watches",
-    "清單",
 )
 _WATCH_REMOVE_KEYWORDS = (
     "取消追蹤",
@@ -435,6 +434,11 @@ def fallback_route_telegram_natural_language(text: str) -> TelegramNaturalLangua
 
     # ── Original intents ──────────────────────────────────────────────────────
 
+    # scan_help is checked before help so "照片查價怎麼用" / "OCR 怎麼用" routes
+    # to scan_help rather than being swallowed by the generic "怎麼用" help keyword.
+    if any(keyword in lowered for keyword in _SCAN_KEYWORDS):
+        return TelegramNaturalLanguageIntent(intent="scan_help", confidence=0.45)
+
     if any(keyword in lowered for keyword in ("help", "指令", "怎麼用", "會什麼")):
         return TelegramNaturalLanguageIntent(intent="help", confidence=0.35)
 
@@ -443,9 +447,6 @@ def fallback_route_telegram_natural_language(text: str) -> TelegramNaturalLangua
 
     if any(keyword in lowered for keyword in _STATUS_KEYWORDS):
         return TelegramNaturalLanguageIntent(intent="status", confidence=0.45)
-
-    if any(keyword in lowered for keyword in _SCAN_KEYWORDS):
-        return TelegramNaturalLanguageIntent(intent="scan_help", confidence=0.45)
 
     if any(keyword in lowered for keyword in _TREND_KEYWORDS):
         game = _infer_game(content)
