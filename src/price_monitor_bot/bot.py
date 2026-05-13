@@ -11,9 +11,12 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+if TYPE_CHECKING:
+    from sns_monitor.storage import SnsDatabase
 
 from hashlib import sha1
 
@@ -51,6 +54,10 @@ WATCH_COMMANDS = {"/watch"}
 WATCHLIST_COMMANDS = {"/watchlist", "/watches"}
 UNWATCH_COMMANDS = {"/unwatch", "/stopwatch"}
 SET_PRICE_COMMANDS = {"/setprice", "/updatewatch"}
+SNS_ADD_COMMANDS = {"/snsadd", "/sns_add"}
+SNS_LIST_COMMANDS = {"/snslist", "/sns_list"}
+SNS_DELETE_COMMANDS = {"/snsdelete", "/sns_delete"}
+SNS_BUZZ_COMMANDS = {"/snsbuzz", "/sns_buzz"}
 HEAVY_COMMANDS = PRICE_LOOKUP_COMMANDS | TREND_BOARD_COMMANDS | REPUTATION_SNAPSHOT_COMMANDS
 
 logger = logging.getLogger(__name__)
@@ -247,6 +254,8 @@ class TelegramCommandProcessor:
         allowed_chat_ids: frozenset[str] | None = None,
         status_renderer: Callable[[], str] | None = None,
         watch_db: MonitorDatabase | None = None,
+        sns_db: SnsDatabase | None = None,
+        sns_buzz_fn: Callable[[str], str] | None = None,
     ) -> None:
         self._lookup_renderer = lookup_renderer
         self._board_loader = board_loader
@@ -256,6 +265,8 @@ class TelegramCommandProcessor:
         self._allowed_chat_ids: frozenset[str] = allowed_chat_ids or frozenset()
         self._status_renderer = status_renderer
         self._watch_db = watch_db
+        self._sns_db = sns_db
+        self._sns_buzz_fn = sns_buzz_fn
 
     def is_allowed_chat(self, chat_id: str | int) -> bool:
         if not self._allowed_chat_ids:
@@ -333,6 +344,22 @@ class TelegramCommandProcessor:
             return TelegramTextReplyPlan(
                 ack=None,
                 reply=self._handle_set_price(remainder),
+            )
+        if command in SNS_ADD_COMMANDS:
+            return TelegramTextReplyPlan(
+                ack="收到 X 追蹤指令，正在設定…",
+                reply=None,
+                reply_factory=lambda remainder=remainder, cid=chat_id: self._handle_sns_add(remainder, str(cid)),
+            )
+        if command in SNS_LIST_COMMANDS:
+            return TelegramTextReplyPlan(ack=None, reply=self._handle_sns_list())
+        if command in SNS_DELETE_COMMANDS:
+            return TelegramTextReplyPlan(ack=None, reply=self._handle_sns_delete(remainder))
+        if command in SNS_BUZZ_COMMANDS:
+            return TelegramTextReplyPlan(
+                ack="收到，正在抓取 X 熱門討論並交給 LLM 整理…",
+                reply=None,
+                reply_factory=lambda remainder=remainder: self._handle_sns_buzz(remainder),
             )
         if not content.startswith("/"):
             intent = self._route_natural_language(content)
@@ -647,7 +674,257 @@ class TelegramCommandProcessor:
                 reply=None,
                 reputation_delivery_factory=lambda url=url: self.build_reputation_delivery(url),
             )
+
+        # ── SNS intents ────────────────────────────────────────────────────────
+        if intent.intent == "sns_add_account":
+            if not intent.sns_handle:
+                return TelegramTextReplyPlan(
+                    ack=None,
+                    reply="請告訴我要追蹤哪個 X 帳號，例如：追蹤 @elonmusk",
+                )
+            handle = intent.sns_handle
+            logger.info("Telegram NL routed intent=sns_add_account handle=%s", handle)
+            cid = str(chat_id)
+            return TelegramTextReplyPlan(
+                ack=f"已理解：相當於 /snsadd @{handle}，正在新增 X 追蹤…",
+                reply=None,
+                reply_factory=lambda h=handle, c=cid: self._handle_sns_add(f"@{h}", c),
+            )
+        if intent.intent == "sns_add_keyword":
+            if not intent.sns_keyword:
+                return TelegramTextReplyPlan(ack=None, reply="請提供 X 關鍵字，例如：監控關鍵字 機動戰士")
+            kw = intent.sns_keyword
+            logger.info("Telegram NL routed intent=sns_add_keyword keyword=%s", kw)
+            cid = str(chat_id)
+            return TelegramTextReplyPlan(
+                ack=f"已理解：相當於 /snsadd keyword:{kw}",
+                reply=None,
+                reply_factory=lambda k=kw, c=cid: self._handle_sns_add(f"keyword:{k}", c),
+            )
+        if intent.intent == "sns_list":
+            logger.info("Telegram NL routed intent=sns_list")
+            return TelegramTextReplyPlan(ack=None, reply=self._handle_sns_list())
+        if intent.intent == "sns_delete":
+            target = (intent.sns_handle and f"@{intent.sns_handle}") or intent.watch_id
+            if not target:
+                return TelegramTextReplyPlan(
+                    ack=None,
+                    reply="請告訴我要移除哪個 X 帳號或規則 ID，例如：刪除追蹤 @elonmusk",
+                )
+            logger.info("Telegram NL routed intent=sns_delete target=%s", target)
+            return TelegramTextReplyPlan(
+                ack=f"已理解：相當於 /snsdelete {target}",
+                reply=None,
+                reply_factory=lambda t=target: self._handle_sns_delete(t),
+            )
+        if intent.intent == "sns_buzz":
+            q = intent.sns_buzz_query
+            if not q:
+                return TelegramTextReplyPlan(
+                    ack=None,
+                    reply="請告訴我關鍵字，例如：整理一下 amd 最近的熱門討論",
+                )
+            logger.info("Telegram NL routed intent=sns_buzz query=%s", q)
+            return TelegramTextReplyPlan(
+                ack=f"已理解：相當於 /snsbuzz {q}，正在抓 Reddit 熱門討論並交給 LLM 整理…",
+                reply=None,
+                reply_factory=lambda x=q: self._handle_sns_buzz(x),
+            )
+
         return None
+
+    def _handle_sns_add(self, raw: str, chat_id: str) -> str:
+        """Handle /snsadd command to add an X (Twitter) account, keyword, or trend watch."""
+        if self._sns_db is None:
+            return "SNS 監控尚未啟用（sns_db 未設定）。"
+        from sns_monitor.models import AccountWatch, KeywordWatch, TrendWatch
+        from sns_monitor.storage import SnsDatabase
+
+        try:
+            raw = raw.strip()
+            if not raw:
+                return "用法：/snsadd @username 或 /snsadd keyword:搜尋詞 或 /snsadd trend:trending"
+
+            # Parse: "@username" or "keyword:xxx" or "trend:xxx"
+            if raw.startswith("@"):
+                # Account watch
+                screen_name = raw.lstrip("@").split()[0]
+                rule_id = SnsDatabase._watch_rule_id("account", screen_name)
+                rule = AccountWatch(
+                    rule_id=rule_id,
+                    screen_name=screen_name,
+                    user_id=None,
+                    label=f"@{screen_name}",
+                    enabled=True,
+                    schedule_minutes=15,
+                    chat_id=chat_id,
+                    last_checked_at=None,
+                )
+                self._sns_db.save_watch_rule(rule)
+                logger.info("SNS account watch added screen_name=%s chat_id=%s", screen_name, chat_id)
+                return f"✓ 已新增 X 帳號追蹤：@{screen_name}\nID: {rule_id[:8]}…"
+            elif raw.startswith("keyword:"):
+                # Keyword watch
+                query = raw[8:].strip()
+                if not query:
+                    return "請提供搜尋關鍵字。例如：/snsadd keyword:機動戰士"
+                rule_id = SnsDatabase._watch_rule_id("keyword", query)
+                rule = KeywordWatch(
+                    rule_id=rule_id,
+                    query=query,
+                    label=f'"{query}"',
+                    enabled=True,
+                    schedule_minutes=30,
+                    chat_id=chat_id,
+                    last_checked_at=None,
+                )
+                self._sns_db.save_watch_rule(rule)
+                logger.info("SNS keyword watch added query=%s chat_id=%s", query, chat_id)
+                return f'✓ 已新增 X 關鍵字追蹤："{query}"\nID: {rule_id[:8]}…'
+            elif raw.startswith("trend:"):
+                # Trend watch
+                category = raw[6:].strip()
+                if category not in {"trending", "for-you", "news", "sports", "entertainment"}:
+                    return "不支援的分類。請使用：trending, for-you, news, sports, 或 entertainment"
+                rule_id = SnsDatabase._watch_rule_id("trend", category)
+                rule = TrendWatch(
+                    rule_id=rule_id,
+                    category=category,
+                    label=f"Trend: {category}",
+                    enabled=True,
+                    schedule_minutes=60,
+                    chat_id=chat_id,
+                    last_checked_at=None,
+                )
+                self._sns_db.save_watch_rule(rule)
+                logger.info("SNS trend watch added category=%s chat_id=%s", category, chat_id)
+                return f"✓ 已新增 X 熱門話題追蹤：{category}\nID: {rule_id[:8]}…"
+            else:
+                return "不認識的格式。用法：/snsadd @username 或 /snsadd keyword:搜尋詞 或 /snsadd trend:trending"
+        except Exception as exc:
+            logger.exception("SNS add failed raw=%s chat_id=%s", raw, chat_id)
+            return f"新增失敗：{exc}"
+
+    def _handle_sns_list(self) -> str:
+        """Handle /snslist command to list all SNS watch rules."""
+        if self._sns_db is None:
+            return "SNS 監控尚未啟用（sns_db 未設定）。"
+        try:
+            rules = self._sns_db.list_watch_rules()
+            if not rules:
+                return "尚無 SNS 監控規則。\n用法：/snsadd @username"
+
+            lines = [f"📋 SNS 監控規則 ({len(rules)} 項)："]
+            for rule in rules:
+                status = "✓" if rule.enabled else "✗"
+                if rule.__class__.__name__ == "AccountWatch":
+                    info = f"@{rule.screen_name}"
+                elif rule.__class__.__name__ == "KeywordWatch":
+                    info = f'"{rule.query}"'
+                elif rule.__class__.__name__ == "TrendWatch":
+                    info = f"Trend:{rule.category}"
+                else:
+                    info = "Unknown"
+                lines.append(f"  {status} {info} ({rule.rule_id[:8]}…)")
+
+            return "\n".join(lines)
+        except Exception as exc:
+            logger.exception("SNS list failed")
+            return f"列表失敗：{exc}"
+
+    def _handle_sns_delete(self, raw: str) -> str:
+        """Handle /snsdelete to remove an SNS rule by rule_id, @handle, or keyword:xxx."""
+        if self._sns_db is None:
+            return "SNS 監控尚未啟用（sns_db 未設定）。"
+        try:
+            target = raw.strip()
+            if not target:
+                return "請提供 @帳號 或規則 ID。例如：/snsdelete @elonmusk 或 /snsdelete abc12345"
+
+            rule_id = self._resolve_sns_rule_id(target)
+            if rule_id is None:
+                return f"找不到對應的 SNS 規則：{target}"
+
+            label = self._describe_sns_rule(rule_id)
+            found = self._sns_db.delete_watch_rule(rule_id)
+            if found:
+                logger.info("SNS rule deleted rule_id=%s target=%s", rule_id, target)
+                return f"✓ 已刪除 SNS 監控：{label}"
+            return f"找不到規則 {target}"
+        except Exception as exc:
+            logger.exception("SNS delete failed raw=%s", raw)
+            return f"刪除失敗：{exc}"
+
+    def _resolve_sns_rule_id(self, target: str) -> str | None:
+        """Resolve a user-supplied target to a SNS rule_id.
+
+        Accepts: a hex rule_id prefix, '@handle' for account watches,
+        or 'keyword:xxx' for keyword watches.
+        """
+        if self._sns_db is None:
+            return None
+        cleaned = target.strip()
+        if not cleaned:
+            return None
+
+        rules = list(self._sns_db.list_watch_rules())
+
+        # 1) Exact / prefix match on rule_id
+        for rule in rules:
+            if rule.rule_id == cleaned or rule.rule_id.startswith(cleaned):
+                return rule.rule_id
+
+        # 2) @handle → account watch
+        if cleaned.startswith("@"):
+            handle = cleaned.lstrip("@").lower()
+            for rule in rules:
+                if getattr(rule, "screen_name", "").lower() == handle:
+                    return rule.rule_id
+            return None
+
+        # 3) keyword:xxx → keyword watch
+        if cleaned.lower().startswith("keyword:"):
+            query = cleaned.split(":", 1)[1].strip().lower()
+            for rule in rules:
+                if getattr(rule, "query", "").lower() == query:
+                    return rule.rule_id
+            return None
+
+        # 4) Bare token: try as a handle (without @) since users often forget it
+        bare = cleaned.lstrip("@").lower()
+        for rule in rules:
+            if getattr(rule, "screen_name", "").lower() == bare:
+                return rule.rule_id
+
+        return None
+
+    def _describe_sns_rule(self, rule_id: str) -> str:
+        if self._sns_db is None:
+            return rule_id[:8]
+        for rule in self._sns_db.list_watch_rules():
+            if rule.rule_id != rule_id:
+                continue
+            screen_name = getattr(rule, "screen_name", None)
+            if screen_name:
+                return f"@{screen_name}"
+            query = getattr(rule, "query", None)
+            if query:
+                return f"關鍵字「{query}」"
+            return rule.rule_id[:8]
+        return rule_id[:8]
+
+    def _handle_sns_buzz(self, raw: str) -> str:
+        """Handle /snsbuzz <keyword> command: summarize X buzz on a topic via LLM."""
+        if self._sns_buzz_fn is None:
+            return "SNS Buzz 功能尚未啟用（需要 X 客戶端與 LLM endpoint）。"
+        query = raw.strip()
+        if not query:
+            return "請提供關鍵字。例如：/snsbuzz amd"
+        try:
+            return self._sns_buzz_fn(query)
+        except Exception as exc:
+            logger.exception("SNS buzz failed query=%s", query)
+            return f"熱門整理失敗：{exc}"
 
     def _route_natural_language(self, text: str) -> TelegramNaturalLanguageIntent | None:
         if self._natural_language_router is not None:
@@ -699,6 +976,13 @@ class TelegramCommandProcessor:
                 "/watchlist",
                 "/unwatch <ID>",
                 "/setprice <ID> <新價格>",
+                "--- SNS (X/Twitter) 監控 ---",
+                "/snsadd @username",
+                "/snsadd keyword:搜詞",
+                "/snsadd trend:trending",
+                "/snslist",
+                "/snsdelete <rule_id>",
+                "/snsbuzz amd",
                 "You can also ask things like: 幫我查 pokemon Pikachu ex 132/106",
                 "Or: pokemon 熱門前 5",
             ]
@@ -998,6 +1282,8 @@ def run_telegram_polling(
     allowed_chat_ids: frozenset[str] | None = None,
     status_renderer: Callable[[], str] | None = None,
     watch_db: MonitorDatabase | None = None,
+    sns_db: SnsDatabase | None = None,
+    sns_buzz_fn: Callable[[str], str] | None = None,
     poll_timeout: int = 20,
     notify_startup: bool = False,
     drop_pending_updates: bool = True,
@@ -1028,6 +1314,8 @@ def run_telegram_polling(
         allowed_chat_ids=allowed_chat_ids,
         status_renderer=status_renderer,
         watch_db=watch_db,
+        sns_db=sns_db,
+        sns_buzz_fn=sns_buzz_fn,
     )
     resolved_photo_renderer = photo_renderer or default_photo_renderer()
 

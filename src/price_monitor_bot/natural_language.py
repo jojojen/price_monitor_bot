@@ -33,10 +33,15 @@ _ROUTER_JSON_SCHEMA = {
         "watch_id": {"type": ["string", "null"]},
         # reputation snapshot field
         "query_url": {"type": ["string", "null"]},
+        # SNS fields
+        "sns_handle": {"type": ["string", "null"]},
+        "sns_keyword": {"type": ["string", "null"]},
+        "sns_buzz_query": {"type": ["string", "null"]},
     },
     "required": [
         "intent", "game", "name", "card_number", "rarity", "set_code", "limit", "confidence",
         "watch_query", "watch_price_threshold", "watch_id", "query_url",
+        "sns_handle", "sns_keyword", "sns_buzz_query",
     ],
     "additionalProperties": False,
 }
@@ -100,6 +105,39 @@ _WATCH_UPDATE_PRICE_KEYWORDS = (
     "setprice",
     "updatewatch",
 )
+_SNS_CONTEXT_KEYWORDS = (
+    "推特",
+    "推主",
+    "推文",
+    "twitter",
+    "x.com",
+    "sns",
+    " x ",  # bare "X" as a word (with spaces)
+    "@",
+)
+_SNS_LIST_KEYWORDS = (
+    "推主追蹤",
+    "x 追蹤",
+    "x追蹤",
+    "twitter 追蹤",
+    "snslist",
+    "sns 清單",
+    "sns清單",
+    "x 清單",
+    "推特清單",
+)
+_SNS_BUZZ_KEYWORDS = (
+    "snsbuzz",
+    "熱門整理",
+    "熱門討論",
+    "整理一下",
+    "什麼熱門",
+    "最近熱門",
+    "在 reddit",
+    "buzz",
+    "topic digest",
+)
+_X_HANDLE_RE = re.compile(r"@([a-zA-Z0-9_]{1,15})")
 _REPUTATION_KEYWORDS = (
     "信用",
     "信譽",
@@ -170,6 +208,10 @@ class TelegramNaturalLanguageIntent:
     watch_id: str | None = None
     # reputation snapshot field
     query_url: str | None = None
+    # SNS-specific fields
+    sns_handle: str | None = None       # for sns_add_account / sns_delete (@username)
+    sns_keyword: str | None = None      # for sns_add_keyword (keyword watch)
+    sns_buzz_query: str | None = None   # for sns_buzz (LLM topic digest)
 
 
 class TelegramNaturalLanguageRouter:
@@ -216,22 +258,38 @@ class TelegramNaturalLanguageRouter:
         tool_spec_block = f"Tool spec:\n{self.tool_spec}\n\n" if self.tool_spec else ""
         return (
             "You route Telegram messages for a trading-card price assistant and must return only JSON.\n"
-            "Allowed intents: lookup_card, trend_board, add_watch, list_watches, remove_watch, update_watch_price, reputation_snapshot, help, status, tools, scan_help, unknown.\n"
+            "Allowed intents: lookup_card, trend_board, add_watch, list_watches, remove_watch, update_watch_price, reputation_snapshot, "
+            "sns_add_account, sns_add_keyword, sns_list, sns_delete, sns_buzz, "
+            "help, status, tools, scan_help, unknown.\n"
             + tool_spec_block +
             "Use lookup_card when the user wants the price, value, or card lookup of one specific card.\n"
             "Use trend_board when the user asks for hot, trending, liquidity, or ranking cards.\n"
-            "Use add_watch when the user wants to track/monitor a product and be notified below a price threshold.\n"
+            "Use add_watch when the user wants to track/monitor a MERCARI product and be notified below a price threshold.\n"
             "  Set watch_query to the product name/keywords, watch_price_threshold to the integer JPY limit.\n"
-            "Use list_watches when the user wants to see their watchlist / tracked items.\n"
-            "Use remove_watch when the user wants to stop tracking / unwatch an item. Set watch_id if mentioned.\n"
-            "Use update_watch_price when the user wants to change the price threshold of an existing watch. Set watch_id and watch_price_threshold.\n"
+            "Use list_watches when the user wants to see the MERCARI watchlist / tracked items (no @ handle, no SNS context).\n"
+            "Use remove_watch when the user wants to stop tracking a MERCARI watch by hex ID (e.g. abc12345). Set watch_id.\n"
+            "Use update_watch_price when the user wants to change the price threshold of an existing Mercari watch. Set watch_id and watch_price_threshold.\n"
             "Use reputation_snapshot when the user wants to check a seller's reputation/trust/credit or take a snapshot of a URL.\n"
             "  Set query_url to the URL found in the message (Mercari item or profile URL).\n"
+            "Use sns_add_account when the user wants to ADD / track / monitor an X (Twitter) account that starts with @.\n"
+            "  Set sns_handle to the @username (without the @).\n"
+            "Use sns_add_keyword when the user wants to add an X keyword/topic watch (not an @ account).\n"
+            "  Set sns_keyword to the keyword phrase.\n"
+            "Use sns_list when the user wants to see the SNS / X / Twitter watch rules (NOT the Mercari watchlist).\n"
+            "Use sns_delete when the user wants to REMOVE / unfollow / unwatch / 取消追蹤 / 刪除 an X account or SNS rule, especially when the message references an @ handle.\n"
+            "  Set sns_handle to the @username if mentioned (without the @). Set watch_id only if a hex SNS rule ID is given.\n"
+            "Use sns_buzz when the user wants a Reddit/X topic digest, hot discussion, summary, 'what's buzzing about X'.\n"
+            "  Set sns_buzz_query to the topic keyword.\n"
             "Use help when the user asks what the bot can do.\n"
             "Use status when the user asks about current runtime state, models, or service health.\n"
             "Use tools when the user explicitly asks for the full tool catalog or list of available tools.\n"
             "Use scan_help when the user asks how to scan a card from a photo or wants image-lookup instructions before sending a photo.\n"
             "Use unknown when the request is unrelated or too ambiguous.\n"
+            "DISAMBIGUATION RULES:\n"
+            "- Any mention of @username (e.g. @elonmusk, @aka_claw) means SNS, not Mercari. Pick sns_add_account / sns_delete / sns_list accordingly.\n"
+            "- 'X', 'Twitter', '推特', '推文', '推主', '帳號' always indicate SNS intents.\n"
+            "- '追蹤'/'tracking' alone is ambiguous: if it co-occurs with @handle/X/Twitter → SNS; if it co-occurs with a price (円/JPY/万) or Mercari URL → Mercari.\n"
+            "- '取消'/'刪除'/'unfollow'/'unwatch' on an @ handle → sns_delete with sns_handle set, NOT remove_watch.\n"
             'Game must be "pokemon", "ws", or null.\n'
             "Infer pokemon for wording like Pokemon, PTCG, 寶可夢, 寶可卡.\n"
             "Infer ws for wording like Weiss, WS, Weiß Schwarz, ヴァイス.\n"
@@ -248,7 +306,16 @@ class TelegramNaturalLanguageRouter:
             '- "取消追蹤 abc12345" -> remove_watch, watch_id="abc12345"\n'
             '- "把 abc12345 改成 4萬" -> update_watch_price, watch_id="abc12345", watch_price_threshold=40000\n'
             '- "查詢信用 https://jp.mercari.com/item/m12345" -> reputation_snapshot, query_url="https://jp.mercari.com/item/m12345"\n'
-            '- "這個賣家信譽如何 https://jp.mercari.com/item/m12345" -> reputation_snapshot, query_url="https://jp.mercari.com/item/m12345"\n'
+            '- "追蹤 @elonmusk" -> sns_add_account, sns_handle="elonmusk"\n'
+            '- "新增 X 監控 @aka_claw" -> sns_add_account, sns_handle="aka_claw"\n'
+            '- "刪除追蹤 @elonmusk" -> sns_delete, sns_handle="elonmusk"\n'
+            '- "取消追蹤 @aka_claw" -> sns_delete, sns_handle="aka_claw"\n'
+            '- "unfollow @elonmusk" -> sns_delete, sns_handle="elonmusk"\n'
+            '- "我的 X 追蹤清單" -> sns_list\n'
+            '- "看一下推主追蹤" -> sns_list\n'
+            '- "監控關鍵字 機動戰士" -> sns_add_keyword, sns_keyword="機動戰士"\n'
+            '- "整理一下 amd 最近的熱門討論" -> sns_buzz, sns_buzz_query="amd"\n'
+            '- "Trump 在 X 上最近怎樣" -> sns_buzz, sns_buzz_query="Trump"\n'
             '- "你會什麼" -> help\n'
             '- "你現在狀態如何" -> status\n'
             '- "列出所有工具" -> tools\n'
@@ -391,6 +458,45 @@ def fallback_route_telegram_natural_language(text: str) -> TelegramNaturalLangua
             confidence=0.85,
         )
 
+    # ── SNS intents (must run before Mercari watch intents so @handle wins) ───
+
+    handle_match = _X_HANDLE_RE.search(content)
+    has_sns_context = any(kw in lowered for kw in _SNS_CONTEXT_KEYWORDS) or handle_match is not None
+
+    # sns_delete: any remove/unfollow phrase combined with @handle or SNS context
+    if handle_match and any(kw in lowered for kw in _WATCH_REMOVE_KEYWORDS):
+        return TelegramNaturalLanguageIntent(
+            intent="sns_delete",
+            sns_handle=handle_match.group(1),
+            confidence=0.85,
+        )
+    if "unfollow" in lowered and handle_match:
+        return TelegramNaturalLanguageIntent(
+            intent="sns_delete",
+            sns_handle=handle_match.group(1),
+            confidence=0.85,
+        )
+
+    # sns_list: explicit SNS list phrasing
+    if any(kw in lowered for kw in _SNS_LIST_KEYWORDS):
+        return TelegramNaturalLanguageIntent(intent="sns_list", confidence=0.75)
+
+    # sns_buzz: digest-of-topic phrasing
+    if any(kw in lowered for kw in _SNS_BUZZ_KEYWORDS):
+        return TelegramNaturalLanguageIntent(
+            intent="sns_buzz",
+            sns_buzz_query=_extract_buzz_query(content),
+            confidence=0.6,
+        )
+
+    # sns_add_account: track/monitor with @handle
+    if handle_match and any(kw in lowered for kw in _WATCH_ADD_KEYWORDS):
+        return TelegramNaturalLanguageIntent(
+            intent="sns_add_account",
+            sns_handle=handle_match.group(1),
+            confidence=0.8,
+        )
+
     # ── Watch intents (check before generic lookup so keywords don't conflict) ──
 
     # remove_watch: "取消追蹤 abc123" / "unwatch abc123"
@@ -531,9 +637,18 @@ def _load_json_fragment(value: str) -> object:
         return json.loads(match.group(0))
 
 
+_ALLOWED_INTENTS = frozenset({
+    "lookup_card", "trend_board",
+    "add_watch", "list_watches", "remove_watch", "update_watch_price",
+    "reputation_snapshot",
+    "sns_add_account", "sns_add_keyword", "sns_list", "sns_delete", "sns_buzz",
+    "help", "status", "tools", "scan_help", "unknown",
+})
+
+
 def _normalize_intent(payload: dict[str, object]) -> TelegramNaturalLanguageIntent:
     intent = str(payload.get("intent", "unknown")).strip().lower()
-    if intent not in {"lookup_card", "trend_board", "add_watch", "list_watches", "remove_watch", "update_watch_price", "reputation_snapshot", "help", "status", "tools", "scan_help", "unknown"}:
+    if intent not in _ALLOWED_INTENTS:
         intent = "unknown"
 
     game = _normalize_game(payload.get("game"))
@@ -547,6 +662,9 @@ def _normalize_intent(payload: dict[str, object]) -> TelegramNaturalLanguageInte
     watch_price_threshold = _normalize_price_threshold(payload.get("watch_price_threshold"))
     watch_id = _normalize_text_field(payload.get("watch_id"))
     query_url = _normalize_text_field(payload.get("query_url"))
+    sns_handle = _normalize_handle(payload.get("sns_handle"))
+    sns_keyword = _normalize_text_field(payload.get("sns_keyword"))
+    sns_buzz_query = _normalize_text_field(payload.get("sns_buzz_query"))
 
     if intent == "trend_board" and limit is None:
         limit = 5
@@ -563,7 +681,35 @@ def _normalize_intent(payload: dict[str, object]) -> TelegramNaturalLanguageInte
         watch_price_threshold=watch_price_threshold,
         watch_id=watch_id,
         query_url=query_url,
+        sns_handle=sns_handle,
+        sns_keyword=sns_keyword,
+        sns_buzz_query=sns_buzz_query,
     )
+
+
+def _normalize_handle(value: object) -> str | None:
+    """Strip leading @ and whitespace from an X handle."""
+    text = _normalize_text_field(value)
+    if not text:
+        return None
+    return text.lstrip("@").strip() or None
+
+
+_BUZZ_STOP_PHRASES = (
+    "幫我整理", "整理一下", "整理", "最近熱門討論", "熱門討論", "熱門整理",
+    "最近怎樣", "怎麼樣", "在 reddit 上", "在 reddit", "buzz", "topic digest",
+    "snsbuzz", "什麼熱門", "最近熱門", "看一下",
+)
+
+
+def _extract_buzz_query(text: str) -> str | None:
+    """Strip framing phrases from a buzz request to expose the actual keyword."""
+    cleaned = text
+    for phrase in _BUZZ_STOP_PHRASES:
+        cleaned = re.sub(re.escape(phrase), " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"[，、。！？!?]", " ", cleaned)
+    cleaned = " ".join(cleaned.split()).strip()
+    return cleaned or None
 
 
 def _normalize_game(value: object) -> str | None:
