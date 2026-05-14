@@ -69,6 +69,10 @@ def score_tcg_offer(spec: TcgCardSpec, offer: MarketOffer) -> float:
     if spec.card_number:
         if _card_numbers_match(spec.normalized_card_number, offer_number):
             score += 40
+        elif spec.game == "union_arena" and _ua_card_numbers_share_suffix(spec.normalized_card_number, offer_number):
+            # Union Arena reprints land under different set-code prefixes across sites
+            # (UAPR/EVA-1-071 on Surugaya/Mercari vs UA44BT/EVA-1-071 on Yuyutei).
+            score += 28
         else:
             score -= 30
 
@@ -192,6 +196,27 @@ def _card_numbers_match(left: str, right: str) -> bool:
     if _normalize_trailing_card_number(left) == _normalize_trailing_card_number(right) != "":
         return True
     return _normalize_simple_pokemon_number(left) == _normalize_simple_pokemon_number(right) != ""
+
+
+def _ua_card_numbers_share_suffix(left: str, right: str) -> bool:
+    """Return True when two UA card numbers share the same suffix after the first '/'.
+
+    Union Arena reprints get distributed under set-specific prefixes (UAPR/, UA44BT/, …)
+    that all point at the same card identity. Compare only the post-slash portion,
+    normalized to zero-padded trailing digits.
+    """
+    left_suffix = _ua_suffix(left)
+    right_suffix = _ua_suffix(right)
+    if not left_suffix or not right_suffix:
+        return False
+    return left_suffix == right_suffix
+
+
+def _ua_suffix(value: str) -> str:
+    if "/" not in value:
+        return ""
+    suffix = value.split("/", 1)[1]
+    return _normalize_trailing_card_number(suffix) or suffix
 
 
 def _compact_text(value: str) -> str:

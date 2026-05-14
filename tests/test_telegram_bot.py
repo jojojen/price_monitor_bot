@@ -11,7 +11,11 @@ from tcg_tracker.service import TcgLookupResult
 from tests.image_lookup_case_fixtures import get_image_lookup_live_case
 
 from price_monitor_bot.formatters import format_lookup_result_telegram
-from price_monitor_bot.natural_language import TelegramNaturalLanguageIntent, fallback_route_telegram_natural_language
+from price_monitor_bot.natural_language import (
+    TelegramNaturalLanguageIntent,
+    _normalize_intent,
+    fallback_route_telegram_natural_language,
+)
 from price_monitor_bot.bot import (
     TelegramCommandProcessor,
     TelegramFileAttachment,
@@ -132,8 +136,29 @@ def test_parse_lookup_command_supports_yugioh_and_union_arena_aliases() -> None:
         name="青眼の白龍",
         card_number="QCCP-JP001",
         rarity="ウルトラ",
+        set_code="qccp",
     )
     assert ua_query == TelegramLookupQuery(game="union_arena", name="綾波レイ")
+
+
+def test_parse_lookup_command_recovers_card_metadata_from_simple_format() -> None:
+    ua_query = parse_lookup_command("union_arena uapr/eva-1-071 綾波レイ")
+    ua_card_query = parse_lookup_command("ua card uapr/eva-1-071 綾波レイ")
+    pokemon_query = parse_lookup_command("pokemon リザードンex 201/165 SAR")
+
+    assert ua_query == TelegramLookupQuery(
+        game="union_arena",
+        name="綾波レイ",
+        card_number="UAPR/EVA-1-071",
+        set_code="uapr",
+    )
+    assert ua_card_query == ua_query
+    assert pokemon_query == TelegramLookupQuery(
+        game="pokemon",
+        name="リザードンex",
+        card_number="201/165",
+        rarity="SAR",
+    )
 
 
 def test_command_processor_restricts_unconfigured_chat() -> None:
@@ -734,3 +759,75 @@ def test_fallback_router_defaults_limit_when_no_number_given() -> None:
     assert intent.intent == "trend_board"
     assert intent.game == "ws"
     assert intent.limit == 5
+
+
+def _llm_payload(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "intent": "lookup_card",
+        "game": None,
+        "name": None,
+        "card_number": None,
+        "rarity": None,
+        "set_code": None,
+        "limit": None,
+        "confidence": 0.6,
+        "watch_query": None,
+        "watch_price_threshold": None,
+        "watch_id": None,
+        "query_url": None,
+        "sns_handle": None,
+        "sns_keyword": None,
+        "sns_buzz_query": None,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_normalize_intent_recovers_union_arena_card_number_from_name() -> None:
+    intent = _normalize_intent(
+        _llm_payload(game="union_arena", name="uapr/eva-1-071 綾波レイ")
+    )
+
+    assert intent.intent == "lookup_card"
+    assert intent.name == "綾波レイ"
+    assert intent.card_number == "UAPR/EVA-1-071"
+    assert intent.set_code == "uapr"
+
+
+def test_normalize_intent_recovers_pokemon_card_number_and_rarity_from_name() -> None:
+    intent = _normalize_intent(
+        _llm_payload(game="pokemon", name="リザードンex 201/165 SAR")
+    )
+
+    assert intent.name == "リザードンex"
+    assert intent.card_number == "201/165"
+    assert intent.rarity == "SAR"
+
+
+def test_normalize_intent_leaves_already_structured_fields_alone() -> None:
+    intent = _normalize_intent(
+        _llm_payload(
+            game="union_arena",
+            name="綾波レイ",
+            card_number="UAPR/EVA-1-71",
+            rarity="SR",
+            set_code="uapr",
+        )
+    )
+
+    assert intent.name == "綾波レイ"
+    assert intent.card_number == "UAPR/EVA-1-71"
+    assert intent.rarity == "SR"
+    assert intent.set_code == "uapr"
+
+
+def test_fallback_router_preserves_union_arena_card_number_in_name() -> None:
+    intent = fallback_route_telegram_natural_language("查 UA卡 uapr/eva-1-071 綾波レイ 價格")
+
+    assert intent is not None
+    assert intent.intent == "lookup_card"
+    assert intent.game == "union_arena"
+    assert intent.card_number == "UAPR/EVA-1-071"
+    assert intent.name == "綾波レイ"
+    # `ua` must no longer be stripped out of the card-number prefix
+    assert "pr/eva" not in intent.name.lower()

@@ -306,10 +306,12 @@ class TelegramNaturalLanguageRouter:
             "For trend_board, limit should be 1-10 when specified, otherwise 5.\n"
             "For add_watch, watch_price_threshold is an integer JPY amount (e.g. 50000 for 5万).\n"
             "For fields not applicable to the intent, return null.\n"
+            "For lookup_card, always split the card identifier out of the name. Put the bare card name\n"
+            "in `name` and the alphanumeric code (e.g. 201/165, UAPR/EVA-1-71, QCCP-JP001) in `card_number`.\n"
             "Examples:\n"
-            '- "幫我查寶可夢 リザードンex 201/165 SAR" -> lookup_card\n'
-            '- "查遊戯王 青眼の白龍 QCCP-JP001 UR" -> lookup_card\n'
-            '- "查 Union Arena UAPR/EVA-1-71 綾波レイ" -> lookup_card\n'
+            '- "幫我查寶可夢 リザードンex 201/165 SAR" -> lookup_card, name="リザードンex", card_number="201/165", rarity="SAR"\n'
+            '- "查遊戯王 青眼の白龍 QCCP-JP001 UR" -> lookup_card, name="青眼の白龍", card_number="QCCP-JP001", rarity="UR"\n'
+            '- "查 Union Arena UAPR/EVA-1-71 綾波レイ" -> lookup_card, name="綾波レイ", card_number="UAPR/EVA-1-71"\n'
             '- "pokemon 熱門前5" -> trend_board\n'
             '- "追蹤 初音ミク SSP 5万以下" -> add_watch, watch_query="初音ミク SSP", watch_price_threshold=50000\n'
             '- "看我的追蹤清單" -> list_watches\n'
@@ -601,7 +603,7 @@ def fallback_route_telegram_natural_language(text: str) -> TelegramNaturalLangua
         set_code_match = re.search(r"\b(SV\d{1,2}[A-Z]?|M\d{1,2}[A-Z]?|SM\d{1,2}[A-Z]?|S\d{1,2}[A-Z]?|SV-P|SM-P|S-P|M-P|BW-P|XY-P)\b", content.upper())
         stripped_name = content
         if card_number_match:
-            stripped_name = stripped_name.replace(card_number_match.group(0), " ")
+            stripped_name = re.sub(re.escape(card_number_match.group(0)), " ", stripped_name, flags=re.IGNORECASE)
         for token in (
             "幫我查",
             "查一下",
@@ -611,17 +613,22 @@ def fallback_route_telegram_natural_language(text: str) -> TelegramNaturalLangua
             "price",
             "pokemon",
             "ptcg",
-            "ws",
             "weiss",
             "schwarz",
             "yugioh",
             "yu-gi-oh",
-            "ygo",
+            "uaカード",
+            "ua カード",
+            "ua卡",
+            "ua 卡",
+            "union arenaカード",
+            "union arena カード",
+            "union arena卡",
+            "union arena 卡",
             "union_arena",
             "union arena",
             "union area",
             "unionarea",
-            "ua",
             "寶可夢",
             "寶可卡",
             "遊戯王",
@@ -631,10 +638,20 @@ def fallback_route_telegram_natural_language(text: str) -> TelegramNaturalLangua
             "ユニオンアリーナ",
         ):
             stripped_name = re.sub(re.escape(token), " ", stripped_name, flags=re.IGNORECASE)
+        # Short ASCII tokens (ws/ua/ygo) need lookarounds so they don't eat the
+        # leading letters of card numbers like UAPR/EVA-1-071 or WS01/...
+        for short_token in ("ws", "ua", "ygo"):
+            stripped_name = re.sub(
+                rf"(?<![a-zA-Z]){re.escape(short_token)}(?![a-zA-Z])",
+                " ",
+                stripped_name,
+                flags=re.IGNORECASE,
+            )
         if rarity_match:
-            stripped_name = stripped_name.replace(rarity_match.group(1), " ")
+            stripped_name = re.sub(re.escape(rarity_match.group(1)), " ", stripped_name, flags=re.IGNORECASE)
         if set_code_match:
-            stripped_name = stripped_name.replace(set_code_match.group(1), " ")
+            stripped_name = re.sub(re.escape(set_code_match.group(1)), " ", stripped_name, flags=re.IGNORECASE)
+        stripped_name = _strip_lookup_name_noise(stripped_name)
         name = " ".join(stripped_name.split()).strip() or None
         return TelegramNaturalLanguageIntent(
             intent="lookup_card",
@@ -704,6 +721,12 @@ def _normalize_intent(payload: dict[str, object]) -> TelegramNaturalLanguageInte
 
     if intent == "trend_board" and limit is None:
         limit = 5
+
+    if intent == "lookup_card":
+        name, card_number, rarity, set_code = _recover_lookup_fields(
+            name, card_number, rarity, set_code
+        )
+
     return TelegramNaturalLanguageIntent(
         intent=intent,
         game=game,
@@ -721,6 +744,67 @@ def _normalize_intent(payload: dict[str, object]) -> TelegramNaturalLanguageInte
         sns_keyword=sns_keyword,
         sns_buzz_query=sns_buzz_query,
     )
+
+
+_RARITY_TOKEN_RE = re.compile(
+    r"\b(SSP|SEC\+|SEC|SAR|CSR|CHR|UR|SR|AR|RRR|RR|PR\+|PR|SP|OFR|SS|MA|MUR)\b"
+)
+_SET_CODE_TOKEN_RE = re.compile(
+    r"\b(SV\d{1,2}[A-Z]?|M\d{1,2}[A-Z]?|SM\d{1,2}[A-Z]?|S\d{1,2}[A-Z]?|SV-P|SM-P|S-P|M-P|BW-P|XY-P)\b"
+)
+
+
+def _recover_lookup_fields(
+    name: str | None,
+    card_number: str | None,
+    rarity: str | None,
+    set_code: str | None,
+) -> tuple[str | None, str | None, str | None, str | None]:
+    """Pull card_number/rarity/set_code out of `name` when the router left them null.
+
+    Routers (especially small LLMs) sometimes return everything packed into
+    `name`. Without this recovery, downstream sources that require a structured
+    card_number (e.g. Surugaya) silently return nothing.
+    """
+    if not name:
+        return name, card_number, rarity, set_code
+
+    working = name
+    if card_number is None:
+        match = _extract_card_number_match(working)
+        if match is not None:
+            card_number = match.group(0).upper()
+            working = re.sub(re.escape(match.group(0)), " ", working, flags=re.IGNORECASE)
+    if rarity is None:
+        rarity_match = _RARITY_TOKEN_RE.search(working.upper())
+        if rarity_match is not None:
+            rarity = rarity_match.group(1).upper()
+            working = re.sub(re.escape(rarity_match.group(1)), " ", working, flags=re.IGNORECASE)
+    if set_code is None:
+        set_match = _SET_CODE_TOKEN_RE.search(working.upper())
+        if set_match is not None:
+            set_code = set_match.group(1).lower()
+            working = re.sub(re.escape(set_match.group(1)), " ", working, flags=re.IGNORECASE)
+        else:
+            derived = _derive_set_code_from_card_number(card_number)
+            if derived:
+                set_code = derived
+
+    working = _strip_lookup_name_noise(working)
+    cleaned = " ".join(working.split()).strip() or None
+    return cleaned, card_number, rarity, set_code
+
+
+def _strip_lookup_name_noise(value: str) -> str:
+    """Remove standalone lookup descriptors left around the actual card name."""
+    cleaned = " ".join(value.split()).strip()
+    while True:
+        updated = re.sub(r"^(?:card|cards|卡|卡片|卡牌)\s+", "", cleaned, flags=re.IGNORECASE)
+        updated = re.sub(r"\s+(?:card|cards|卡|卡片|卡牌)$", "", updated, flags=re.IGNORECASE)
+        updated = " ".join(updated.split()).strip()
+        if updated == cleaned:
+            return updated
+        cleaned = updated
 
 
 def _normalize_handle(value: object) -> str | None:
@@ -841,7 +925,9 @@ def _derive_set_code_from_card_number(card_number: str | None) -> str | None:
     if not card_number:
         return None
     if "/" in card_number:
-        return card_number.split("/", 1)[0].lower()
+        prefix = card_number.split("/", 1)[0].strip()
+        return prefix.lower() if any(character.isalpha() for character in prefix) else None
     if "-" in card_number:
-        return card_number.split("-", 1)[0].lower()
+        prefix = card_number.split("-", 1)[0].strip()
+        return prefix.lower() if any(character.isalpha() for character in prefix) else None
     return None

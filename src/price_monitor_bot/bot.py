@@ -38,6 +38,7 @@ from .natural_language import (
     TelegramNaturalLanguageIntent,
     TelegramNaturalLanguageRouter,
     fallback_route_telegram_natural_language,
+    _recover_lookup_fields,
 )
 
 LookupRenderer = Callable[["TelegramLookupQuery"], str]
@@ -1077,12 +1078,20 @@ def parse_lookup_command(raw: str) -> TelegramLookupQuery:
         name = parts[1]
         if game is None:
             raise ValueError(f"Unsupported game. Use {supported_game_hint()}.")
+        name, card_number, rarity, set_code = _recover_lookup_fields(
+            name,
+            _value_or_none(parts, 2),
+            _value_or_none(parts, 3),
+            _value_or_none(parts, 4),
+        )
+        if not name:
+            raise ValueError("Lookup name cannot be empty.")
         return TelegramLookupQuery(
             game=game,
             name=name,
-            card_number=_value_or_none(parts, 2),
-            rarity=_value_or_none(parts, 3),
-            set_code=_value_or_none(parts, 4),
+            card_number=card_number,
+            rarity=rarity,
+            set_code=set_code,
         )
 
     tokens = body.split()
@@ -1092,9 +1101,16 @@ def parse_lookup_command(raw: str) -> TelegramLookupQuery:
     if game is None:
         raise ValueError(f"Unsupported game. Use {supported_game_hint()}.")
     name = " ".join(tokens[1:]).strip()
+    name, card_number, rarity, set_code = _recover_lookup_fields(name, None, None, None)
     if not name:
         raise ValueError("Lookup name cannot be empty.")
-    return TelegramLookupQuery(game=game, name=name)
+    return TelegramLookupQuery(
+        game=game,
+        name=name,
+        card_number=card_number,
+        rarity=rarity,
+        set_code=set_code,
+    )
 
 
 def parse_reputation_snapshot_command(raw: str) -> TelegramReputationQuery:

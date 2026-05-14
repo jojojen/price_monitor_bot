@@ -2,8 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from datetime import datetime, timezone
+
 from market_monitor.http import HttpClient
+from market_monitor.models import MarketOffer
 from tcg_tracker.catalog import TcgCardSpec
+from tcg_tracker.matching import minimum_match_score, score_tcg_offer
 from tcg_tracker.yuyutei import YuyuteiClient
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures"
@@ -125,3 +129,50 @@ def test_union_arena_search_terms_include_padded_card_number_variant() -> None:
     assert terms[0] == "UAPR/EVA-1-71"
     assert "UAPR/EVA-1-071" in terms
     assert "綾波レイ" in terms
+
+
+def test_union_arena_matching_tolerates_different_set_code_prefix() -> None:
+    """Yuyutei lists this card as UA44BT/... while users / other sites use UAPR/...
+    The same EVA-1-071 suffix should still produce a match."""
+    spec = TcgCardSpec(game="union_arena", title="綾波レイ", card_number="UAPR/EVA-1-071")
+    offer = MarketOffer(
+        source="yuyutei",
+        listing_id="ua44bt:eva1",
+        url="https://yuyu-tei.jp/sell/ua/card/eva1/10093",
+        title="綾波 レイ",
+        price_jpy=2200,
+        price_kind="ask",
+        captured_at=datetime.now(timezone.utc),
+        source_category="ua",
+        attributes={
+            "card_number": "UA44BT/EVA-1-071",
+            "rarity": "R",
+            "version_code": "eva1",
+            "image_alt": "UA44BT/EVA-1-071 R 綾波 レイ",
+        },
+    )
+
+    score = score_tcg_offer(spec, offer)
+
+    assert score >= minimum_match_score(spec)
+
+
+def test_union_arena_matching_still_rejects_different_card_suffix() -> None:
+    spec = TcgCardSpec(game="union_arena", title="綾波レイ", card_number="UAPR/EVA-1-071")
+    offer = MarketOffer(
+        source="yuyutei",
+        listing_id="other",
+        url="https://example.com/other",
+        title="シンジ",
+        price_jpy=2200,
+        price_kind="ask",
+        captured_at=datetime.now(timezone.utc),
+        source_category="ua",
+        attributes={
+            "card_number": "UA44BT/EVA-1-072",
+            "rarity": "R",
+            "version_code": "eva1",
+        },
+    )
+
+    assert score_tcg_offer(spec, offer) < minimum_match_score(spec)
