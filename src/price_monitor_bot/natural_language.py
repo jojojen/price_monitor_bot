@@ -35,6 +35,8 @@ _ROUTER_JSON_SCHEMA = {
         "watch_id": {"type": ["string", "null"]},
         # reputation snapshot field
         "query_url": {"type": ["string", "null"]},
+        # web research field
+        "research_query": {"type": ["string", "null"]},
         # SNS fields
         "sns_handle": {"type": ["string", "null"]},
         "sns_keyword": {"type": ["string", "null"]},
@@ -42,7 +44,7 @@ _ROUTER_JSON_SCHEMA = {
     },
     "required": [
         "intent", "game", "name", "card_number", "rarity", "set_code", "limit", "confidence",
-        "watch_query", "watch_price_threshold", "watch_id", "query_url",
+        "watch_query", "watch_price_threshold", "watch_id", "query_url", "research_query",
         "sns_handle", "sns_keyword", "sns_buzz_query",
     ],
     "additionalProperties": False,
@@ -191,6 +193,46 @@ _SCAN_KEYWORDS = (
     "photo lookup",
     "ocr",
 )
+_WEB_RESEARCH_QUESTION_KEYWORDS = (
+    "why",
+    "how come",
+    "what makes",
+    "reason",
+    "reasons",
+    "popular",
+    "popularity",
+    "為什麼",
+    "爲什麼",
+    "为什么",
+    "原因",
+    "人氣",
+    "受歡迎",
+    "受欢迎",
+    "熱門原因",
+    "人気",
+    "なぜ",
+)
+_WEB_RESEARCH_SUBJECT_KEYWORDS = (
+    "pokemon",
+    "pikachu",
+    "pickachu",
+    "charizard",
+    "ptcg",
+    "card",
+    "tcg",
+    "weiss",
+    "schwarz",
+    "yugioh",
+    "yu-gi-oh",
+    "union arena",
+    "寶可夢",
+    "寶可卡",
+    "卡牌",
+    "カード",
+    "遊戯王",
+    "遊戲王",
+    "ユニオンアリーナ",
+)
 _URL_PATTERN = re.compile(r"https?://\S+")
 _GENERIC_CARD_NUMBER_PATTERN = re.compile(
     r"\b(?:[A-Z0-9]+/[A-Z0-9]+(?:-[A-Z0-9]+)*-\d{1,3}|[A-Z0-9]{2,}-[A-Z]{1,4}\d{1,4})\b",
@@ -214,6 +256,8 @@ class TelegramNaturalLanguageIntent:
     watch_id: str | None = None
     # reputation snapshot field
     query_url: str | None = None
+    # web research field
+    research_query: str | None = None
     # SNS-specific fields
     sns_handle: str | None = None       # for sns_add_account / sns_delete (@username)
     sns_keyword: str | None = None      # for sns_add_keyword (keyword watch)
@@ -265,7 +309,7 @@ class TelegramNaturalLanguageRouter:
         return (
             "You route Telegram messages for a trading-card price assistant and must return only JSON.\n"
             "Allowed intents: lookup_card, trend_board, add_watch, list_watches, remove_watch, update_watch_price, reputation_snapshot, "
-            "sns_add_account, sns_add_keyword, sns_list, sns_delete, sns_buzz, "
+            "web_research, sns_add_account, sns_add_keyword, sns_list, sns_delete, sns_buzz, "
             "help, status, tools, scan_help, unknown.\n"
             + tool_spec_block +
             "Use lookup_card when the user wants the price, value, or card lookup of one specific card.\n"
@@ -277,6 +321,9 @@ class TelegramNaturalLanguageRouter:
             "Use update_watch_price when the user wants to change the price threshold of an existing Mercari watch. Set watch_id and watch_price_threshold.\n"
             "Use reputation_snapshot when the user wants to check a seller's reputation/trust/credit or take a snapshot of a URL.\n"
             "  Set query_url to the URL found in the message (Mercari item or profile URL).\n"
+            "Use web_research when the user asks a general explanatory/news/background question that needs current web sources, "
+            "especially why/how questions about TCG cards, Pokemon cards, popularity, market context, releases, or collector demand.\n"
+            "  Set research_query to a concise web search query preserving the user's topic.\n"
             "Use sns_add_account when the user wants to ADD / track / monitor an X (Twitter) account that starts with @.\n"
             "  Set sns_handle to the @username (without the @).\n"
             "Use sns_add_keyword when the user wants to add an X keyword/topic watch (not an @ account).\n"
@@ -318,6 +365,8 @@ class TelegramNaturalLanguageRouter:
             '- "取消追蹤 abc12345" -> remove_watch, watch_id="abc12345"\n'
             '- "把 abc12345 改成 4萬" -> update_watch_price, watch_id="abc12345", watch_price_threshold=40000\n'
             '- "查詢信用 https://jp.mercari.com/item/m12345" -> reputation_snapshot, query_url="https://jp.mercari.com/item/m12345"\n'
+            '- "why pokemon card pickachu card is so popular?" -> web_research, research_query="why Pokemon Pikachu cards are popular"\n'
+            '- "為什麼噴火龍寶可夢卡那麼有人氣" -> web_research, research_query="為什麼 噴火龍 寶可夢卡 人氣"\n'
             '- "追蹤 @elonmusk" -> sns_add_account, sns_handle="elonmusk"\n'
             '- "新增 X 監控 @aka_claw" -> sns_add_account, sns_handle="aka_claw"\n'
             '- "刪除追蹤 @elonmusk" -> sns_delete, sns_handle="elonmusk"\n'
@@ -577,6 +626,13 @@ def fallback_route_telegram_natural_language(text: str) -> TelegramNaturalLangua
     if any(keyword in lowered for keyword in _STATUS_KEYWORDS):
         return TelegramNaturalLanguageIntent(intent="status", confidence=0.45)
 
+    if _looks_like_web_research_question(content):
+        return TelegramNaturalLanguageIntent(
+            intent="web_research",
+            research_query=_extract_research_query(content),
+            confidence=0.45,
+        )
+
     if any(keyword in lowered for keyword in _TREND_KEYWORDS):
         game = _infer_game(content)
         if game is None:
@@ -693,7 +749,7 @@ def _load_json_fragment(value: str) -> object:
 _ALLOWED_INTENTS = frozenset({
     "lookup_card", "trend_board",
     "add_watch", "list_watches", "remove_watch", "update_watch_price",
-    "reputation_snapshot",
+    "reputation_snapshot", "web_research",
     "sns_add_account", "sns_add_keyword", "sns_list", "sns_delete", "sns_buzz",
     "help", "status", "tools", "scan_help", "unknown",
 })
@@ -715,6 +771,7 @@ def _normalize_intent(payload: dict[str, object]) -> TelegramNaturalLanguageInte
     watch_price_threshold = _normalize_price_threshold(payload.get("watch_price_threshold"))
     watch_id = _normalize_text_field(payload.get("watch_id"))
     query_url = _normalize_text_field(payload.get("query_url"))
+    research_query = _normalize_text_field(payload.get("research_query"))
     sns_handle = _normalize_handle(payload.get("sns_handle"))
     sns_keyword = _normalize_text_field(payload.get("sns_keyword"))
     sns_buzz_query = _normalize_text_field(payload.get("sns_buzz_query"))
@@ -740,6 +797,7 @@ def _normalize_intent(payload: dict[str, object]) -> TelegramNaturalLanguageInte
         watch_price_threshold=watch_price_threshold,
         watch_id=watch_id,
         query_url=query_url,
+        research_query=research_query,
         sns_handle=sns_handle,
         sns_keyword=sns_keyword,
         sns_buzz_query=sns_buzz_query,
@@ -829,6 +887,24 @@ def _extract_buzz_query(text: str) -> str | None:
         cleaned = re.sub(re.escape(phrase), " ", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"[，、。！？!?]", " ", cleaned)
     cleaned = " ".join(cleaned.split()).strip()
+    return cleaned or None
+
+
+def _looks_like_web_research_question(text: str) -> bool:
+    lowered = text.lower()
+    has_question_shape = (
+        "?" in text
+        or "？" in text
+        or any(keyword in lowered for keyword in _WEB_RESEARCH_QUESTION_KEYWORDS)
+    )
+    if not has_question_shape:
+        return False
+    return any(keyword in lowered for keyword in _WEB_RESEARCH_SUBJECT_KEYWORDS)
+
+
+def _extract_research_query(text: str) -> str | None:
+    cleaned = re.sub(r"[？?]+", " ", text)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned or None
 
 

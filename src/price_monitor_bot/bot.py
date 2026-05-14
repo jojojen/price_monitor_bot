@@ -44,6 +44,7 @@ from .natural_language import (
 LookupRenderer = Callable[["TelegramLookupQuery"], str]
 PhotoLookupRenderer = Callable[["TelegramPhotoQuery"], str]
 ReputationRenderer = Callable[["TelegramReputationQuery"], object]
+ResearchRenderer = Callable[["TelegramResearchQuery"], str]
 BoardLoader = Callable[[], tuple[HotCardBoard, ...]]
 CatalogRenderer = Callable[[], str]
 WatchlistStore = object  # MonitorDatabase or None
@@ -52,6 +53,7 @@ PRICE_LOOKUP_COMMANDS = {"/lookup", "/price"}
 TREND_BOARD_COMMANDS = {"/trend", "/trending", "/hot", "/heat", "/liquidity"}
 PHOTO_SCAN_COMMANDS = {"/scan", "/image", "/photo"}
 REPUTATION_SNAPSHOT_COMMANDS = {"/snapshot", "/proof", "/repcheck", "/reputation"}
+WEB_RESEARCH_COMMANDS = {"/search", "/research", "/web"}
 WATCH_COMMANDS = {"/watch"}
 WATCHLIST_COMMANDS = {"/watchlist", "/watches"}
 UNWATCH_COMMANDS = {"/unwatch", "/stopwatch"}
@@ -61,7 +63,7 @@ SNS_LIST_COMMANDS = {"/snslist", "/sns_list"}
 SNS_DELETE_COMMANDS = {"/snsdelete", "/sns_delete"}
 SNS_BUZZ_COMMANDS = {"/snsbuzz", "/sns_buzz"}
 HUNT_COMMANDS = {"/hunt", "/opportunity"}
-HEAVY_COMMANDS = PRICE_LOOKUP_COMMANDS | TREND_BOARD_COMMANDS | REPUTATION_SNAPSHOT_COMMANDS
+HEAVY_COMMANDS = PRICE_LOOKUP_COMMANDS | TREND_BOARD_COMMANDS | REPUTATION_SNAPSHOT_COMMANDS | WEB_RESEARCH_COMMANDS
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +90,11 @@ class TelegramPhotoQuery:
 @dataclass(frozen=True, slots=True)
 class TelegramReputationQuery:
     query_url: str
+
+
+@dataclass(frozen=True, slots=True)
+class TelegramResearchQuery:
+    query: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,6 +260,7 @@ class TelegramCommandProcessor:
         board_loader: BoardLoader,
         catalog_renderer: CatalogRenderer,
         reputation_renderer: ReputationRenderer | None = None,
+        research_renderer: ResearchRenderer | None = None,
         natural_language_router: TelegramNaturalLanguageRouter | None = None,
         allowed_chat_ids: frozenset[str] | None = None,
         status_renderer: Callable[[], str] | None = None,
@@ -265,6 +273,7 @@ class TelegramCommandProcessor:
         self._board_loader = board_loader
         self._catalog_renderer = catalog_renderer
         self._reputation_renderer = reputation_renderer
+        self._research_renderer = research_renderer
         self._natural_language_router = natural_language_router
         self._allowed_chat_ids: frozenset[str] = allowed_chat_ids or frozenset()
         self._status_renderer = status_renderer
@@ -334,6 +343,12 @@ class TelegramCommandProcessor:
                 reply=None,
                 reply_factory=lambda remainder=remainder: self._handle_reputation_snapshot(remainder),
             )
+        if command in WEB_RESEARCH_COMMANDS:
+            return TelegramTextReplyPlan(
+                ack=build_processing_ack(text=content),
+                reply=None,
+                reply_factory=lambda remainder=remainder: self._handle_web_research(remainder),
+            )
         if command in WATCH_COMMANDS:
             return TelegramTextReplyPlan(
                 ack="收到追蹤指令，正在設定…",
@@ -377,7 +392,7 @@ class TelegramCommandProcessor:
         logger.info("Telegram unknown command command=%s", command)
         return TelegramTextReplyPlan(
             ack=None,
-            reply="Unknown command. Use /help, /price, /trend, /snapshot, or send a photo with /scan. You can also ask in natural language.",
+            reply="Unknown command. Use /help, /price, /trend, /snapshot, /search, or send a photo with /scan. You can also ask in natural language.",
         )
 
     def _handle_lookup(self, raw: str) -> str:
@@ -428,6 +443,19 @@ class TelegramCommandProcessor:
 
     def _handle_reputation_snapshot(self, raw: str) -> str:
         return self.build_reputation_delivery(raw).summary_text
+
+    def _handle_web_research(self, raw: str) -> str:
+        if self._research_renderer is None:
+            return "Web research is not configured in this OpenClaw runtime."
+        query = raw.strip()
+        if not query:
+            return "Please provide a search question. Example: /search why Pikachu Pokemon cards are popular"
+        try:
+            logger.info("Telegram web research requested query=%s", trim_for_log(query, limit=240))
+            return self._research_renderer(TelegramResearchQuery(query=query))
+        except Exception as exc:  # pragma: no cover - source/network-dependent.
+            logger.exception("Telegram web research failed query=%s", trim_for_log(query, limit=240))
+            return f"Web research failed: {exc}"
 
     def _handle_watch(self, raw: str, chat_id: str) -> str:
         if self._watch_db is None:
@@ -690,6 +718,23 @@ class TelegramCommandProcessor:
                 ack=f"已理解查詢內容，相當於 /snapshot {url}，正在建立信譽快照…",
                 reply=None,
                 reputation_delivery_factory=lambda url=url: self.build_reputation_delivery(url),
+            )
+        if intent.intent == "web_research":
+            query = intent.research_query
+            if not query:
+                return TelegramTextReplyPlan(
+                    ack=None,
+                    reply="I understood that you want web research, but I still need the topic or question.",
+                )
+            logger.info(
+                "Telegram natural-language routed intent=web_research query=%s confidence=%s",
+                trim_for_log(query, limit=240),
+                intent.confidence,
+            )
+            return TelegramTextReplyPlan(
+                ack=f"已理解：相當於 /search {query}，正在搜尋資料來源並整理答案…",
+                reply=None,
+                reply_factory=lambda q=query: self._handle_web_research(q),
             )
 
         # ── SNS intents ────────────────────────────────────────────────────────
@@ -991,6 +1036,7 @@ class TelegramCommandProcessor:
                 "/hot pokemon",
                 "/liquidity ws 5",
                 "/snapshot https://jp.mercari.com/item/m123456789",
+                "/search why Pikachu Pokemon cards are popular",
                 "Send a photo with caption: /scan pokemon",
                 "--- Mercari 追蹤 ---",
                 "/watch 想いが重なる場所で 初音ミク SSP on 300000",
@@ -1008,6 +1054,7 @@ class TelegramCommandProcessor:
                 "/hunt status",
                 "You can also ask things like: 幫我查 pokemon Pikachu ex 132/106",
                 "Or: pokemon 熱門前 5",
+                "Or: why are Pikachu Pokemon cards so popular?",
             ]
         )
 
@@ -1304,6 +1351,8 @@ def build_processing_ack(*, text: str | None = None, has_photo: bool = False) ->
         return "收到趨勢榜查詢，開始整理資料。"
     if command in REPUTATION_SNAPSHOT_COMMANDS:
         return "收到信譽快照查詢，先檢查既有 proof，必要時建立新快照。"
+    if command in WEB_RESEARCH_COMMANDS:
+        return "收到搜尋問題，正在找資料來源並整理答案。"
     return None
 
 
@@ -1315,6 +1364,7 @@ def run_telegram_polling(
     catalog_renderer: CatalogRenderer,
     photo_renderer: PhotoLookupRenderer | None = None,
     reputation_renderer: ReputationRenderer | None = None,
+    research_renderer: ResearchRenderer | None = None,
     natural_language_router: TelegramNaturalLanguageRouter | None = None,
     ssl_context: ssl.SSLContext | None = None,
     allowed_chat_ids: frozenset[str] | None = None,
@@ -1349,6 +1399,7 @@ def run_telegram_polling(
         board_loader=board_loader,
         catalog_renderer=catalog_renderer,
         reputation_renderer=reputation_renderer,
+        research_renderer=research_renderer,
         natural_language_router=natural_language_router,
         allowed_chat_ids=allowed_chat_ids,
         status_renderer=status_renderer,
