@@ -7,7 +7,9 @@ from tcg_tracker.hot_cards import (
     HotCardBuySignal,
     HotCardReference,
     HotCardSocialSignal,
+    YUYUTEI_UNION_ARENA_TOP_URL,
     YUYUTEI_WS_TOP_URL,
+    YUYUTEI_YUGIOH_TOP_URL,
     TcgHotCardService,
     _ParsedHotItem,
     _parse_cardrush_text,
@@ -673,6 +675,54 @@ def test_parse_yuyutei_ws_carousel_items_extracts_featured_cards() -> None:
     assert items[0].detail_url == "https://yuyu-tei.jp/sell/ws/card/pjs3.0/10263"
     assert items[0].board_url == YUYUTEI_WS_TOP_URL
     assert items[0].source_label == "Yuyutei featured singles"
+
+
+def test_parse_yuyutei_generic_carousel_items_extracts_yugioh_and_union_arena_cards() -> None:
+    html = """
+    <div id="recommendedItemList">
+      <div class="col-md-4">
+        <a href="https://yuyu-tei.jp/sell/ygo/card/pre/10639">
+          <img src="/dragoon.jpg" alt=" LOSP-JP001 PSE 超魔導竜騎士-ドラグーン・オブ・レッドアイズ(オーバーフレーム) "/>
+          <p>超魔導竜騎士-ドラグーン・オブ・レッドアイズ(オーバーフレーム)</p>
+        </a>
+        <strong>6,980 円</strong>
+      </div>
+      <div class="col-md-4">
+        <a href="https://yuyu-tei.jp/sell/ua/card/eva1/10071">
+          <img src="/rei.jpg" alt=" UAPR/EVA-1-071 SR 綾波レイ "/>
+          <p>綾波レイ</p>
+        </a>
+        <strong>2,200 円</strong>
+      </div>
+    </div>
+    """
+    service = TcgHotCardService()
+
+    ygo_items = service._parse_yuyutei_carousel_items(  # type: ignore[attr-defined]
+        html,
+        source_code="ygo",
+        board_url=YUYUTEI_YUGIOH_TOP_URL,
+        carousel_id="recommendedItemList",
+        source_label="Yuyutei featured singles",
+        source_weight=0.34,
+        note="featured",
+    )
+    ua_items = service._parse_yuyutei_carousel_items(  # type: ignore[attr-defined]
+        html,
+        source_code="ua",
+        board_url=YUYUTEI_UNION_ARENA_TOP_URL,
+        carousel_id="recommendedItemList",
+        source_label="Yuyutei featured singles",
+        source_weight=0.34,
+        note="featured",
+    )
+
+    assert ygo_items[0].card_number == "LOSP-JP001"
+    assert ygo_items[0].set_code == "losp"
+    assert ygo_items[0].price_jpy == 6980
+    assert ua_items[0].card_number == "UAPR/EVA-1-071"
+    assert ua_items[0].set_code == "uapr"
+    assert ua_items[0].price_jpy == 2200
 
 
 def test_load_ws_board_items_uses_live_sources_instead_of_legacy_articles() -> None:

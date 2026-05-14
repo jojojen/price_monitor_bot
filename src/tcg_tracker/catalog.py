@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from hashlib import sha1
+import re
 
 from market_monitor.models import TrackedItem
 from market_monitor.normalize import normalize_card_number
@@ -9,8 +10,55 @@ from market_monitor.normalize import normalize_card_number
 GAME_CODES = {
     "pokemon": "poc",
     "ws": "ws",
+    "yugioh": "ygo",
+    "union_arena": "ua",
+}
+SUPPORTED_GAMES = tuple(GAME_CODES)
+GAME_ALIASES = {
+    "pokemon": "pokemon",
+    "ptcg": "pokemon",
+    "ポケモン": "pokemon",
+    "寶可夢": "pokemon",
+    "宝可梦": "pokemon",
+    "寶可卡": "pokemon",
+    "宝可卡": "pokemon",
+    "ws": "ws",
+    "weiss": "ws",
+    "weiss_schwarz": "ws",
+    "weiß_schwarz": "ws",
+    "ヴァイス": "ws",
+    "yugioh": "yugioh",
+    "ygo": "yugioh",
+    "yu_gi_oh": "yugioh",
+    "遊戯王": "yugioh",
+    "遊戲王": "yugioh",
+    "游戏王": "yugioh",
+    "遊戯王ocg": "yugioh",
+    "遊戯王ラッシュデュエル": "yugioh",
+    "union_arena": "union_arena",
+    "unionarena": "union_arena",
+    "union_area": "union_arena",
+    "unionarea": "union_arena",
+    "ua": "union_arena",
+    "ユニオンアリーナ": "union_arena",
 }
 ITEM_KINDS = {"card", "sealed_box"}
+
+
+def normalize_game_key(value: str | None) -> str | None:
+    if value is None:
+        return None
+    key = value.strip().lower()
+    if not key:
+        return None
+    key = key.replace("-", "_").replace("/", "_")
+    key = key.replace("☆", "").replace("・", "")
+    key = re.sub(r"\s+", "_", key)
+    return GAME_ALIASES.get(key)
+
+
+def supported_game_hint() -> str:
+    return "pokemon, ws, yugioh/ygo, union_arena/ua"
 
 
 def build_tcg_item_id(
@@ -41,8 +89,10 @@ class TcgCardSpec:
     item_id: str | None = None
 
     def __post_init__(self) -> None:
-        if self.game not in GAME_CODES:
+        normalized_game = normalize_game_key(self.game)
+        if normalized_game not in GAME_CODES:
             raise ValueError(f"unsupported game: {self.game}")
+        object.__setattr__(self, "game", normalized_game)
         if self.item_kind not in ITEM_KINDS:
             raise ValueError(f"unsupported item kind: {self.item_kind}")
 

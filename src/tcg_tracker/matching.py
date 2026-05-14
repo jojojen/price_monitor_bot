@@ -47,6 +47,13 @@ def score_tcg_offer(spec: TcgCardSpec, offer: MarketOffer) -> float:
         score += 35
     elif canonical_title in title_norm or title_norm in canonical_title:
         score += 25
+    else:
+        canonical_compact = _compact_text(canonical_title)
+        title_compact = _compact_text(title_norm)
+        if len(canonical_compact) >= 2 and (
+            canonical_compact in title_compact or title_compact in canonical_compact
+        ):
+            score += 25
 
     for alias in spec.aliases:
         alias_norm = normalize_text(alias)
@@ -182,7 +189,23 @@ def _shared_sealed_box_token_score(left: str, right: str) -> float:
 def _card_numbers_match(left: str, right: str) -> bool:
     if left == right:
         return True
+    if _normalize_trailing_card_number(left) == _normalize_trailing_card_number(right) != "":
+        return True
     return _normalize_simple_pokemon_number(left) == _normalize_simple_pokemon_number(right) != ""
+
+
+def _compact_text(value: str) -> str:
+    return re.sub(r"[\s・･]+", "", value or "")
+
+
+def _normalize_trailing_card_number(value: str) -> str:
+    match = re.fullmatch(r"(?P<prefix>.+[-/])(?P<number>\d{1,3})", value)
+    if match is None:
+        return ""
+    number = int(match.group("number"))
+    if number <= 0:
+        return ""
+    return f"{match.group('prefix')}{number:03d}"
 
 
 def _normalize_simple_pokemon_number(value: str) -> str:

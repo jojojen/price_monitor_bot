@@ -14,6 +14,8 @@ def build_lookup_terms(spec: TcgCardSpec) -> tuple[str, ...]:
         terms.append(spec.card_number)
         if spec.game == "pokemon":
             terms.extend(_pokemon_card_number_variants(spec.card_number))
+        if spec.game in {"yugioh", "union_arena"}:
+            terms.extend(generic_card_number_variants(spec.card_number))
 
     for keyword in spec.keywords():
         if keyword:
@@ -23,6 +25,10 @@ def build_lookup_terms(spec: TcgCardSpec) -> tuple[str, ...]:
         terms.extend(_pokemon_title_variants(spec.title))
         for alias in spec.aliases:
             terms.extend(_pokemon_title_variants(alias))
+    if spec.game in {"yugioh", "union_arena"}:
+        terms.extend(_japanese_spacing_variants(spec.title))
+        for alias in spec.aliases:
+            terms.extend(_japanese_spacing_variants(alias))
 
     deduped: list[str] = []
     for term in terms:
@@ -96,6 +102,18 @@ def _pokemon_title_variants(title: str) -> tuple[str, ...]:
     return cleaned, f"{cleaned}ex"
 
 
+def _japanese_spacing_variants(title: str) -> tuple[str, ...]:
+    cleaned = title.strip()
+    if not cleaned:
+        return ()
+    variants = (
+        cleaned.replace("・", ""),
+        cleaned.replace("・", " "),
+        cleaned.replace(" ", ""),
+    )
+    return tuple(value for value in variants if value and value != cleaned)
+
+
 def _pokemon_card_number_variants(card_number: str) -> tuple[str, ...]:
     match = re.fullmatch(r"(?P<numerator>\d{1,3})/(?P<denominator>\d{1,3})", card_number.strip())
     if match is None:
@@ -114,3 +132,43 @@ def _pokemon_card_number_variants(card_number: str) -> tuple[str, ...]:
         for value in (compact, padded)
         if value and value != original
     )
+
+
+def generic_card_number_variants(card_number: str) -> tuple[str, ...]:
+    original = card_number.strip().upper()
+    if not original:
+        return ()
+
+    variants: list[str] = []
+    padded = _pad_trailing_card_number(original)
+    if padded and padded != original:
+        variants.append(padded)
+
+    depadded = _depad_trailing_card_number(original)
+    if depadded and depadded != original:
+        variants.append(depadded)
+
+    tokenized = re.sub(r"[-/]", " ", padded or original)
+    tokenized = " ".join(tokenized.split())
+    if tokenized and tokenized not in {original, *variants}:
+        variants.append(tokenized)
+
+    deduped: list[str] = []
+    for variant in variants:
+        if variant and variant not in deduped:
+            deduped.append(variant)
+    return tuple(deduped)
+
+
+def _pad_trailing_card_number(value: str) -> str | None:
+    match = re.fullmatch(r"(?P<prefix>.+[-/])(?P<number>\d{1,3})", value.strip().upper())
+    if match is None:
+        return None
+    return f"{match.group('prefix')}{int(match.group('number')):03d}"
+
+
+def _depad_trailing_card_number(value: str) -> str | None:
+    match = re.fullmatch(r"(?P<prefix>.+[-/])(?P<number>0{1,2}\d{1,3})", value.strip().upper())
+    if match is None:
+        return None
+    return f"{match.group('prefix')}{int(match.group('number'))}"

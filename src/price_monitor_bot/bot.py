@@ -22,6 +22,7 @@ from hashlib import sha1
 
 from market_monitor.http import HttpClient
 from market_monitor.storage import MercariWatch, MonitorDatabase
+from tcg_tracker.catalog import normalize_game_key, supported_game_hint
 from tcg_tracker.hot_cards import HotCardBoard, TcgHotCardService
 from tcg_tracker.image_lookup import (
     TcgImageLookupOutcome,
@@ -404,9 +405,9 @@ class TelegramCommandProcessor:
         if not parts:
             return "Specify a game, for example: /trend pokemon"
 
-        game = parts[0].lower()
-        if game not in {"pokemon", "ws"}:
-            return "Unsupported game. Use pokemon or ws."
+        game = normalize_game_key(parts[0])
+        if game is None:
+            return f"Unsupported game. Use {supported_game_hint()}."
 
         limit = 5
         if len(parts) >= 2 and parts[1].isdigit():
@@ -560,29 +561,31 @@ class TelegramCommandProcessor:
                 reply="Send a card photo with the caption /scan pokemon or /scan ws, and I will parse it and then look up the price.",
             )
         if intent.intent == "trend_board":
-            if intent.game not in {"pokemon", "ws"}:
+            if normalize_game_key(intent.game) is None:
                 return TelegramTextReplyPlan(
                     ack=None,
-                    reply="I understood that you want the hot board, but I still need the game: pokemon or ws.",
+                    reply=f"I understood that you want the hot board, but I still need the game: {supported_game_hint()}.",
                 )
+            game = normalize_game_key(intent.game) or intent.game
             limit = 5 if intent.limit is None else max(1, min(10, intent.limit))
             logger.info(
                 "Telegram natural-language routed intent=trend_board game=%s limit=%s confidence=%s",
-                intent.game,
+                game,
                 limit,
                 intent.confidence,
             )
             return TelegramTextReplyPlan(
-                ack=f"已理解查詢內容，相當於 /trend {intent.game} {limit}，開始整理資料。",
+                ack=f"已理解查詢內容，相當於 /trend {game} {limit}，開始整理資料。",
                 reply=None,
-                reply_factory=lambda game=intent.game, limit=limit: self._handle_liquidity(f"{game} {limit}"),
+                reply_factory=lambda game=game, limit=limit: self._handle_liquidity(f"{game} {limit}"),
             )
         if intent.intent == "lookup_card":
-            if intent.game not in {"pokemon", "ws"}:
+            if normalize_game_key(intent.game) is None:
                 return TelegramTextReplyPlan(
                     ack=None,
-                    reply="I understood that you want a card lookup, but I still need the game: pokemon or ws.",
+                    reply=f"I understood that you want a card lookup, but I still need the game: {supported_game_hint()}.",
                 )
+            game = normalize_game_key(intent.game) or intent.game
             resolved_name = intent.name or intent.card_number
             if not resolved_name:
                 return TelegramTextReplyPlan(
@@ -590,7 +593,7 @@ class TelegramCommandProcessor:
                     reply="I understood that you want a card lookup, but I still need the card name.",
                 )
             query = TelegramLookupQuery(
-                game=intent.game,
+                game=game,
                 name=resolved_name,
                 card_number=intent.card_number,
                 rarity=intent.rarity,
@@ -978,8 +981,12 @@ class TelegramCommandProcessor:
                 "/price pokemon Pikachu ex",
                 "/price pokemon | Pikachu ex | 132/106 | SAR | sv08",
                 "/price ws | Hatsune Miku | PJS/S91-T51 | TD | pjs",
+                "/price ygo | 青眼の白龍 | QCCP-JP001 | UR",
+                "/price ua | 綾波レイ | UAPR/EVA-1-71",
                 "/trend pokemon",
                 "/trend ws 5",
+                "/trend ygo 5",
+                "/trend ua 5",
                 "/hot pokemon",
                 "/liquidity ws 5",
                 "/snapshot https://jp.mercari.com/item/m123456789",
@@ -1066,10 +1073,10 @@ def parse_lookup_command(raw: str) -> TelegramLookupQuery:
         parts = [part.strip() for part in body.split("|")]
         if len(parts) < 2 or not parts[0] or not parts[1]:
             raise ValueError("Pipe format requires at least game and name.")
-        game = parts[0].lower()
+        game = normalize_game_key(parts[0])
         name = parts[1]
-        if game not in {"pokemon", "ws"}:
-            raise ValueError("Unsupported game. Use pokemon or ws.")
+        if game is None:
+            raise ValueError(f"Unsupported game. Use {supported_game_hint()}.")
         return TelegramLookupQuery(
             game=game,
             name=name,
@@ -1081,9 +1088,9 @@ def parse_lookup_command(raw: str) -> TelegramLookupQuery:
     tokens = body.split()
     if len(tokens) < 2:
         raise ValueError("Lookup command requires at least game and name.")
-    game = tokens[0].lower()
-    if game not in {"pokemon", "ws"}:
-        raise ValueError("Unsupported game. Use pokemon or ws.")
+    game = normalize_game_key(tokens[0])
+    if game is None:
+        raise ValueError(f"Unsupported game. Use {supported_game_hint()}.")
     name = " ".join(tokens[1:]).strip()
     if not name:
         raise ValueError("Lookup name cannot be empty.")
@@ -1557,8 +1564,8 @@ def _parse_photo_caption_for_lookup(caption: str | None) -> tuple[str | None, st
     tokens = content.split()
     if not tokens:
         return None, None
-    first = tokens[0].lower()
-    if first in {"pokemon", "ws"}:
+    first = normalize_game_key(tokens[0])
+    if first is not None:
         remainder = " ".join(tokens[1:]).strip()
         return first, _sanitize_image_title_hint(remainder or None)
     return None, _sanitize_image_title_hint(content)

@@ -115,3 +115,13 @@ def test_search_terms_include_card_number_and_pokemon_ex_variant() -> None:
     assert terms[0] == "235/193"
     assert "メガシビルドン" in terms
     assert "メガシビルドンex" in terms
+
+
+def test_union_arena_search_terms_include_padded_card_number_variant() -> None:
+    spec = TcgCardSpec(game="union area", title="綾波レイ", card_number="UAPR/EVA-1-71")
+
+    terms = YuyuteiClient._search_terms(spec)  # type: ignore[attr-defined]
+
+    assert terms[0] == "UAPR/EVA-1-71"
+    assert "UAPR/EVA-1-071" in terms
+    assert "綾波レイ" in terms

@@ -22,15 +22,48 @@
     "notes": "Use for card normalization and title verification, not price estimation."
   },
   {
+    "id": "yugioh_official_card_database",
+    "name": "Yu-Gi-Oh! Official Card Database",
+    "games": ["yugioh"],
+    "source_kind": "official_metadata",
+    "reference_roles": ["canonical_name", "card_number", "title", "product_line"],
+    "price_weight": 0.0,
+    "trust_score": 1.0,
+    "url": "https://www.db.yugioh-card.com/yugiohdb/card_search.action",
+    "notes": "Use for Yugioh card normalization and metadata verification, not price estimation."
+  },
+  {
+    "id": "union_arena_official_cardlist",
+    "name": "Union Arena Official Card List",
+    "games": ["union_arena"],
+    "source_kind": "official_metadata",
+    "reference_roles": ["canonical_name", "card_number", "title", "product_line"],
+    "price_weight": 0.0,
+    "trust_score": 1.0,
+    "url": "https://www.unionarena-tcg.com/jp/cardlist/",
+    "notes": "Use for Union Arena card normalization and metadata verification, not price estimation."
+  },
+  {
     "id": "yuyutei",
     "name": "Yuyu-Tei",
-    "games": ["pokemon", "ws"],
+    "games": ["pokemon", "ws", "yugioh", "union_arena"],
     "source_kind": "specialty_store",
     "reference_roles": ["ask_price", "bid_price", "inventory_signal"],
     "price_weight": 0.9,
     "trust_score": 0.93,
     "url": "https://yuyu-tei.jp/",
     "notes": "Primary phase-one store reference already implemented."
+  },
+  {
+    "id": "surugaya",
+    "name": "Surugaya",
+    "games": ["union_arena"],
+    "source_kind": "specialty_store",
+    "reference_roles": ["ask_price", "bid_price", "inventory_signal"],
+    "price_weight": 0.78,
+    "trust_score": 0.82,
+    "url": "https://www.suruga-ya.jp/",
+    "notes": "Union Arena fallback source for exact card-number lookups when Yuyu-Tei search misses promos."
   },
   {
     "id": "snkrdunk",
@@ -66,6 +99,17 @@
     "notes": "Buylist reference. Their page warns cache may affect freshness, so scrape carefully."
   },
   {
+    "id": "cardrush_yugioh_sell",
+    "name": "Card Rush Yugioh Sell",
+    "games": ["yugioh"],
+    "source_kind": "specialty_store",
+    "reference_roles": ["ask_price", "inventory_signal"],
+    "price_weight": 0.87,
+    "trust_score": 0.88,
+    "url": "https://www.cardrush.jp/",
+    "notes": "Useful Yugioh single-card retail reference."
+  },
+  {
     "id": "hareruya2_buy",
     "name": "Hareruya 2 Buylist",
     "games": ["pokemon"],
@@ -99,9 +143,20 @@
     "notes": "Useful WS secondary-market source when store references are thin."
   },
   {
+    "id": "magi_generic_tcg_search",
+    "name": "Magi Generic TCG Search",
+    "games": ["yugioh", "union_arena"],
+    "source_kind": "marketplace",
+    "reference_roles": ["listing_price", "market_depth", "supply_signal"],
+    "price_weight": 0.62,
+    "trust_score": 0.72,
+    "url": "https://magi.camp/products/search",
+    "notes": "Fallback marketplace search for Yugioh and Union Arena when specialty-store references are thin."
+  },
+  {
     "id": "mercari",
     "name": "Mercari JP",
-    "games": ["pokemon", "ws"],
+    "games": ["pokemon", "ws", "yugioh", "union_arena"],
     "source_kind": "marketplace",
     "reference_roles": ["listing_price", "new_listing_alert", "seller_signal"],
     "price_weight": 0.82,
@@ -112,7 +167,7 @@
   {
     "id": "yahoo_fleamarket",
     "name": "Yahoo Flea Market",
-    "games": ["pokemon", "ws"],
+    "games": ["pokemon", "ws", "yugioh", "union_arena"],
     "source_kind": "marketplace",
     "reference_roles": ["listing_price", "market_depth"],
     "price_weight": 0.68,
@@ -123,7 +178,7 @@
   {
     "id": "rakuma",
     "name": "Rakuma",
-    "games": ["pokemon", "ws"],
+    "games": ["pokemon", "ws", "yugioh", "union_arena"],
     "source_kind": "marketplace",
     "reference_roles": ["listing_price", "market_depth"],
     "price_weight": 0.65,

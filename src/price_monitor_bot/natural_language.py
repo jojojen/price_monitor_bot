@@ -9,6 +9,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
+from tcg_tracker.catalog import normalize_game_key, supported_game_hint
+
 logger = logging.getLogger(__name__)
 
 _CHINESE_DIGIT_MAP: dict[str, int] = {
@@ -190,6 +192,10 @@ _SCAN_KEYWORDS = (
     "ocr",
 )
 _URL_PATTERN = re.compile(r"https?://\S+")
+_GENERIC_CARD_NUMBER_PATTERN = re.compile(
+    r"\b(?:[A-Z0-9]+/[A-Z0-9]+(?:-[A-Z0-9]+)*-\d{1,3}|[A-Z0-9]{2,}-[A-Z]{1,4}\d{1,4})\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -290,9 +296,11 @@ class TelegramNaturalLanguageRouter:
             "- 'X', 'Twitter', '推特', '推文', '推主', '帳號' always indicate SNS intents.\n"
             "- '追蹤'/'tracking' alone is ambiguous: if it co-occurs with @handle/X/Twitter → SNS; if it co-occurs with a price (円/JPY/万) or Mercari URL → Mercari.\n"
             "- '取消'/'刪除'/'unfollow'/'unwatch' on an @ handle → sns_delete with sns_handle set, NOT remove_watch.\n"
-            'Game must be "pokemon", "ws", or null.\n'
+            f'Game must be one of "{supported_game_hint()}" or null.\n'
             "Infer pokemon for wording like Pokemon, PTCG, 寶可夢, 寶可卡.\n"
             "Infer ws for wording like Weiss, WS, Weiß Schwarz, ヴァイス.\n"
+            "Infer yugioh for wording like Yu-Gi-Oh, YGO, 遊戯王, 遊戲王.\n"
+            "Infer union_arena for wording like Union Arena, Union Area, UA, ユニオンアリーナ.\n"
             "Extract only high-confidence structured fields.\n"
             "Do not invent card numbers, rarity, or set codes.\n"
             "For trend_board, limit should be 1-10 when specified, otherwise 5.\n"
@@ -300,6 +308,8 @@ class TelegramNaturalLanguageRouter:
             "For fields not applicable to the intent, return null.\n"
             "Examples:\n"
             '- "幫我查寶可夢 リザードンex 201/165 SAR" -> lookup_card\n'
+            '- "查遊戯王 青眼の白龍 QCCP-JP001 UR" -> lookup_card\n'
+            '- "查 Union Arena UAPR/EVA-1-71 綾波レイ" -> lookup_card\n'
             '- "pokemon 熱門前5" -> trend_board\n'
             '- "追蹤 初音ミク SSP 5万以下" -> add_watch, watch_query="初音ミク SSP", watch_price_threshold=50000\n'
             '- "看我的追蹤清單" -> list_watches\n'
@@ -586,10 +596,12 @@ def fallback_route_telegram_natural_language(text: str) -> TelegramNaturalLangua
         game = _infer_game(content)
         if game is None:
             return None
-        card_number_match = re.search(r"\b\d{1,3}/\d{1,3}\b", content)
+        card_number_match = _extract_card_number_match(content)
         rarity_match = re.search(r"\b(SSP|SEC\+|SEC|SAR|CSR|CHR|UR|SR|AR|RRR|RR|PR\+|PR|SP|OFR|SS|R|U|C|MA|MUR)\b", content.upper())
         set_code_match = re.search(r"\b(SV\d{1,2}[A-Z]?|M\d{1,2}[A-Z]?|SM\d{1,2}[A-Z]?|S\d{1,2}[A-Z]?|SV-P|SM-P|S-P|M-P|BW-P|XY-P)\b", content.upper())
         stripped_name = content
+        if card_number_match:
+            stripped_name = stripped_name.replace(card_number_match.group(0), " ")
         for token in (
             "幫我查",
             "查一下",
@@ -602,12 +614,23 @@ def fallback_route_telegram_natural_language(text: str) -> TelegramNaturalLangua
             "ws",
             "weiss",
             "schwarz",
+            "yugioh",
+            "yu-gi-oh",
+            "ygo",
+            "union_arena",
+            "union arena",
+            "union area",
+            "unionarea",
+            "ua",
             "寶可夢",
             "寶可卡",
+            "遊戯王",
+            "遊戲王",
+            "游戏王",
+            "遊☆戯☆王",
+            "ユニオンアリーナ",
         ):
             stripped_name = re.sub(re.escape(token), " ", stripped_name, flags=re.IGNORECASE)
-        if card_number_match:
-            stripped_name = stripped_name.replace(card_number_match.group(0), " ")
         if rarity_match:
             stripped_name = stripped_name.replace(rarity_match.group(1), " ")
         if set_code_match:
@@ -619,7 +642,9 @@ def fallback_route_telegram_natural_language(text: str) -> TelegramNaturalLangua
             name=name,
             card_number=None if card_number_match is None else card_number_match.group(0),
             rarity=None if rarity_match is None else rarity_match.group(1).upper(),
-            set_code=None if set_code_match is None else set_code_match.group(1).lower(),
+            set_code=_derive_set_code_from_card_number(None if card_number_match is None else card_number_match.group(0))
+            if set_code_match is None
+            else set_code_match.group(1).lower(),
             confidence=0.3,
         )
     return None
@@ -726,10 +751,7 @@ def _extract_buzz_query(text: str) -> str | None:
 def _normalize_game(value: object) -> str | None:
     if not isinstance(value, str):
         return None
-    lowered = value.strip().lower()
-    if lowered in {"pokemon", "ws"}:
-        return lowered
-    return None
+    return normalize_game_key(value)
 
 
 def _normalize_text_field(value: object) -> str | None:
@@ -798,4 +820,28 @@ def _infer_game(text: str) -> str | None:
     # Use ASCII-only lookaround so "熱門ws前三" is matched correctly.
     if any(token in lowered for token in ("weiss", "schwarz", "ヴァイス")) or re.search(r"(?<![a-z])ws(?![a-z])", lowered):
         return "ws"
+    if (
+        any(token in lowered for token in ("yugioh", "yu-gi-oh", "遊戯王", "遊戲王", "游戏王", "遊☆戯☆王"))
+        or re.search(r"(?<![a-z])ygo(?![a-z])", lowered)
+    ):
+        return "yugioh"
+    if (
+        any(token in lowered for token in ("union arena", "union area", "union_arena", "unionarea", "ユニオンアリーナ"))
+        or re.search(r"(?<![a-z])ua(?![a-z])", lowered)
+    ):
+        return "union_arena"
+    return None
+
+
+def _extract_card_number_match(text: str) -> re.Match[str] | None:
+    return re.search(r"\b\d{1,3}/\d{1,3}\b", text) or _GENERIC_CARD_NUMBER_PATTERN.search(text.upper())
+
+
+def _derive_set_code_from_card_number(card_number: str | None) -> str | None:
+    if not card_number:
+        return None
+    if "/" in card_number:
+        return card_number.split("/", 1)[0].lower()
+    if "-" in card_number:
+        return card_number.split("-", 1)[0].lower()
     return None

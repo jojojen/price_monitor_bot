@@ -14,8 +14,10 @@ from market_monitor.pricing import FairValueCalculator
 from market_monitor.storage import MonitorDatabase
 
 from .catalog import TcgCardSpec
-from .cardrush import CardrushPokemonClient
+from .cardrush import CardrushPokemonClient, CardrushYugiohClient
 from .magi import MagiProductClient
+from .mercari_reference import MercariReferenceClient
+from .surugaya import SurugayaClient
 from .yuyutei import YuyuteiClient
 
 logger = logging.getLogger(__name__)
@@ -66,7 +68,10 @@ class TcgPriceService:
             self.reference_clients = (
                 primary_client,
                 CardrushPokemonClient(shared_http_client),
+                CardrushYugiohClient(shared_http_client),
                 MagiProductClient(shared_http_client),
+                SurugayaClient(shared_http_client),
+                MercariReferenceClient(),
             )
         self.pricing = pricing or FairValueCalculator()
 

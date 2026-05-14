@@ -123,6 +123,19 @@ def test_parse_lookup_command_supports_simple_format() -> None:
     )
 
 
+def test_parse_lookup_command_supports_yugioh_and_union_arena_aliases() -> None:
+    ygo_query = parse_lookup_command("ygo | 青眼の白龍 | QCCP-JP001 | ウルトラ")
+    ua_query = parse_lookup_command("ua 綾波レイ")
+
+    assert ygo_query == TelegramLookupQuery(
+        game="yugioh",
+        name="青眼の白龍",
+        card_number="QCCP-JP001",
+        rarity="ウルトラ",
+    )
+    assert ua_query == TelegramLookupQuery(game="union_arena", name="綾波レイ")
+
+
 def test_command_processor_restricts_unconfigured_chat() -> None:
     processor = TelegramCommandProcessor(
         allowed_chat_ids=frozenset({"999"}),

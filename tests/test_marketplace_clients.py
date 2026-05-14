@@ -3,9 +3,16 @@ from __future__ import annotations
 from urllib.parse import urlencode
 
 from market_monitor.http import HttpClient
-from tcg_tracker.cardrush import CARDRUSH_PRODUCT_LIST_URL, CardrushPokemonClient
+from tcg_tracker.cardrush import (
+    CARDRUSH_PRODUCT_LIST_URL,
+    CARDRUSH_YUGIOH_PRODUCT_LIST_URL,
+    CardrushPokemonClient,
+    CardrushYugiohClient,
+)
 from tcg_tracker.catalog import TcgCardSpec
 from tcg_tracker.magi import MAGI_PRODUCT_SEARCH_URL, MagiProductClient
+from tcg_tracker.mercari_reference import MercariReferenceClient
+from tcg_tracker.surugaya import SURUGAYA_SEARCH_URL, SurugayaClient
 from tcg_tracker.search_terms import build_lookup_terms
 
 
@@ -119,6 +126,118 @@ def test_cardrush_temporarily_disables_after_repeated_transport_failures() -> No
     assert second_http_client.calls == 0
 
     CardrushPokemonClient.reset_temporary_disable()
+
+
+def test_cardrush_yugioh_lookup_matches_exact_variant() -> None:
+    CardrushYugiohClient.reset_temporary_disable()
+    spec = TcgCardSpec(game="ygo", title="青眼の白龍", card_number="QCCP-JP001", rarity="ウルトラ")
+    html = """
+    <ul class="item_list">
+      <li class="list_item_cell list_item_84978">
+        <div class="item_data clearfix" data-product-id="84978">
+          <a href="https://www.cardrush.jp/product/84978">
+            <span class="goods_name">青眼の白龍【ウルトラ】{QCCP-JP001}《モンスター》</span>
+          </a>
+          <p><span class="figure">1,580円</span></p>
+          <p class="stock">在庫数 34枚</p>
+        </div>
+      </li>
+      <li class="list_item_cell list_item_45650">
+        <div class="item_data clearfix" data-product-id="45650">
+          <a href="https://www.cardrush.jp/product/45650">
+            <span class="goods_name">青眼の白龍(初期)【シークレット】{-}《モンスター》</span>
+          </a>
+          <p><span class="figure">10,800,000円</span></p>
+          <p class="stock">在庫数 1枚</p>
+        </div>
+      </li>
+    </ul>
+    """
+    client = CardrushYugiohClient(
+        FixtureHttpClient(
+            {
+                f"{CARDRUSH_YUGIOH_PRODUCT_LIST_URL}?{urlencode({'keyword': term})}": html
+                for term in build_lookup_terms(spec)
+            }
+        )
+    )
+
+    offers = client.lookup(spec)
+
+    assert len(offers) == 1
+    assert offers[0].source == "cardrush_yugioh"
+    assert offers[0].price_jpy == 1580
+    assert offers[0].attributes["card_number"] == "QCCP-JP001"
+    assert offers[0].attributes["set_code"] == "qccp"
+
+
+def test_mercari_reference_matches_union_arena_padded_card_number() -> None:
+    calls: list[str] = []
+
+    def fake_search(query: str, **kwargs) -> list[dict[str, object]]:
+        calls.append(query)
+        return [
+            {
+                "item_id": "mua1",
+                "title": "UAPR/EVA-1-071 綾波レイ SR ユニオンアリーナ",
+                "price_jpy": 2200,
+                "url": "https://jp.mercari.com/item/mua1",
+                "thumbnail_url": "https://example.com/card.jpg",
+            }
+        ]
+
+    client = MercariReferenceClient(search_fn=fake_search, max_results=3)
+
+    offers = client.lookup(TcgCardSpec(game="union area", title="綾波レイ", card_number="UAPR/EVA-1-71"))
+
+    assert offers
+    assert calls[0] == "UAPR/EVA-1-71 綾波レイ"
+    assert "UAPR/EVA-1-071 綾波レイ" in calls
+    assert offers[0].source == "mercari"
+    assert offers[0].attributes["card_number"] == "UAPR/EVA-1-071"
+    assert offers[0].attributes["set_code"] == "uapr"
+
+
+def test_surugaya_lookup_matches_union_arena_card_with_buylist_price() -> None:
+    search_html = """
+    <div class="item_box first_item">
+      <p class="title">
+        <a href="/product/detail/GU659612?branch_number=0080">UAPR/EVA-1-071[R]：(キラ)綾波 レイ（未開封）</a>
+      </p>
+      <p class="price_teika">中古： ￥8,317 税込</p>
+    </div>
+    """
+    detail_html = """
+    <h1>ユニオンアリーナ/R/キャラクター UAPR/EVA-1-071[R]：(キラ)綾波 レイ（未開封）</h1>
+    <label data-label="中古&nbsp;未開封">
+      <span class="text-price-detail price-buy">8,317円 (税込)</span>
+    </label>
+    <input type="hidden" name="amount_max" value="1" class="amount_max">
+    <button type="button" class="btn_buy btn cart1">カートに入れる</button>
+    <a href="https://www.suruga-ya.jp/kaitori/kaitori_detail/GU659612">
+      <span>買取価格：</span><span class="text-red purchase-price">4,200円</span>
+    </a>
+    """
+    client = SurugayaClient(
+        FixtureHttpClient(
+            {
+                f"{SURUGAYA_SEARCH_URL}?search_word=UAPR%2FEVA-1-071": search_html,
+                f"{SURUGAYA_SEARCH_URL}?search_word=UAPR%2FEVA-1-71": "",
+                f"{SURUGAYA_SEARCH_URL}?search_word=UAPR+EVA+1+071": "",
+                "https://www.suruga-ya.jp/product/detail/GU659612": detail_html,
+            }
+        )
+    )
+
+    offers = client.lookup(TcgCardSpec(game="union area", title="綾波レイ", card_number="UAPR/EVA-1-71"))
+
+    assert len(offers) == 2
+    assert {offer.price_kind for offer in offers} == {"ask", "bid"}
+    assert any(offer.price_kind == "ask" and offer.price_jpy == 8317 for offer in offers)
+    assert any(offer.price_kind == "bid" and offer.price_jpy == 4200 for offer in offers)
+    assert {offer.attributes["card_number"] for offer in offers} == {"UAPR/EVA-1-071"}
+    assert {offer.attributes["rarity"] for offer in offers} == {"R"}
+    assert all((offer.score or 0) >= 40 for offer in offers)
 
 
 def test_magi_lookup_matches_ws_card() -> None:

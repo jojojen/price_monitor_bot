@@ -26,6 +26,8 @@ CARDRUSH_POKEMON_RANKING_URL = "https://www.cardrush-pokemon.jp/product-group/22
 MAGI_WS_RANKING_URL = "https://magi.camp/series/7/products"
 MAGI_POKEMON_LIST_URL = "https://magi.camp/brands/3/items"
 YUYUTEI_WS_TOP_URL = "https://yuyu-tei.jp/top/ws"
+YUYUTEI_YUGIOH_TOP_URL = "https://yuyu-tei.jp/top/ygo"
+YUYUTEI_UNION_ARENA_TOP_URL = "https://yuyu-tei.jp/top/ua"
 SNKRDUNK_POKEMON_MONTHLY_TRADES_URL = "https://snkrdunk.com/articles/31649/"
 SNKRDUNK_POKEMON_UR_TRADES_URL = "https://snkrdunk.com/articles/31962/"
 SNKRDUNK_POKEMON_SA_TRADES_URL = "https://snkrdunk.com/articles/31708/"
@@ -196,10 +198,17 @@ class TcgHotCardService:
         self._buy_signal_cache: dict[str, tuple[float, HotCardBuySignal | None]] = {}
 
     def load_boards(self, *, limit: int = DEFAULT_BOARD_LIMIT) -> tuple[HotCardBoard, ...]:
-        with ThreadPoolExecutor(max_workers=2) as executor:
+        with ThreadPoolExecutor(max_workers=4) as executor:
             pokemon_future = executor.submit(self.load_pokemon_board, limit=limit)
             ws_future = executor.submit(self.load_ws_board, limit=limit)
-            return (pokemon_future.result(), ws_future.result())
+            yugioh_future = executor.submit(self.load_yugioh_board, limit=limit)
+            union_arena_future = executor.submit(self.load_union_arena_board, limit=limit)
+            return (
+                pokemon_future.result(),
+                ws_future.result(),
+                yugioh_future.result(),
+                union_arena_future.result(),
+            )
 
     def load_pokemon_board(self, *, limit: int = DEFAULT_BOARD_LIMIT) -> HotCardBoard:
         parsed_items, methodology = self._load_pokemon_board_items()
@@ -231,8 +240,50 @@ class TcgHotCardService:
             items=items,
         )
 
+    def load_yugioh_board(self, *, limit: int = DEFAULT_BOARD_LIMIT) -> HotCardBoard:
+        parsed_items, methodology = self._load_yuyutei_top_board_items(
+            game="yugioh",
+            source_code="ygo",
+            top_url=YUYUTEI_YUGIOH_TOP_URL,
+            label="Yugioh",
+            minimum_price_jpy=500,
+        )
+        items = self._build_ranked_entries(
+            game="yugioh",
+            parsed_items=parsed_items,
+            limit=limit,
+        )
+        return HotCardBoard(
+            game="yugioh",
+            label="Yugioh Liquidity Board",
+            methodology=methodology,
+            generated_at=datetime.now(timezone.utc),
+            items=items,
+        )
+
+    def load_union_arena_board(self, *, limit: int = DEFAULT_BOARD_LIMIT) -> HotCardBoard:
+        parsed_items, methodology = self._load_yuyutei_top_board_items(
+            game="union_arena",
+            source_code="ua",
+            top_url=YUYUTEI_UNION_ARENA_TOP_URL,
+            label="Union Arena",
+            minimum_price_jpy=200,
+        )
+        items = self._build_ranked_entries(
+            game="union_arena",
+            parsed_items=parsed_items,
+            limit=limit,
+        )
+        return HotCardBoard(
+            game="union_arena",
+            label="Union Arena Liquidity Board",
+            methodology=methodology,
+            generated_at=datetime.now(timezone.utc),
+            items=items,
+        )
+
     def resolve_lookup_spec(self, spec: TcgCardSpec) -> TcgCardSpec | None:
-        if spec.game not in {"pokemon", "ws"}:
+        if spec.game not in {"pokemon", "ws", "yugioh", "union_arena"}:
             return None
         if spec.card_number:
             return None
@@ -533,6 +584,24 @@ class TcgHotCardService:
         if game == "ws":
             parsed_items, _ = self._load_ws_board_items()
             return parsed_items
+        if game == "yugioh":
+            parsed_items, _ = self._load_yuyutei_top_board_items(
+                game="yugioh",
+                source_code="ygo",
+                top_url=YUYUTEI_YUGIOH_TOP_URL,
+                label="Yugioh",
+                minimum_price_jpy=500,
+            )
+            return parsed_items
+        if game == "union_arena":
+            parsed_items, _ = self._load_yuyutei_top_board_items(
+                game="union_arena",
+                source_code="ua",
+                top_url=YUYUTEI_UNION_ARENA_TOP_URL,
+                label="Union Arena",
+                minimum_price_jpy=200,
+            )
+            return parsed_items
         return []
 
     def _load_pokemon_board_items(self) -> tuple[list[_ParsedHotItem], str]:
@@ -729,6 +798,49 @@ class TcgHotCardService:
             parsed_items.extend(magi_future.result())
 
         return (parsed_items, "".join(methodology_parts))
+
+    def _load_yuyutei_top_board_items(
+        self,
+        *,
+        game: str,
+        source_code: str,
+        top_url: str,
+        label: str,
+        minimum_price_jpy: int,
+    ) -> tuple[list[_ParsedHotItem], str]:
+        methodology = (
+            f"{label} liquidity board uses Yuyutei live top-page featured singles as a conservative first source. "
+            "Yuyutei bid / ask is still folded into the score when available; unsafe or challenge-gated pages are not used."
+        )
+        try:
+            html = self.http_client.get_text(top_url)
+        except Exception as exc:  # pragma: no cover - network-dependent.
+            logger.warning("Yuyutei %s top page failed; continuing without it. error=%s", game, exc)
+            return ([], methodology)
+
+        items = [
+            *self._parse_yuyutei_carousel_items(
+                html,
+                source_code=source_code,
+                board_url=top_url,
+                carousel_id="recommendedItemList",
+                source_label="Yuyutei featured singles",
+                source_weight=0.34,
+                note=f"Signal source: Yuyutei top-page featured {label} singles.",
+                minimum_price_jpy=minimum_price_jpy,
+            ),
+            *self._parse_yuyutei_carousel_items(
+                html,
+                source_code=source_code,
+                board_url=top_url,
+                carousel_id="newestCardList",
+                source_label="Yuyutei latest-release spotlight",
+                source_weight=0.12,
+                note=f"Signal source: Yuyutei latest-release {label} spotlight.",
+                minimum_price_jpy=minimum_price_jpy,
+            ),
+        ]
+        return (items, methodology)
 
     def _load_social_signals(
         self,
@@ -1262,6 +1374,29 @@ class TcgHotCardService:
         note: str,
         minimum_price_jpy: int = 0,
     ) -> list[_ParsedHotItem]:
+        return self._parse_yuyutei_carousel_items(
+            html,
+            source_code="ws",
+            board_url=board_url,
+            carousel_id=carousel_id,
+            source_label=source_label,
+            source_weight=source_weight,
+            note=note,
+            minimum_price_jpy=minimum_price_jpy,
+        )
+
+    def _parse_yuyutei_carousel_items(
+        self,
+        html: str,
+        *,
+        source_code: str,
+        board_url: str,
+        carousel_id: str,
+        source_label: str,
+        source_weight: float,
+        note: str,
+        minimum_price_jpy: int = 0,
+    ) -> list[_ParsedHotItem]:
         soup = BeautifulSoup(html, "html.parser")
         carousel = soup.select_one(f"#{carousel_id}")
         if carousel is None:
@@ -1272,7 +1407,7 @@ class TcgHotCardService:
         for card_box in carousel.select("div.col-md-4"):
             anchors = [
                 anchor
-                for anchor in card_box.select("a[href*='/sell/ws/card/']")
+                for anchor in card_box.select(f"a[href*='/sell/{source_code}/card/']")
                 if anchor.select_one("img") is not None
             ]
             if not anchors:
@@ -1311,7 +1446,7 @@ class TcgHotCardService:
                     thumbnail_url=_pick_image_url(image, attribute_names=("src", "data-src")),
                     card_number=card_number,
                     rarity=rarity,
-                    set_code=card_number.split("/", 1)[0].lower() if "/" in card_number else None,
+                    set_code=_derive_set_code_from_card_number(card_number),
                     listing_count=1,
                     is_graded=False,
                     condition=None,
@@ -1786,6 +1921,10 @@ def _build_social_query(*, game: str, item: _ParsedHotItem) -> str:
         query_parts.append("ポケカ")
     elif game == "ws":
         query_parts.append("ヴァイス")
+    elif game == "yugioh":
+        query_parts.append("遊戯王")
+    elif game == "union_arena":
+        query_parts.append("ユニオンアリーナ")
 
     if item.rarity and _looks_like_rarity(item.rarity):
         query_parts.append(item.rarity.upper())
@@ -1869,6 +2008,13 @@ def _extract_magi_thumbnail_url(anchor: Tag) -> str | None:
     if not url:
         return None
     return urljoin("https://magi.camp", url)
+
+
+def _derive_set_code_from_card_number(card_number: str | None) -> str | None:
+    if not card_number:
+        return None
+    prefix = card_number.split("/", 1)[0].split("-", 1)[0].strip().lower()
+    return prefix or None
 
 
 def _pick_image_url(image: Tag, *, attribute_names: tuple[str, ...]) -> str | None:

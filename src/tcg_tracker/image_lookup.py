@@ -15,7 +15,7 @@ from pathlib import Path
 from market_monitor.models import MarketOffer
 from market_monitor.normalize import normalize_card_number, normalize_text
 
-from .catalog import TcgCardSpec
+from .catalog import TcgCardSpec, normalize_game_key
 from .hot_cards import TcgHotCardService
 from .local_vision import LocalVisionCardCandidate, LocalVisionTimeoutError, build_local_vision_clients
 from .service import TcgLookupResult, TcgPriceService
@@ -1015,7 +1015,7 @@ def parse_image_caption_hints(caption: str | None) -> tuple[str | None, str | No
     if not tokens:
         return None, None
 
-    game_hint = tokens[0].lower() if tokens[0].lower() in {"pokemon", "ws"} else None
+    game_hint = normalize_game_key(tokens[0])
     if game_hint is not None:
         title_hint = _sanitize_image_title_hint(" ".join(tokens[1:]).strip() or None)
         return game_hint, title_hint
