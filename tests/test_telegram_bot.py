@@ -169,6 +169,19 @@ def test_command_processor_help_lists_trend_and_scan_commands() -> None:
     assert "/price pokemon | Pikachu ex | 132/106 | SAR | sv08" in help_reply
     assert "/snapshot https://jp.mercari.com/item/m123456789" in help_reply
     assert "Send a photo with caption: /scan pokemon" in help_reply
+    assert "/hunt status" in help_reply
+
+
+def test_command_processor_handles_hunt_status() -> None:
+    processor = TelegramCommandProcessor(
+        allowed_chat_ids=frozenset({"123"}),
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        opportunity_status_renderer=lambda: "targets: Umbreon",
+    )
+
+    assert processor.build_reply(chat_id="123", text="/hunt status") == "targets: Umbreon"
 
 
 def test_parse_reputation_snapshot_command_requires_url() -> None:

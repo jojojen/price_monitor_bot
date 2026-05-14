@@ -481,8 +481,19 @@ def fallback_route_telegram_natural_language(text: str) -> TelegramNaturalLangua
     if any(kw in lowered for kw in _SNS_LIST_KEYWORDS):
         return TelegramNaturalLanguageIntent(intent="sns_list", confidence=0.75)
 
-    # sns_buzz: digest-of-topic phrasing
-    if any(kw in lowered for kw in _SNS_BUZZ_KEYWORDS):
+    # sns_buzz: digest-of-topic phrasing. Keep generic "最近什麼熱門排行"
+    # available for the TCG trend router, where it should return None until a
+    # game is provided.
+    buzz_keywords = [kw for kw in _SNS_BUZZ_KEYWORDS if kw in lowered]
+    generic_buzz_keywords = {"什麼熱門", "最近熱門"}
+    generic_trend_without_game = (
+        buzz_keywords
+        and all(kw in generic_buzz_keywords for kw in buzz_keywords)
+        and not has_sns_context
+        and _infer_game(content) is None
+        and any(kw in lowered for kw in _TREND_KEYWORDS)
+    )
+    if buzz_keywords and not generic_trend_without_game:
         return TelegramNaturalLanguageIntent(
             intent="sns_buzz",
             sns_buzz_query=_extract_buzz_query(content),

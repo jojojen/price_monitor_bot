@@ -58,6 +58,7 @@ SNS_ADD_COMMANDS = {"/snsadd", "/sns_add"}
 SNS_LIST_COMMANDS = {"/snslist", "/sns_list"}
 SNS_DELETE_COMMANDS = {"/snsdelete", "/sns_delete"}
 SNS_BUZZ_COMMANDS = {"/snsbuzz", "/sns_buzz"}
+HUNT_COMMANDS = {"/hunt", "/opportunity"}
 HEAVY_COMMANDS = PRICE_LOOKUP_COMMANDS | TREND_BOARD_COMMANDS | REPUTATION_SNAPSHOT_COMMANDS
 
 logger = logging.getLogger(__name__)
@@ -256,6 +257,7 @@ class TelegramCommandProcessor:
         watch_db: MonitorDatabase | None = None,
         sns_db: SnsDatabase | None = None,
         sns_buzz_fn: Callable[[str], str] | None = None,
+        opportunity_status_renderer: Callable[[], str] | None = None,
     ) -> None:
         self._lookup_renderer = lookup_renderer
         self._board_loader = board_loader
@@ -267,6 +269,7 @@ class TelegramCommandProcessor:
         self._watch_db = watch_db
         self._sns_db = sns_db
         self._sns_buzz_fn = sns_buzz_fn
+        self._opportunity_status_renderer = opportunity_status_renderer
 
     def is_allowed_chat(self, chat_id: str | int) -> bool:
         if not self._allowed_chat_ids:
@@ -304,6 +307,8 @@ class TelegramCommandProcessor:
             return TelegramTextReplyPlan(ack=None, reply=self._status_text())
         if command == "/tools":
             return TelegramTextReplyPlan(ack=None, reply=self._catalog_renderer())
+        if command in HUNT_COMMANDS:
+            return TelegramTextReplyPlan(ack=None, reply=self._handle_hunt(remainder))
         if command in PRICE_LOOKUP_COMMANDS:
             return TelegramTextReplyPlan(
                 ack=build_processing_ack(text=content),
@@ -500,6 +505,14 @@ class TelegramCommandProcessor:
             f"關鍵字：{watch.query}\n"
             f"價格上限：¥{old_price:,} → ¥{new_price:,}"
         )
+
+    def _handle_hunt(self, raw: str) -> str:
+        action = raw.strip().lower()
+        if action in {"", "status", "candidates", "list", "targets", "目標", "候選"}:
+            if self._opportunity_status_renderer is None:
+                return "Opportunity agent status is not configured in this runtime."
+            return self._opportunity_status_renderer()
+        return "可用格式：/hunt status"
 
     def build_reputation_delivery(self, raw: str) -> TelegramReputationDelivery:
         if self._reputation_renderer is None:
@@ -983,6 +996,8 @@ class TelegramCommandProcessor:
                 "/snslist",
                 "/snsdelete <rule_id>",
                 "/snsbuzz amd",
+                "--- Opportunity Agent ---",
+                "/hunt status",
                 "You can also ask things like: 幫我查 pokemon Pikachu ex 132/106",
                 "Or: pokemon 熱門前 5",
             ]
@@ -1284,6 +1299,7 @@ def run_telegram_polling(
     watch_db: MonitorDatabase | None = None,
     sns_db: SnsDatabase | None = None,
     sns_buzz_fn: Callable[[str], str] | None = None,
+    opportunity_status_renderer: Callable[[], str] | None = None,
     poll_timeout: int = 20,
     notify_startup: bool = False,
     drop_pending_updates: bool = True,
@@ -1316,6 +1332,7 @@ def run_telegram_polling(
         watch_db=watch_db,
         sns_db=sns_db,
         sns_buzz_fn=sns_buzz_fn,
+        opportunity_status_renderer=opportunity_status_renderer,
     )
     resolved_photo_renderer = photo_renderer or default_photo_renderer()
 
