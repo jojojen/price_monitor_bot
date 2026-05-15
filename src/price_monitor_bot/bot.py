@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import mimetypes
+import re
 import ssl
 import tempfile
 import time
@@ -45,6 +46,7 @@ LookupRenderer = Callable[["TelegramLookupQuery"], str]
 PhotoLookupRenderer = Callable[["TelegramPhotoQuery"], str]
 ReputationRenderer = Callable[["TelegramReputationQuery"], object]
 ResearchRenderer = Callable[["TelegramResearchQuery"], str]
+OpportunityTargetRemover = Callable[[str], str]
 BoardLoader = Callable[[], tuple[HotCardBoard, ...]]
 CatalogRenderer = Callable[[], str]
 WatchlistStore = object  # MonitorDatabase or None
@@ -268,6 +270,7 @@ class TelegramCommandProcessor:
         sns_db: SnsDatabase | None = None,
         sns_buzz_fn: Callable[[str], str] | None = None,
         opportunity_status_renderer: Callable[[], str] | None = None,
+        opportunity_target_remover: OpportunityTargetRemover | None = None,
     ) -> None:
         self._lookup_renderer = lookup_renderer
         self._board_loader = board_loader
@@ -281,6 +284,7 @@ class TelegramCommandProcessor:
         self._sns_db = sns_db
         self._sns_buzz_fn = sns_buzz_fn
         self._opportunity_status_renderer = opportunity_status_renderer
+        self._opportunity_target_remover = opportunity_target_remover
 
     def is_allowed_chat(self, chat_id: str | int) -> bool:
         if not self._allowed_chat_ids:
@@ -446,16 +450,16 @@ class TelegramCommandProcessor:
 
     def _handle_web_research(self, raw: str) -> str:
         if self._research_renderer is None:
-            return "Web research is not configured in this OpenClaw runtime."
+            return "這個 OpenClaw 執行環境尚未設定網路搜尋摘要功能。"
         query = raw.strip()
         if not query:
-            return "Please provide a search question. Example: /search why Pikachu Pokemon cards are popular"
+            return "請提供要搜尋整理的問題。例如：/search 為什麼皮卡丘寶可夢卡這麼受歡迎"
         try:
             logger.info("Telegram web research requested query=%s", trim_for_log(query, limit=240))
             return self._research_renderer(TelegramResearchQuery(query=query))
         except Exception as exc:  # pragma: no cover - source/network-dependent.
             logger.exception("Telegram web research failed query=%s", trim_for_log(query, limit=240))
-            return f"Web research failed: {exc}"
+            return f"網路搜尋摘要失敗：{exc}"
 
     def _handle_watch(self, raw: str, chat_id: str) -> str:
         if self._watch_db is None:
@@ -542,7 +546,14 @@ class TelegramCommandProcessor:
             if self._opportunity_status_renderer is None:
                 return "Opportunity agent status is not configured in this runtime."
             return self._opportunity_status_renderer()
-        return "可用格式：/hunt status"
+        if _is_hunt_remove_action(raw):
+            if self._opportunity_target_remover is None:
+                return "Opportunity target removal is not configured in this runtime."
+            target = _extract_hunt_remove_target(raw)
+            if not target:
+                return "請提供要移除的目標，例如：/hunt remove 2 或 /hunt remove Umbreon ex SAR"
+            return self._opportunity_target_remover(target)
+        return "可用格式：/hunt status 或 /hunt remove <編號或名稱>"
 
     def build_reputation_delivery(self, raw: str) -> TelegramReputationDelivery:
         if self._reputation_renderer is None:
@@ -735,6 +746,23 @@ class TelegramCommandProcessor:
                 ack=f"已理解：相當於 /search {query}，正在搜尋資料來源並整理答案…",
                 reply=None,
                 reply_factory=lambda q=query: self._handle_web_research(q),
+            )
+        if intent.intent == "opportunity_remove":
+            target = intent.opportunity_target
+            if not target:
+                return TelegramTextReplyPlan(
+                    ack=None,
+                    reply="請告訴我要移除哪個機會目標，例如：移除機會目標 2 或 不感興趣 Umbreon ex SAR",
+                )
+            logger.info(
+                "Telegram natural-language routed intent=opportunity_remove target=%s confidence=%s",
+                trim_for_log(target, limit=160),
+                intent.confidence,
+            )
+            return TelegramTextReplyPlan(
+                ack=f"已理解：相當於 /hunt remove {target}，正在移除。",
+                reply=None,
+                reply_factory=lambda target=target: self._handle_hunt(f"remove {target}"),
             )
 
         # ── SNS intents ────────────────────────────────────────────────────────
@@ -1052,9 +1080,11 @@ class TelegramCommandProcessor:
                 "/snsbuzz amd",
                 "--- Opportunity Agent ---",
                 "/hunt status",
+                "/hunt remove 2",
                 "You can also ask things like: 幫我查 pokemon Pikachu ex 132/106",
                 "Or: pokemon 熱門前 5",
                 "Or: why are Pikachu Pokemon cards so popular?",
+                "Or: remove target 2 from the opportunity list",
             ]
         )
 
@@ -1165,6 +1195,72 @@ def parse_reputation_snapshot_command(raw: str) -> TelegramReputationQuery:
     if not query_url:
         raise ValueError("Snapshot command requires a Mercari item or profile URL.")
     return TelegramReputationQuery(query_url=query_url)
+
+
+def _is_hunt_remove_action(raw: str) -> bool:
+    lowered = raw.strip().lower()
+    if not lowered:
+        return False
+    return any(
+        lowered == keyword or lowered.startswith(f"{keyword} ")
+        for keyword in (
+            "remove",
+            "delete",
+            "dismiss",
+            "hide",
+            "ignore",
+            "drop",
+            "not interested",
+            "no interest",
+            "移除",
+            "刪除",
+            "删除",
+            "不要",
+            "不感興趣",
+            "不感兴趣",
+            "沒興趣",
+            "没兴趣",
+            "外して",
+            "削除",
+        )
+    )
+
+
+def _extract_hunt_remove_target(raw: str) -> str:
+    target = raw.strip()
+    for phrase in (
+        "not interested in",
+        "not interested",
+        "no interest in",
+        "no interest",
+        "remove",
+        "delete",
+        "dismiss",
+        "hide",
+        "ignore",
+        "drop",
+        "target",
+        "candidate",
+        "opportunity",
+        "移除",
+        "刪除",
+        "删除",
+        "不要",
+        "不感興趣",
+        "不感兴趣",
+        "沒興趣",
+        "没兴趣",
+        "外して",
+        "削除",
+        "目標",
+        "目标",
+        "候選",
+        "候选",
+    ):
+        target = re.sub(re.escape(phrase), " ", target, flags=re.IGNORECASE)
+    target = re.sub(r"^(?:第)?\s*(\d{1,2})\s*(?:個|个|項|项|筆|笔|番)?$", r"\1", target.strip())
+    target = re.sub(r"[，、。！？!?：:；;]", " ", target)
+    return " ".join(target.split()).strip()
 
 
 def format_liquidity_board(board: HotCardBoard, *, limit: int = 5) -> str:
@@ -1373,6 +1469,7 @@ def run_telegram_polling(
     sns_db: SnsDatabase | None = None,
     sns_buzz_fn: Callable[[str], str] | None = None,
     opportunity_status_renderer: Callable[[], str] | None = None,
+    opportunity_target_remover: OpportunityTargetRemover | None = None,
     poll_timeout: int = 20,
     notify_startup: bool = False,
     drop_pending_updates: bool = True,
@@ -1407,6 +1504,7 @@ def run_telegram_polling(
         sns_db=sns_db,
         sns_buzz_fn=sns_buzz_fn,
         opportunity_status_renderer=opportunity_status_renderer,
+        opportunity_target_remover=opportunity_target_remover,
     )
     resolved_photo_renderer = photo_renderer or default_photo_renderer()
 

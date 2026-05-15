@@ -37,6 +37,8 @@ _ROUTER_JSON_SCHEMA = {
         "query_url": {"type": ["string", "null"]},
         # web research field
         "research_query": {"type": ["string", "null"]},
+        # opportunity agent fields
+        "opportunity_target": {"type": ["string", "null"]},
         # SNS fields
         "sns_handle": {"type": ["string", "null"]},
         "sns_keyword": {"type": ["string", "null"]},
@@ -44,7 +46,7 @@ _ROUTER_JSON_SCHEMA = {
     },
     "required": [
         "intent", "game", "name", "card_number", "rarity", "set_code", "limit", "confidence",
-        "watch_query", "watch_price_threshold", "watch_id", "query_url", "research_query",
+        "watch_query", "watch_price_threshold", "watch_id", "query_url", "research_query", "opportunity_target",
         "sns_handle", "sns_keyword", "sns_buzz_query",
     ],
     "additionalProperties": False,
@@ -233,6 +235,43 @@ _WEB_RESEARCH_SUBJECT_KEYWORDS = (
     "遊戲王",
     "ユニオンアリーナ",
 )
+_OPPORTUNITY_REMOVE_KEYWORDS = (
+    "remove",
+    "delete",
+    "dismiss",
+    "hide",
+    "not interested",
+    "no interest",
+    "ignore",
+    "drop",
+    "移除",
+    "刪除",
+    "删除",
+    "不要",
+    "不感興趣",
+    "不感兴趣",
+    "沒興趣",
+    "没兴趣",
+    "外して",
+    "削除",
+    "興味ない",
+)
+_OPPORTUNITY_CONTEXT_KEYWORDS = (
+    "hunt",
+    "opportunity",
+    "target",
+    "candidate",
+    "機會",
+    "机会",
+    "目標",
+    "目标",
+    "候選",
+    "候选",
+    "清單",
+    "列表",
+    "リスト",
+    "候補",
+)
 _URL_PATTERN = re.compile(r"https?://\S+")
 _GENERIC_CARD_NUMBER_PATTERN = re.compile(
     r"\b(?:[A-Z0-9]+/[A-Z0-9]+(?:-[A-Z0-9]+)*-\d{1,3}|[A-Z0-9]{2,}-[A-Z]{1,4}\d{1,4})\b",
@@ -258,6 +297,8 @@ class TelegramNaturalLanguageIntent:
     query_url: str | None = None
     # web research field
     research_query: str | None = None
+    # opportunity agent field
+    opportunity_target: str | None = None
     # SNS-specific fields
     sns_handle: str | None = None       # for sns_add_account / sns_delete (@username)
     sns_keyword: str | None = None      # for sns_add_keyword (keyword watch)
@@ -309,7 +350,7 @@ class TelegramNaturalLanguageRouter:
         return (
             "You route Telegram messages for a trading-card price assistant and must return only JSON.\n"
             "Allowed intents: lookup_card, trend_board, add_watch, list_watches, remove_watch, update_watch_price, reputation_snapshot, "
-            "web_research, sns_add_account, sns_add_keyword, sns_list, sns_delete, sns_buzz, "
+            "web_research, opportunity_remove, sns_add_account, sns_add_keyword, sns_list, sns_delete, sns_buzz, "
             "help, status, tools, scan_help, unknown.\n"
             + tool_spec_block +
             "Use lookup_card when the user wants the price, value, or card lookup of one specific card.\n"
@@ -324,6 +365,8 @@ class TelegramNaturalLanguageRouter:
             "Use web_research when the user asks a general explanatory/news/background question that needs current web sources, "
             "especially why/how questions about TCG cards, Pokemon cards, popularity, market context, releases, or collector demand.\n"
             "  Set research_query to a concise web search query preserving the user's topic.\n"
+            "Use opportunity_remove when the user wants to remove/dismiss a target/candidate from the opportunity/hunt list because they are not interested.\n"
+            "  Set opportunity_target to the target number from /hunt status (e.g. '2') or the product name/keywords to remove.\n"
             "Use sns_add_account when the user wants to ADD / track / monitor an X (Twitter) account that starts with @.\n"
             "  Set sns_handle to the @username (without the @).\n"
             "Use sns_add_keyword when the user wants to add an X keyword/topic watch (not an @ account).\n"
@@ -343,6 +386,7 @@ class TelegramNaturalLanguageRouter:
             "- 'X', 'Twitter', '推特', '推文', '推主', '帳號' always indicate SNS intents.\n"
             "- '追蹤'/'tracking' alone is ambiguous: if it co-occurs with @handle/X/Twitter → SNS; if it co-occurs with a price (円/JPY/万) or Mercari URL → Mercari.\n"
             "- '取消'/'刪除'/'unfollow'/'unwatch' on an @ handle → sns_delete with sns_handle set, NOT remove_watch.\n"
+            "- Removing a target/candidate from /hunt status or the opportunity list → opportunity_remove, NOT remove_watch.\n"
             f'Game must be one of "{supported_game_hint()}" or null.\n'
             "Infer pokemon for wording like Pokemon, PTCG, 寶可夢, 寶可卡.\n"
             "Infer ws for wording like Weiss, WS, Weiß Schwarz, ヴァイス.\n"
@@ -367,6 +411,9 @@ class TelegramNaturalLanguageRouter:
             '- "查詢信用 https://jp.mercari.com/item/m12345" -> reputation_snapshot, query_url="https://jp.mercari.com/item/m12345"\n'
             '- "why pokemon card pickachu card is so popular?" -> web_research, research_query="why Pokemon Pikachu cards are popular"\n'
             '- "為什麼噴火龍寶可夢卡那麼有人氣" -> web_research, research_query="為什麼 噴火龍 寶可夢卡 人氣"\n'
+            '- "remove target 2 from hunt status" -> opportunity_remove, opportunity_target="2"\n'
+            '- "I am not interested in Umbreon ex SAR anymore" -> opportunity_remove, opportunity_target="Umbreon ex SAR"\n'
+            '- "機會清單不要ホエルオーex" -> opportunity_remove, opportunity_target="ホエルオーex"\n'
             '- "追蹤 @elonmusk" -> sns_add_account, sns_handle="elonmusk"\n'
             '- "新增 X 監控 @aka_claw" -> sns_add_account, sns_handle="aka_claw"\n'
             '- "刪除追蹤 @elonmusk" -> sns_delete, sns_handle="elonmusk"\n'
@@ -569,6 +616,15 @@ def fallback_route_telegram_natural_language(text: str) -> TelegramNaturalLangua
             confidence=0.8,
         )
 
+    # ── Opportunity agent controls (must run before Mercari watch removal) ────
+
+    if _looks_like_opportunity_remove_request(content):
+        return TelegramNaturalLanguageIntent(
+            intent="opportunity_remove",
+            opportunity_target=_extract_opportunity_target(content),
+            confidence=0.65,
+        )
+
     # ── Watch intents (check before generic lookup so keywords don't conflict) ──
 
     # remove_watch: "取消追蹤 abc123" / "unwatch abc123"
@@ -749,7 +805,7 @@ def _load_json_fragment(value: str) -> object:
 _ALLOWED_INTENTS = frozenset({
     "lookup_card", "trend_board",
     "add_watch", "list_watches", "remove_watch", "update_watch_price",
-    "reputation_snapshot", "web_research",
+    "reputation_snapshot", "web_research", "opportunity_remove",
     "sns_add_account", "sns_add_keyword", "sns_list", "sns_delete", "sns_buzz",
     "help", "status", "tools", "scan_help", "unknown",
 })
@@ -772,6 +828,7 @@ def _normalize_intent(payload: dict[str, object]) -> TelegramNaturalLanguageInte
     watch_id = _normalize_text_field(payload.get("watch_id"))
     query_url = _normalize_text_field(payload.get("query_url"))
     research_query = _normalize_text_field(payload.get("research_query"))
+    opportunity_target = _normalize_text_field(payload.get("opportunity_target"))
     sns_handle = _normalize_handle(payload.get("sns_handle"))
     sns_keyword = _normalize_text_field(payload.get("sns_keyword"))
     sns_buzz_query = _normalize_text_field(payload.get("sns_buzz_query"))
@@ -798,6 +855,7 @@ def _normalize_intent(payload: dict[str, object]) -> TelegramNaturalLanguageInte
         watch_id=watch_id,
         query_url=query_url,
         research_query=research_query,
+        opportunity_target=opportunity_target,
         sns_handle=sns_handle,
         sns_keyword=sns_keyword,
         sns_buzz_query=sns_buzz_query,
@@ -905,6 +963,69 @@ def _looks_like_web_research_question(text: str) -> bool:
 def _extract_research_query(text: str) -> str | None:
     cleaned = re.sub(r"[？?]+", " ", text)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned or None
+
+
+def _looks_like_opportunity_remove_request(text: str) -> bool:
+    lowered = text.lower()
+    has_remove = any(keyword in lowered for keyword in _OPPORTUNITY_REMOVE_KEYWORDS)
+    if not has_remove:
+        return False
+    has_context = any(keyword in lowered for keyword in _OPPORTUNITY_CONTEXT_KEYWORDS)
+    if has_context:
+        return True
+    return "not interested in" in lowered or "no interest in" in lowered
+
+
+def _extract_opportunity_target(text: str) -> str | None:
+    cleaned = text
+    phrases = (
+        "from hunt status",
+        "from the hunt status",
+        "from opportunity list",
+        "from the opportunity list",
+        "from target list",
+        "from the target list",
+        "i am not interested in",
+        "i'm not interested in",
+        "not interested in",
+        "no interest in",
+        "anymore",
+        "remove",
+        "delete",
+        "dismiss",
+        "hide",
+        "ignore",
+        "drop",
+        "target",
+        "candidate",
+        "opportunity",
+        "hunt",
+        "機會清單",
+        "机会清单",
+        "目標清單",
+        "目标清单",
+        "候選清單",
+        "候选清单",
+        "移除",
+        "刪除",
+        "删除",
+        "不要",
+        "不感興趣",
+        "不感兴趣",
+        "沒興趣",
+        "没兴趣",
+        "外して",
+        "削除",
+        "興味ない",
+        "リスト",
+        "候補",
+    )
+    for phrase in phrases:
+        cleaned = re.sub(re.escape(phrase), " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"^(?:第)?\s*(\d{1,2})\s*(?:個|个|項|项|筆|笔|番)?$", r"\1", cleaned.strip())
+    cleaned = re.sub(r"[，、。！？!?：:；;]", " ", cleaned)
+    cleaned = " ".join(cleaned.split()).strip()
     return cleaned or None
 
 
