@@ -57,6 +57,8 @@ data/
 *.sqlite3
 logs/
 *.log
+.openclaw_tmp/
+.openclaw_ocr/
 
 # OS
 .DS_Store
