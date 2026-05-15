@@ -43,7 +43,10 @@ from .natural_language import (
 )
 
 LookupRenderer = Callable[["TelegramLookupQuery"], str]
-PhotoLookupRenderer = Callable[["TelegramPhotoQuery"], str]
+# Photo renderer can return either a bare reply string (existing behaviour)
+# or a PhotoLookupReply when the renderer also wants to install a pending
+# clarification state — used by the unresolved/rejected_sanity path.
+PhotoLookupRenderer = Callable[["TelegramPhotoQuery"], "str | PhotoLookupReply"]
 PhotoIntentAnalyzer = Callable[["TelegramPhotoQuery"], "TelegramPhotoIntentAnalysis"]
 ReputationRenderer = Callable[["TelegramReputationQuery"], object]
 ResearchRenderer = Callable[["TelegramResearchQuery"], str]
@@ -148,6 +151,19 @@ class TelegramPhotoIntentAnalysis:
     parsed_item_kind: str | None = None
     parsed_title: str | None = None
     warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class PhotoLookupReply:
+    """Return type for `photo_renderer` callables that need to install a
+    pending photo clarification (e.g. when the vision pipeline could not
+    confidently identify the card and is falling back to user clarification).
+    Plain `str` returns are still supported for back-compat — `_handle_photo_message`
+    wraps them automatically.
+    """
+    text: str
+    pending_clarification: "PendingTelegramPhotoClarification | None" = None
+    ack: str | None = None
 
 
 @dataclass(slots=True)
@@ -1780,6 +1796,7 @@ def default_photo_renderer(
     tesseract_path: str | None = None,
     tessdata_dir: str | None = None,
     vision_settings: TcgVisionSettings | None = None,
+    research_renderer: ResearchRenderer | None = None,
 ) -> PhotoLookupRenderer:
     image_service = TcgImagePriceService(
         db_path=db_path,
@@ -1788,7 +1805,7 @@ def default_photo_renderer(
         vision_settings=vision_settings,
     )
 
-    def render(query: TelegramPhotoQuery) -> str:
+    def render(query: TelegramPhotoQuery) -> str | PhotoLookupReply:
         logger.info(
             "Telegram photo renderer executing chat_id=%s file_id=%s path=%s caption=%s game_hint=%s title_hint=%s item_kind_hint=%s",
             mask_identifier(query.chat_id),
@@ -1831,9 +1848,74 @@ def default_photo_renderer(
             0 if outcome.lookup_result is None else len(outcome.lookup_result.offers),
             list(outcome.warnings),
         )
+        if outcome.status in {"unresolved", "rejected_sanity"}:
+            return _build_unresolved_photo_reply(
+                query=query,
+                outcome=outcome,
+                research_renderer=research_renderer,
+            )
         return format_photo_lookup_result(outcome)
 
     return render
+
+
+def _build_unresolved_photo_reply(
+    *,
+    query: TelegramPhotoQuery,
+    outcome: TcgImageLookupOutcome,
+    research_renderer: ResearchRenderer | None,
+) -> PhotoLookupReply:
+    """Build a clarification reply for the photo path when vision either
+    couldn't read the card (status=unresolved) or the post-lookup sanity
+    check rejected the catalog match (status=rejected_sanity).
+
+    Optionally asks the local /search pipeline for a human-readable hint
+    about what the card might be, and stashes the photo as a pending
+    clarification so the user's text response can re-target the lookup
+    via the existing "否，[您的意圖]" override path.
+    """
+    parsed = outcome.parsed
+    research_summary: str | None = None
+    if research_renderer is not None and parsed.research_hint:
+        try:
+            research_summary = research_renderer(
+                TelegramResearchQuery(query=parsed.research_hint)
+            )
+        except Exception:
+            logger.exception(
+                "Photo research-assist failed chat_id=%s file_id=%s",
+                mask_identifier(query.chat_id),
+                query.file_id,
+            )
+            research_summary = None
+
+    if outcome.status == "rejected_sanity":
+        head = "我看了一下，看起來和我查到的卡對不太上，所以先不亂下結論。"
+    else:
+        head = "我看不太清楚這張卡，先不亂猜。"
+
+    pieces: list[str] = [head]
+    if research_summary:
+        pieces.append("以下是網路搜尋找到的線索：")
+        pieces.append(research_summary.strip()[:1500])
+    pieces.append(
+        "可以直接告訴我這張卡是什麼嗎？例如：\n"
+        "否，這張是寶可夢 ピカチュウ\n"
+        "否，這張是遊戲王 青眼白龍"
+    )
+    text = "\n\n".join(pieces)
+
+    pending = PendingTelegramPhotoClarification(
+        chat_id=str(query.chat_id),
+        image_path=query.image_path,
+        caption=query.caption,
+        file_id=query.file_id,
+        options=(),  # no numeric options — only the "否，..." override path
+        parsed_game=parsed.game,
+        parsed_item_kind=parsed.item_kind,
+        parsed_title=parsed.title,
+    )
+    return PhotoLookupReply(text=text, pending_clarification=pending)
 
 
 _BOARD_CACHE_TTL_SECONDS = 20 * 60
@@ -1980,6 +2062,24 @@ def handle_telegram_message(
     text_value = text if isinstance(text, str) else None
     photo_items = message.get("photo")
     has_photo = isinstance(photo_items, list) and bool(photo_items)
+
+    # Immediate intake ack — the downstream pipeline can take a while
+    # (vision/OCR/LLM calls), so let the user know we've received their
+    # message before we start the real work.
+    if has_photo:
+        intake_ack = "已收到圖片，開始解讀使用者意圖"
+    elif text_value is not None:
+        intake_ack = "已收到訊息，開始解讀使用者意圖"
+    else:
+        intake_ack = None
+    if intake_ack is not None:
+        try:
+            client.send_message(chat_id=chat_id, text=intake_ack)
+        except Exception:
+            logger.exception("Intake ack send failed chat_id=%s", mask_identifier(chat_id))
+        else:
+            replies.append(intake_ack)
+
     pending_plan = processor.build_pending_photo_reply_plan(
         chat_id=chat_id,
         text=text_value,
@@ -2148,13 +2248,20 @@ def _handle_photo_message(
             file_id=file_id,
         )
         if _caption_requests_direct_photo_lookup(caption_text):
+            raw_reply = photo_renderer(query)
+            reply = _coerce_photo_lookup_reply(raw_reply)
+            installed_pending = False
             try:
-                return photo_renderer(query), build_processing_ack(has_photo=True)
+                if reply.pending_clarification is not None:
+                    processor.set_pending_photo_clarification(reply.pending_clarification)
+                    installed_pending = True
+                return reply.text, reply.ack or build_processing_ack(has_photo=True)
             finally:
-                try:
-                    local_path.unlink(missing_ok=True)
-                except PermissionError:
-                    logger.debug("Could not remove temporary Telegram photo path=%s", local_path)
+                if not installed_pending:
+                    try:
+                        local_path.unlink(missing_ok=True)
+                    except PermissionError:
+                        logger.debug("Could not remove temporary Telegram photo path=%s", local_path)
 
         analysis = processor.analyze_photo_intent(query)
         processor.set_pending_photo_clarification(
@@ -2211,12 +2318,20 @@ def _execute_pending_photo_lookup(
         file_id=pending.file_id,
     )
     try:
-        return photo_renderer(query)
+        raw_reply = photo_renderer(query)
+        reply = _coerce_photo_lookup_reply(raw_reply)
+        return reply.text
     finally:
         try:
             pending.image_path.unlink(missing_ok=True)
         except PermissionError:
             logger.debug("Could not remove pending Telegram photo path=%s", pending.image_path)
+
+
+def _coerce_photo_lookup_reply(value: "str | PhotoLookupReply") -> PhotoLookupReply:
+    if isinstance(value, PhotoLookupReply):
+        return value
+    return PhotoLookupReply(text=str(value))
 
 
 def _build_pending_photo_retry_reply(options: tuple[TelegramPhotoIntentOption, ...]) -> str:

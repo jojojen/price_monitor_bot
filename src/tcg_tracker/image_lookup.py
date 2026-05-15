@@ -17,7 +17,12 @@ from market_monitor.normalize import normalize_card_number, normalize_text
 
 from .catalog import TcgCardSpec, normalize_game_key
 from .hot_cards import TcgHotCardService
-from .local_vision import LocalVisionCardCandidate, LocalVisionTimeoutError, build_local_vision_clients
+from .local_vision import (
+    LocalVisionCardCandidate,
+    LocalVisionIdentityVerdict,
+    LocalVisionTimeoutError,
+    build_local_vision_clients,
+)
 from .service import TcgLookupResult, TcgPriceService
 
 logger = logging.getLogger(__name__)
@@ -114,6 +119,10 @@ class TcgVisionSettings:
     ssl_context: ssl.SSLContext | None = field(default=None, compare=False, hash=False)
 
 
+IMAGE_HARD_FLOOR = 0.4
+IMAGE_SANITY_FLOOR = 0.55
+
+
 @dataclass(frozen=True, slots=True)
 class ParsedCardImage:
     status: str
@@ -127,6 +136,8 @@ class ParsedCardImage:
     extracted_lines: tuple[str, ...]
     item_kind: str = "card"
     warnings: tuple[str, ...] = ()
+    confidence: float | None = None
+    research_hint: str | None = None
 
     def to_spec(self) -> TcgCardSpec | None:
         if self.game is None or self.title is None:
@@ -226,6 +237,46 @@ class TcgImagePriceService:
                     f"{result.spec.title} / {result.spec.card_number or 'n/a'} / {result.spec.rarity or 'n/a'}"
                 ),
             )
+
+        # Defence 3: post-lookup sanity check. Trigger when vision confidence
+        # is below the sanity floor OR when the lookup rewrote the title from
+        # what we originally parsed (that's the symptom of the Pikachu →
+        # Mega Charizard hallucination — OCR-metadata fallback "resolved" to
+        # a card we never actually parsed).
+        sanity_should_run = self._should_run_sanity_check(parsed, result)
+        if sanity_should_run:
+            verdict = self._run_sanity_check(Path(image_path), result.spec)
+            if verdict is not None and verdict.match != "yes":
+                research_hint = parsed.research_hint or _build_research_hint(
+                    parsed=parsed,
+                    game_hint=game_hint,
+                    title_hint=title_hint,
+                    raw_text=parsed.raw_text,
+                    vision_confidence=parsed.confidence,
+                )
+                sanity_warning = (
+                    f"Post-lookup sanity check rejected the match: "
+                    f"verdict={verdict.match}, reasons={'; '.join(verdict.mismatch_reasons) or 'unspecified'}"
+                )
+                parsed = replace(
+                    parsed,
+                    status="rejected_sanity",
+                    warnings=(*parsed.warnings, sanity_warning),
+                    research_hint=research_hint,
+                )
+                logger.info(
+                    "Photo lookup sanity check rejected match image=%s matched_title=%s verdict=%s",
+                    image_path,
+                    result.spec.title,
+                    verdict.match,
+                )
+                return TcgImageLookupOutcome(
+                    status="rejected_sanity",
+                    parsed=parsed,
+                    lookup_result=None,
+                    warnings=parsed.warnings,
+                )
+
         status = "success" if result.offers else "partial"
         return TcgImageLookupOutcome(
             status=status,
@@ -233,6 +284,65 @@ class TcgImagePriceService:
             lookup_result=result,
             warnings=parsed.warnings,
         )
+
+    def _should_run_sanity_check(
+        self,
+        parsed: ParsedCardImage,
+        result: "TcgLookupResult",
+    ) -> bool:
+        if not self._local_vision_clients:
+            return False
+        if parsed.item_kind == "sealed_box":
+            # Sealed boxes have a different visual surface; the verify prompt
+            # is tuned for single cards. Skip for now.
+            return False
+        if parsed.confidence is not None and parsed.confidence < IMAGE_SANITY_FLOOR:
+            return True
+        # If the catalog gave us back a title we didn't actually parse from
+        # the image, that's the exact hallucination signature.
+        if parsed.title is None and result.spec.title:
+            return True
+        if (
+            parsed.title is not None
+            and result.spec.title
+            and normalize_text(parsed.title) != normalize_text(result.spec.title)
+        ):
+            return True
+        return False
+
+    def _run_sanity_check(
+        self,
+        image_path: Path,
+        matched_spec: TcgCardSpec,
+    ) -> "LocalVisionIdentityVerdict | None":
+        # Prefer an alternate vision model for verification when more than one
+        # is configured — don't ask the same network to verify its own output.
+        clients = list(self._local_vision_clients)
+        if not clients:
+            return None
+        verify_client = clients[-1] if len(clients) > 1 else clients[0]
+        verify_fn = getattr(verify_client, "verify_card_identity", None)
+        if not callable(verify_fn):
+            return None
+        try:
+            return verify_fn(
+                image_path,
+                matched_title=matched_spec.title,
+                matched_card_number=matched_spec.card_number,
+            )
+        except LocalVisionTimeoutError as exc:
+            logger.warning(
+                "Sanity check timed out backend=%s detail=%s",
+                getattr(verify_client, "descriptor", "<unknown>"),
+                exc.detail,
+            )
+            return None
+        except Exception:
+            logger.exception(
+                "Sanity check failed backend=%s",
+                getattr(verify_client, "descriptor", "<unknown>"),
+            )
+            return None
 
     def parse_image(
         self,
@@ -284,6 +394,7 @@ class TcgImagePriceService:
         if path_title_hint:
             parsed = _merge_path_title_hint(parsed, path_title_hint)
         warnings = [*parsed.warnings, *extraction_warnings]
+        vision_confidence: float | None = None
         if self._should_try_local_vision(parsed):
             vision_candidate, vision_warnings = self._run_local_vision_fallback(
                 resolved_path,
@@ -294,6 +405,7 @@ class TcgImagePriceService:
             )
             warnings.extend(vision_warnings)
             if vision_candidate is not None:
+                vision_confidence = vision_candidate.confidence
                 parsed = _merge_local_vision_candidate(parsed, vision_candidate)
         warnings = _dedupe_preserve_order([*warnings, *parsed.warnings])
         if parsed.status == "success" and parsed.title is not None:
@@ -303,6 +415,33 @@ class TcgImagePriceService:
         status = parsed.status
         if status == "success" and parsed.to_spec() is None:
             status = "unresolved"
+
+        # Defence 2: two-tier confidence floor. VLMs over-report confidence on
+        # the failure mode where they invent a card_number from prompt examples,
+        # so we ALSO treat "both title and card_number are null" as below the
+        # hard floor regardless of self-reported confidence.
+        research_hint: str | None = None
+        both_null = parsed.title is None and parsed.card_number is None
+        below_hard_floor = (
+            vision_confidence is not None and vision_confidence < IMAGE_HARD_FLOOR
+        )
+        if (both_null or below_hard_floor) and status not in {"unavailable"}:
+            status = "unresolved"
+            research_hint = _build_research_hint(
+                parsed=parsed,
+                game_hint=resolved_game_hint,
+                title_hint=resolved_title_hint,
+                raw_text=raw_text,
+                vision_confidence=vision_confidence,
+            )
+            logger.info(
+                "Photo parse fell below confidence hard floor; routing to clarification image=%s confidence=%s both_null=%s research_hint=%r",
+                resolved_path,
+                vision_confidence,
+                both_null,
+                research_hint,
+            )
+
         return ParsedCardImage(
             status=status,
             game=parsed.game,
@@ -315,6 +454,8 @@ class TcgImagePriceService:
             extracted_lines=parsed.extracted_lines,
             item_kind=parsed.item_kind,
             warnings=tuple(warnings),
+            confidence=vision_confidence,
+            research_hint=research_hint,
         )
 
     def _should_try_local_vision(self, parsed: ParsedCardImage) -> bool:
@@ -1865,6 +2006,56 @@ def _sealed_box_title_looks_usable(value: str | None) -> bool:
     if long_word_count == 0 and not has_numeric_signal and not gameplay_keyword:
         return False
     return has_numeric_signal or has_long_word or strong_keyword or gameplay_keyword or long_word_count >= 2
+
+
+def _build_research_hint(
+    *,
+    parsed: ParsedCardImage,
+    game_hint: str | None,
+    title_hint: str | None,
+    raw_text: str,
+    vision_confidence: float | None,
+) -> str:
+    """Build a free-text query for the web-research fallback when the photo
+    pipeline can't confidently identify the card. We deliberately keep this
+    pure-data — bot.py will dispatch the actual /search call.
+    """
+    parts: list[str] = []
+    game = parsed.game or game_hint
+    if game == "pokemon":
+        parts.append("Pokemon TCG card")
+    elif game == "ws":
+        parts.append("Weiss Schwarz TCG card")
+    elif game:
+        parts.append(f"{game} TCG card")
+    else:
+        parts.append("trading card")
+    if parsed.title:
+        parts.append(f'with printed name "{parsed.title}"')
+    elif title_hint:
+        parts.append(f'with caption hint "{title_hint}"')
+    if parsed.card_number:
+        parts.append(f"collector number {parsed.card_number}")
+    if parsed.rarity:
+        parts.append(f"rarity {parsed.rarity}")
+    if parsed.set_code:
+        parts.append(f"set code {parsed.set_code}")
+    cleaned_lines: list[str] = []
+    for line in (raw_text or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # Strip OCR junk: short fragments, isolated punctuation.
+        if len(stripped) < 3:
+            continue
+        cleaned_lines.append(stripped)
+        if len(cleaned_lines) >= 4:
+            break
+    if cleaned_lines:
+        parts.append("visible printed fragments: " + " / ".join(cleaned_lines))
+    if vision_confidence is not None:
+        parts.append(f"local vision confidence={vision_confidence:.2f}")
+    return ", ".join(parts)
 
 
 def _merge_local_vision_candidate(

@@ -37,6 +37,40 @@ CARD_JSON_SCHEMA = {
 }
 
 
+VERIFY_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "evidence": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+        "mismatch_reasons": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+        "match": {"type": "string"},
+        "confidence": {"type": ["number", "null"]},
+    },
+    "required": ["evidence", "mismatch_reasons", "match", "confidence"],
+    "additionalProperties": False,
+}
+
+
+@dataclass(frozen=True, slots=True)
+class LocalVisionIdentityVerdict:
+    match: str  # "yes" | "no" | "uncertain"
+    evidence: tuple[str, ...]
+    mismatch_reasons: tuple[str, ...]
+    confidence: float | None
+    backend: str
+    model: str
+    raw_response: str
+
+    @property
+    def descriptor(self) -> str:
+        return f"{self.backend}:{self.model}"
+
+
 @dataclass(frozen=True, slots=True)
 class LocalVisionCardCandidate:
     backend: str
@@ -129,6 +163,69 @@ class OllamaLocalVisionClient:
             game_hint=game_hint,
         )
 
+    def verify_card_identity(
+        self,
+        image_path: Path,
+        *,
+        matched_title: str,
+        matched_card_number: str | None = None,
+    ) -> LocalVisionIdentityVerdict:
+        """Force-disconfirm a proposed match against the photo.
+
+        The prompt asks the model to ENUMERATE the printed text features that
+        WOULD have to be visible if the card really were ``matched_title`` and
+        then state which of those it can read on the photo. This is much more
+        robust than a soft yes/no because it requires citing evidence, which
+        the caller cross-checks (an empty ``evidence`` list demotes a `yes` to
+        `uncertain`).
+
+        Note: ``matched_card_number`` is passed in only so the prompt can ASK
+        about it as a question, never as an assertion — otherwise we'd seed
+        another few-shot leak after just removing the last one.
+        """
+        image_payload = base64.b64encode(image_path.read_bytes()).decode("ascii")
+        payload = {
+            "model": self.model,
+            "prompt": self._build_verify_prompt(
+                matched_title=matched_title,
+                matched_card_number=matched_card_number,
+            ),
+            "images": [image_payload],
+            "format": VERIFY_JSON_SCHEMA,
+            "stream": False,
+            "options": {"temperature": 0},
+        }
+        response_text = self._post_generate(payload)
+        verdict_payload = _load_json_fragment(response_text)
+        if not isinstance(verdict_payload, dict):
+            raise RuntimeError(f"Ollama did not return a JSON object for {self.descriptor}.")
+
+        raw_match = verdict_payload.get("match")
+        normalized = (
+            raw_match.strip().lower() if isinstance(raw_match, str) else ""
+        )
+        if normalized not in {"yes", "no", "uncertain"}:
+            normalized = "uncertain"
+
+        evidence = _normalize_str_list(verdict_payload.get("evidence"))
+        mismatch_reasons = _normalize_str_list(verdict_payload.get("mismatch_reasons"))
+
+        # Guard rail: a "yes" with no concrete evidence is treated as
+        # uncertain. VLMs sometimes affirm without grounding.
+        if normalized == "yes" and not evidence:
+            normalized = "uncertain"
+            mismatch_reasons = (*mismatch_reasons, "Model returned 'yes' without citing any printed evidence.")
+
+        return LocalVisionIdentityVerdict(
+            match=normalized,
+            evidence=evidence,
+            mismatch_reasons=mismatch_reasons,
+            confidence=_normalize_confidence(verdict_payload.get("confidence")),
+            backend=self.backend,
+            model=self.model,
+            raw_response=response_text,
+        )
+
     def analyze_sealed_box_title_focus(
         self,
         image_path: Path,
@@ -197,14 +294,15 @@ class OllamaLocalVisionClient:
             "Prefer the printed product name and pack branding over slab labels whenever they disagree.\n"
             "Ignore slab grades, cert numbers, copyright lines, attack text, and rule text.\n"
             "Never use slab grade text as the card rarity.\n"
-            "For Japanese sealed Pokemon products, include the product line when visible, such as 強化拡張パック ポケモンカード151 or ハイクラスパック MEGAドリームex.\n"
-            "Pokemon collector numbers should stay in full market-friendly form when visible, such as 201/165, 020/M-P, 085/SV-P, or 764/742.\n"
-            "If a Pokemon promo card shows a set code and number separately, combine them into one card_number field like 085/SV-P.\n"
-            "For Japanese Start Deck 100 Battle Collection slab labels such as MC JP #764, return 764/742 when the image supports that collector number.\n"
+            "For Japanese sealed Pokemon products, include the full printed product line when visible.\n"
+            "Pokemon collector numbers print as digits over digits (e.g. card-number-over-set-size) or digits over a short alphanumeric set code. Return the number exactly as printed. Do NOT invent or fill numbers from prior knowledge.\n"
+            "If a Pokemon promo card shows a set code and the collector number separately on the card, combine them into one card_number field exactly as printed.\n"
+            "For slab labels containing only a partial collector number, return the printed digits exactly; do not extend or complete the number from memory.\n"
             'Use item_kind values "card", "sealed_box", or null.\n'
             'Use game values "pokemon", "ws", or null.\n'
             "Preserve the Japanese title when visible.\n"
             "Use null for unknown values instead of guessing.\n"
+            "If you cannot read a field directly from the printed text on this image, set it to null and set confidence ≤ 0.4. Honest uncertainty is preferred over a confident guess.\n"
             "aliases should contain only high-confidence alternate names.\n"
             "Hints:\n"
             f"{hint_text}\n"
@@ -221,11 +319,38 @@ class OllamaLocalVisionClient:
             "Read only the printed card identity text from this trading card image and return only JSON.\n"
             "Prioritize the printed card name near the top and the collector number, rarity, and set code near the bottom.\n"
             "Do not identify the artwork subject, attack names, slab labels, cert numbers, or promo guesses unless the printed card text supports them.\n"
-            "If you are unsure about the title, keep title null but still return card_number, rarity, and set_code when visible.\n"
-            "For Pokemon cards, prefer collector numbers like 201/165, 110/080, 085/SV-P, or 020/M-P.\n"
+            "If you are unsure about the title, keep title null but still return card_number, rarity, and set_code when they are clearly readable.\n"
+            "Pokemon collector numbers print as digits over digits or digits over a short alphanumeric set code. Return the number exactly as printed.\n"
+            "Do NOT invent or fill in collector numbers from prior knowledge of other Pokemon cards. If you cannot directly read the digits on this specific image, set card_number to null.\n"
+            "If you are not confident a field is read from the printed text on this image (rather than guessed from artwork or memory), set that field to null and set confidence ≤ 0.4. Honest uncertainty is preferred over a confident guess.\n"
             'Use game values "pokemon", "ws", or null.\n'
             "Hints:\n"
             f"{hint_text}\n"
+        )
+
+    def _build_verify_prompt(
+        self,
+        *,
+        matched_title: str,
+        matched_card_number: str | None,
+    ) -> str:
+        # IMPORTANT: never echo matched_card_number as an assertion. Only ask
+        # about it as a question. Otherwise we re-introduce the few-shot leak
+        # we just fixed in the analyze prompts.
+        number_question = ""
+        if matched_card_number:
+            number_question = (
+                "Also state whether the printed collector number on this image matches "
+                f"'{matched_card_number}' exactly. If you cannot read the number, say so. "
+            )
+        return (
+            "You are auditing a candidate identification of a trading card photo. "
+            "Without assuming the answer, do these three steps in order:\n"
+            f"1. List three distinct printed text features that MUST be visible on the photo if this card really were '{matched_title}'. Choose features that uniquely identify this specific card (e.g. printed card name, HP value, attack names, set symbol or collector number).\n"
+            "2. For each feature, state whether you can actually read it on the printed text of this photo. Quote the printed text you can see; do not infer.\n"
+            f"3. {number_question}Finally answer match using exactly one of: yes / no / uncertain.\n"
+            "Return JSON with keys: evidence (list of printed text you can directly see on the photo that supports the match), mismatch_reasons (list of features that should be present but you cannot read or that contradict the candidate), match (one of yes/no/uncertain), confidence (0-1).\n"
+            "If you cannot read any of the three required features on the photo, return match=no or match=uncertain with the missing features in mismatch_reasons. Do not say yes without citing concrete printed text in evidence.\n"
         )
 
     def _build_sealed_box_title_prompt(self, *, game_hint: str | None, title_hint: str | None) -> str:
@@ -241,8 +366,8 @@ class OllamaLocalVisionClient:
             "Focus on the big printed product name on the front of the box.\n"
             "Ignore chat captions, timestamps, UI chrome, seller overlays, copyright text, pack counts, and stock labels unless they are part of the official product title.\n"
             "For sealed boxes, set item_kind=sealed_box, keep card_number and rarity null, and keep title null instead of guessing.\n"
-            "For Japanese Pokemon boxes, preserve the Japanese product line when visible, such as 強化拡張パック ポケモンカード151 or ハイクラスパック MEGAドリームex.\n"
-            "If only a strong numeric title like 151 is clearly visible, you may return that as title instead of inventing missing words.\n"
+            "For Japanese Pokemon boxes, preserve the printed Japanese product line exactly as shown on the box front.\n"
+            "If only a partial title fragment is clearly visible, return that exact fragment as title instead of inventing missing words.\n"
             'Use item_kind values "sealed_box" or null.\n'
             'Use game values "pokemon", "ws", or null.\n'
             "aliases should contain only high-confidence alternate names.\n"
@@ -470,6 +595,19 @@ def _normalize_confidence(value: object) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _normalize_str_list(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    cleaned: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        stripped = item.strip()
+        if stripped:
+            cleaned.append(stripped)
+    return tuple(cleaned)
 
 
 def _parse_model_list(value: object) -> tuple[str, ...]:

@@ -1295,3 +1295,221 @@ def test_prepare_lookup_spec_repairs_wrong_card_number_using_slab_number(monkeyp
     assert spec.title == "メガリザードンXex"
     assert spec.card_number == "110/080"
     assert resolved_parsed.card_number == "110/080"
+
+
+# ─── Defence layers against vision hallucinations (Pikachu→Mega Charizard) ─────
+
+
+def test_local_vision_prompts_have_no_few_shot_collector_numbers() -> None:
+    # Regression: the analyzer prompt literally contained `110/080` as a
+    # few-shot example, and the model regurgitated it whenever it could not
+    # actually read the card. Any future edit that re-introduces a
+    # hardcoded collector-number example must fail this test.
+    client = OllamaLocalVisionClient(endpoint="http://x", model="m", timeout_seconds=1)
+    leaked = ("110/080", "201/165", "085/SV-P", "020/M-P", "764/742", "UAPR/EVA-1-71")
+    for prompt_fn in (
+        client._build_prompt,
+        client._build_text_focus_prompt,
+        client._build_sealed_box_title_prompt,
+    ):
+        rendered = prompt_fn(game_hint=None, title_hint=None)
+        for leak in leaked:
+            assert leak not in rendered, (
+                f"Few-shot leak detected: {prompt_fn.__name__} still contains {leak!r}"
+            )
+
+
+def test_parse_image_treats_low_confidence_as_unresolved(monkeypatch, tmp_path) -> None:
+    image_path = tmp_path / "fake.jpg"
+    image_path.write_bytes(b"stub")
+
+    service = TcgImagePriceService(
+        db_path=str(tmp_path / "monitor.sqlite3"),
+        tesseract_path=None,
+        tessdata_dir=None,
+        vision_settings=TcgVisionSettings(backend=""),
+    )
+    service._tesseract_path = None  # force the vision-only path
+    service._local_vision_clients = (object(),)
+    monkeypatch.setattr(service, "_extract_text", lambda path: ("", ()))
+    monkeypatch.setattr(service, "_should_try_local_vision", lambda parsed: True)
+
+    bogus_candidate = LocalVisionCardCandidate(
+        backend="ollama",
+        model="m",
+        game="pokemon",
+        title=None,
+        aliases=(),
+        card_number="110/080",
+        rarity="H",
+        set_code="sv-p",
+        item_kind="card",
+        confidence=0.3,  # below IMAGE_HARD_FLOOR
+    )
+    monkeypatch.setattr(
+        service,
+        "_run_local_vision_fallback",
+        lambda *args, **kwargs: (bogus_candidate, ()),
+    )
+
+    parsed = service.parse_image(image_path, caption="/scan pokemon")
+
+    assert parsed.status == "unresolved"
+    assert parsed.research_hint is not None
+    assert "Pokemon" in parsed.research_hint or "pokemon" in parsed.research_hint
+
+
+def test_parse_image_treats_both_null_as_hard_floor(monkeypatch, tmp_path) -> None:
+    # Even with high self-reported confidence, a candidate with no readable
+    # title AND no readable card_number must NOT trigger a catalog lookup —
+    # that's the exact failure mode that produced the Pikachu→Mega Charizard
+    # bug.
+    image_path = tmp_path / "image.jpg"
+    image_path.write_bytes(b"stub")
+
+    service = TcgImagePriceService(
+        db_path=str(tmp_path / "monitor.sqlite3"),
+        tesseract_path=None,
+        tessdata_dir=None,
+        vision_settings=TcgVisionSettings(backend=""),
+    )
+    service._tesseract_path = None
+    service._local_vision_clients = (object(),)
+    monkeypatch.setattr(service, "_extract_text", lambda path: ("", ()))
+    monkeypatch.setattr(service, "_should_try_local_vision", lambda parsed: True)
+    # Avoid the path-derived title hint kicking in.
+    monkeypatch.setattr(
+        "tcg_tracker.image_lookup._derive_title_hint_from_path",
+        lambda path: None,
+    )
+
+    candidate = LocalVisionCardCandidate(
+        backend="ollama",
+        model="m",
+        game="pokemon",
+        title=None,
+        aliases=(),
+        card_number=None,
+        rarity=None,
+        set_code=None,
+        item_kind="card",
+        confidence=0.9,
+    )
+    monkeypatch.setattr(
+        service,
+        "_run_local_vision_fallback",
+        lambda *args, **kwargs: (candidate, ()),
+    )
+
+    parsed = service.parse_image(image_path)
+
+    assert parsed.status == "unresolved"
+
+
+def test_verify_card_identity_demotes_yes_with_empty_evidence(monkeypatch) -> None:
+    # A "yes" verdict with no concrete evidence cited must be demoted to
+    # "uncertain" so the post-lookup sanity check rejects the match.
+    client = OllamaLocalVisionClient(endpoint="http://x", model="m", timeout_seconds=1)
+    monkeypatch.setattr(
+        client,
+        "_post_generate",
+        lambda payload: '{"match":"yes","evidence":[],"mismatch_reasons":[],"confidence":0.8}',
+    )
+
+    verdict = client.verify_card_identity(
+        Path("/dev/null"),
+        matched_title="メガリザードンXex",
+        matched_card_number="110/080",
+    )
+
+    assert verdict.match == "uncertain"
+    assert verdict.mismatch_reasons
+    assert any("evidence" in reason.lower() for reason in verdict.mismatch_reasons)
+
+
+def test_verify_prompt_does_not_assert_matched_card_number() -> None:
+    # Defence-in-depth: the verify prompt must reference matched_card_number
+    # only as a question, never as a flat assertion. Otherwise we re-introduce
+    # the few-shot leak we just fixed in the analyzer prompts.
+    client = OllamaLocalVisionClient(endpoint="http://x", model="m", timeout_seconds=1)
+    prompt = client._build_verify_prompt(
+        matched_title="メガリザードンXex",
+        matched_card_number="110/080",
+    )
+    assert "matches '110/080' exactly" in prompt
+    assert "collector number is 110/080" not in prompt
+    assert "card_number=110/080" not in prompt
+
+
+def test_sanity_check_rejects_mismatch_in_lookup_image(monkeypatch, tmp_path) -> None:
+    # Full lookup_image end-to-end: parse returns Mega Charizard for a
+    # photo, catalog lookup matches, sanity check returns `no`. Outcome
+    # must be `rejected_sanity` and lookup_result must be None — never a
+    # confident price reply for the wrong card.
+    from tcg_tracker.local_vision import LocalVisionIdentityVerdict
+
+    image_path = tmp_path / "fake.jpg"
+    image_path.write_bytes(b"stub")
+
+    service = TcgImagePriceService(
+        db_path=str(tmp_path / "monitor.sqlite3"),
+        tesseract_path=None,
+        tessdata_dir=None,
+        vision_settings=TcgVisionSettings(backend=""),
+    )
+
+    class FakeVisionClient:
+        descriptor = "ollama:fake"
+
+        def verify_card_identity(self, image_path, *, matched_title, matched_card_number):
+            return LocalVisionIdentityVerdict(
+                match="no",
+                evidence=(),
+                mismatch_reasons=("Pokemon name on card does not match",),
+                confidence=0.8,
+                backend="ollama",
+                model="fake",
+                raw_response="{}",
+            )
+
+    service._local_vision_clients = (FakeVisionClient(),)
+
+    monkeypatch.setattr(
+        service,
+        "parse_image",
+        lambda *args, **kwargs: ParsedCardImage(
+            status="success",
+            game="pokemon",
+            title="メガリザードンXex",
+            aliases=(),
+            card_number="110/080",
+            rarity="SAR",
+            set_code="m2",
+            raw_text="",
+            extracted_lines=(),
+            confidence=0.4,
+        ),
+    )
+
+    fake_spec = TcgCardSpec(
+        game="pokemon",
+        title="メガリザードンXex",
+        card_number="110/080",
+        rarity="SAR",
+    )
+    fake_result = TcgLookupResult(
+        spec=fake_spec,
+        item=fake_spec.to_tracked_item(),
+        offers=(),
+        fair_value=None,
+        notes=(),
+    )
+
+    monkeypatch.setattr(service, "_prepare_lookup_spec", lambda parsed: (parsed, fake_spec))
+    monkeypatch.setattr(service, "_lookup_with_hot_card_fallback", lambda spec, persist=False: fake_result)
+
+    outcome = service.lookup_image(image_path)
+
+    assert outcome.status == "rejected_sanity"
+    assert outcome.parsed.research_hint is not None
+    assert outcome.lookup_result is None

@@ -19,6 +19,7 @@ from price_monitor_bot.natural_language import (
 from price_monitor_bot.bot import (
     PendingTelegramPhotoClarification,
     PendingTelegramTextClarification,
+    PhotoLookupReply,
     TelegramCommandProcessor,
     TelegramFileAttachment,
     TelegramPhotoIntentAnalysis,
@@ -34,6 +35,12 @@ from price_monitor_bot.bot import (
     parse_lookup_command,
     parse_reputation_snapshot_command,
 )
+
+# Every call to `handle_telegram_message` now sends an immediate intake ack
+# before kicking off the real processing pipeline; the assertions below
+# include these to lock in that behaviour.
+PHOTO_INTAKE_ACK = "已收到圖片，開始解讀使用者意圖"
+TEXT_INTAKE_ACK = "已收到訊息，開始解讀使用者意圖"
 
 
 def _stub_board() -> HotCardBoard:
@@ -380,6 +387,7 @@ def test_handle_telegram_message_sends_ack_then_photo_result() -> None:
     )
 
     assert replies == (
+        PHOTO_INTAKE_ACK,
         "收到圖片，開始解析與查價。",
         "photo:pokemon:Pikachu ex:.jpg",
     )
@@ -406,6 +414,7 @@ def test_handle_telegram_message_sends_ack_then_text_result() -> None:
     )
 
     assert replies == (
+        TEXT_INTAKE_ACK,
         "收到查價指令，開始處理。",
         "pokemon:Pikachu ex",
     )
@@ -434,6 +443,7 @@ def test_handle_telegram_message_ignores_generic_price_caption_as_title_hint() -
     )
 
     assert replies == (
+        PHOTO_INTAKE_ACK,
         build_processing_ack(has_photo=True),
         "photo:None:None:.jpg",
     )
@@ -460,10 +470,11 @@ def test_handle_telegram_message_clarifies_image_without_caption() -> None:
         },
     )
 
-    assert len(replies) == 1
-    assert "請回覆數字" in replies[0]
-    assert "1. 要我查這張寶可夢卡市價嗎？" in replies[0]
-    assert "4. 都不是，請回答：否，[您的意圖]" in replies[0]
+    assert len(replies) == 2
+    assert replies[0] == PHOTO_INTAKE_ACK
+    assert "請回覆數字" in replies[1]
+    assert "1. 要我查這張寶可夢卡市價嗎？" in replies[1]
+    assert "4. 都不是，請回答：否，[您的意圖]" in replies[1]
     assert client.sent_messages == list(replies)
 
 
@@ -494,6 +505,7 @@ def test_handle_telegram_message_uses_explicit_price_caption_without_clarifying(
     )
 
     assert replies == (
+        PHOTO_INTAKE_ACK,
         build_processing_ack(has_photo=True),
         "photo:pokemon:None",
     )
@@ -530,6 +542,7 @@ def test_handle_telegram_message_runs_selected_photo_option_after_clarification(
     )
 
     assert replies == (
+        TEXT_INTAKE_ACK,
         "收到，我就照第 1 個方式處理。",
         "resolved:/scan pokemon:pokemon",
     )
@@ -566,6 +579,7 @@ def test_handle_telegram_message_supports_photo_override_text() -> None:
     )
 
     assert replies == (
+        TEXT_INTAKE_ACK,
         "收到，我改照你補充的意思處理：查這張遊戲王卡市價",
         "resolved:/scan yugioh:yugioh:card",
     )
@@ -596,6 +610,7 @@ def test_handle_telegram_message_card_selection_overrides_box_guess() -> None:
     )
 
     assert replies == (
+        TEXT_INTAKE_ACK,
         "收到，我就照第 2 個方式處理。",
         "resolved:/scan yugioh:yugioh:card",
     )
@@ -635,7 +650,7 @@ def test_handle_telegram_message_supports_photo_identify_override() -> None:
         },
     )
 
-    assert replies == ("我目前看起來比較像 寶可夢卡盒：ポケモンカード151",)
+    assert replies == (TEXT_INTAKE_ACK, "我目前看起來比較像 寶可夢卡盒：ポケモンカード151")
     assert processor.get_pending_photo_clarification("123") is None
 
 
@@ -669,9 +684,10 @@ def test_handle_telegram_message_reminds_when_photo_clarification_reply_is_unrec
         },
     )
 
-    assert len(replies) == 1
-    assert "我現在在等你確認這張圖要怎麼處理" in replies[0]
-    assert "1. 要我查這張寶可夢卡市價嗎？" in replies[0]
+    assert len(replies) == 2
+    assert replies[0] == TEXT_INTAKE_ACK
+    assert "我現在在等你確認這張圖要怎麼處理" in replies[1]
+    assert "1. 要我查這張寶可夢卡市價嗎？" in replies[1]
 
 
 def test_handle_telegram_message_requests_override_when_other_option_is_selected() -> None:
@@ -704,7 +720,7 @@ def test_handle_telegram_message_requests_override_when_other_option_is_selected
         },
     )
 
-    assert replies == ("好，請直接回答：否，[您的意圖]",)
+    assert replies == (TEXT_INTAKE_ACK, "好，請直接回答：否，[您的意圖]")
 
 
 def test_pending_photo_clarification_expires(tmp_path: Path) -> None:
@@ -761,6 +777,7 @@ def test_handle_telegram_message_sends_snapshot_ack_then_result(tmp_path: Path) 
     )
 
     assert replies == (
+        TEXT_INTAKE_ACK,
         "收到信譽快照查詢，先檢查既有 proof，必要時建立新快照。",
         "snapshot:https://jp.mercari.com/item/m123456789",
     )
@@ -807,8 +824,9 @@ def test_handle_telegram_message_sends_natural_language_ack_then_result() -> Non
         },
     )
 
-    assert replies[0] == "已理解查詢內容，相當於 /trend ws 5，開始整理資料。"
-    assert "WS Liquidity Board" in replies[1]
+    assert replies[0] == TEXT_INTAKE_ACK
+    assert replies[1] == "已理解查詢內容，相當於 /trend ws 5，開始整理資料。"
+    assert "WS Liquidity Board" in replies[2]
     assert client.sent_messages == list(replies)
 
 
@@ -824,7 +842,7 @@ def test_handle_telegram_message_sends_natural_language_ack_before_running_heavy
     )
 
     def board_loader() -> tuple[HotCardBoard, ...]:
-        assert client.sent_messages == ["已理解查詢內容，相當於 /trend ws 3，開始整理資料。"]
+        assert client.sent_messages == [TEXT_INTAKE_ACK, "已理解查詢內容，相當於 /trend ws 3，開始整理資料。"]
         return (
             HotCardBoard(
                 game="ws",
@@ -853,8 +871,9 @@ def test_handle_telegram_message_sends_natural_language_ack_before_running_heavy
         },
     )
 
-    assert replies[0] == "已理解查詢內容，相當於 /trend ws 3，開始整理資料。"
-    assert "WS Liquidity Board" in replies[1]
+    assert replies[0] == TEXT_INTAKE_ACK
+    assert replies[1] == "已理解查詢內容，相當於 /trend ws 3，開始整理資料。"
+    assert "WS Liquidity Board" in replies[2]
 
 
 def _mixed_grade_lookup_result() -> TcgLookupResult:
@@ -1182,12 +1201,13 @@ def test_handle_telegram_message_clarifies_when_intent_is_unknown() -> None:
         message={"chat": {"id": "123"}, "text": "今天心情很差"},
     )
 
-    assert len(replies) == 1
-    assert "請回覆數字" in replies[0]
+    assert len(replies) == 2
+    assert replies[0] == TEXT_INTAKE_ACK
+    assert "請回覆數字" in replies[1]
     # Falls back to /search + /help options when nothing else fits.
-    assert "上網搜尋" in replies[0]
-    assert "/help" in replies[0]
-    assert "都不是，請回答：否，[您的意圖]" in replies[0]
+    assert "上網搜尋" in replies[1]
+    assert "/help" in replies[1]
+    assert "都不是，請回答：否，[您的意圖]" in replies[1]
     assert processor.get_pending_text_clarification("123") is not None
 
 
@@ -1210,8 +1230,9 @@ def test_handle_telegram_message_clarifies_when_intent_confidence_is_low() -> No
         message={"chat": {"id": "123"}, "text": "why are pokemon cards popular"},
     )
 
-    assert len(replies) == 1
-    reply = replies[0]
+    assert len(replies) == 2
+    assert replies[0] == TEXT_INTAKE_ACK
+    reply = replies[1]
     assert "請回覆數字" in reply
     # The LLM's top guess shows up first.
     assert "1. 上網搜尋" in reply
@@ -1291,7 +1312,7 @@ def test_handle_telegram_message_text_clarification_other_option_requests_overri
         message={"chat": {"id": "123"}, "text": str(sentinel)},
     )
 
-    assert replies == ("好，請直接回答：否，[您的意圖]",)
+    assert replies == (TEXT_INTAKE_ACK, "好，請直接回答：否，[您的意圖]")
     # Pending state remains so the follow-up "否，..." can be matched.
     assert processor.get_pending_text_clarification("123") is not None
 
@@ -1412,3 +1433,54 @@ def test_fallback_router_no_longer_overeats_with_sns_buzz() -> None:
     assert result is not None
     assert result.intent == "trend_board"
     assert result.game == "yugioh"
+
+
+def test_handle_photo_message_installs_clarification_when_renderer_returns_unresolved() -> None:
+    # End-to-end check that when the photo renderer returns a
+    # PhotoLookupReply with a pending_clarification (the
+    # unresolved/rejected_sanity path), the dispatcher both replies with the
+    # clarification text AND installs the pending photo state so the user's
+    # next text message can use the "否，[您的意圖]" override flow.
+    sample_path = get_image_lookup_live_case("pokemon-pikachu-partial-s40").image_path
+    client = FakeTelegramClient(sample_path=sample_path)
+    processor = TelegramCommandProcessor(
+        allowed_chat_ids=frozenset({"123"}),
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        photo_intent_analyzer=lambda query: _ambiguous_photo_analysis(),
+    )
+
+    def stub_photo_renderer(query):
+        pending = PendingTelegramPhotoClarification(
+            chat_id=str(query.chat_id),
+            image_path=query.image_path,
+            caption=query.caption,
+            file_id=query.file_id,
+            options=(),
+            parsed_game="pokemon",
+            parsed_item_kind="card",
+            parsed_title=None,
+        )
+        return PhotoLookupReply(
+            text="我看不太清楚這張卡。可以直接告訴我卡片名稱嗎？",
+            pending_clarification=pending,
+        )
+
+    replies = handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=stub_photo_renderer,
+        message={
+            "chat": {"id": "123"},
+            "photo": [{"file_id": "photo-1", "file_size": 128}],
+            "caption": "/scan pokemon",  # would normally trigger direct lookup
+        },
+    )
+
+    assert any("我看不太清楚這張卡" in reply for reply in replies)
+    # The pending photo state must be installed so a follow-up "否，..."
+    # message reaches the existing override flow.
+    pending = processor.get_pending_photo_clarification("123")
+    assert pending is not None
+    assert pending.parsed_game == "pokemon"
