@@ -1346,3 +1346,69 @@ def test_handle_telegram_message_text_clarification_override_reroutes_through_ro
     assert processor.get_pending_text_clarification("123") is None
 
 
+# ─── Per-intent fallback router behaviour (locks in the slim from this change) ─
+
+
+CANONICAL_FALLBACK_PHRASES: tuple[tuple[str, str], ...] = (
+    # trend_board — must require an explicit ranking word, never plain "趨勢".
+    ("pokemon 熱門前 5", "trend_board"),
+    ("ws trending top 3", "trend_board"),
+    ("幫我看 pokemon liquidity", "trend_board"),
+    ("遊戲王最近熱門排行", "trend_board"),
+    # web_research — only canonical question phrasings stay reliable in fallback.
+    ("為什麼Pokemon卡這麼貴", "web_research"),
+    ("why are pokemon cards popular", "web_research"),
+    # watch / list / remove / update — touched as little as possible.
+    ("追蹤 初音ミク SSP 5萬以下", "add_watch"),
+    ("我的追蹤清單", "list_watches"),
+    ("取消追蹤 abc12345", "remove_watch"),
+    ("把 abc12345 改成 4萬", "update_watch_price"),
+    # reputation, sns — untouched lists, still work.
+    ("信用 https://jp.mercari.com/user/profile/123", "reputation_snapshot"),
+    ("追蹤 @elonmusk", "sns_add_account"),
+    ("snslist", "sns_list"),
+    ("取消追蹤 @elonmusk", "sns_delete"),
+    # sns_buzz — slimmed; canonical phrasings keep working, generic
+    # "什麼熱門" no longer over-eats (asserted separately below).
+    ("snsbuzz amd", "sns_buzz"),
+    ("整理 amd 最近的熱門討論", "sns_buzz"),
+    ("buzz on amd", "sns_buzz"),
+    # status / tools — only canonical roots kept (狀態 / health / 工具 / catalog / 功能清單).
+    ("目前狀態", "status"),
+    ("服務 health", "status"),
+    ("tools", "tools"),
+    ("catalog", "tools"),
+    ("功能清單", "tools"),
+    # opportunity_remove — canonical phrasings.
+    ("移除機會目標 2", "opportunity_remove"),
+    ("remove target 3", "opportunity_remove"),
+    ("I am not interested in Umbreon ex SAR anymore", "opportunity_remove"),
+)
+
+
+def test_fallback_router_canonical_phrases_keep_routing() -> None:
+    for phrase, expected_intent in CANONICAL_FALLBACK_PHRASES:
+        result = fallback_route_telegram_natural_language(phrase)
+        assert result is not None, f"phrase={phrase!r} unexpectedly returned None"
+        assert result.intent == expected_intent, (
+            f"phrase={phrase!r} routed to {result.intent}, expected {expected_intent}"
+        )
+
+
+def test_fallback_router_does_not_route_bare_trend_keyword_to_trend_board() -> None:
+    # "趨勢" was removed from _TREND_KEYWORDS because in Chinese it usually
+    # means "direction", not "ranking". A bare "最近趨勢" should fall through
+    # to the LLM (or to clarification options) rather than fire a confident
+    # trend_board fallback.
+    assert fallback_route_telegram_natural_language("最近趨勢") is None
+
+
+def test_fallback_router_no_longer_overeats_with_sns_buzz() -> None:
+    # Before the slim "遊戲王最近熱門排行" matched _SNS_BUZZ_KEYWORDS via
+    # "什麼熱門"/"最近熱門" and routed to sns_buzz despite the clear ranking
+    # intent. After dropping those entries from _SNS_BUZZ_KEYWORDS it goes
+    # to trend_board as the user would expect.
+    result = fallback_route_telegram_natural_language("遊戲王最近熱門排行")
+    assert result is not None
+    assert result.intent == "trend_board"
+    assert result.game == "yugioh"

@@ -71,13 +71,8 @@ _LOOKUP_KEYWORDS = (
 _TREND_KEYWORDS = (
     "熱門",
     "排行",
-    "趨勢",
-    "熱度",
-    "前",
-    "trend",
     "trending",
     "hot",
-    "heat",
     "liquidity",
 )
 _WATCH_ADD_KEYWORDS = (
@@ -144,9 +139,6 @@ _SNS_BUZZ_KEYWORDS = (
     "熱門整理",
     "熱門討論",
     "整理一下",
-    "什麼熱門",
-    "最近熱門",
-    "在 reddit",
     "buzz",
     "topic digest",
 )
@@ -204,29 +196,15 @@ _REPUTATION_KEYWORDS = (
 _STATUS_KEYWORDS = (
     "status",
     "狀態",
-    "状态",
-    "目前狀況",
-    "目前状态",
-    "現在狀況",
-    "現在状态",
-    "模型",
-    "運行",
-    "运行",
     "健康",
     "health",
 )
 _TOOLS_KEYWORDS = (
     "tools",
-    "tool",
     "工具",
     "功能清單",
-    "功能列表",
-    "工具清單",
-    "工具列表",
-    "所有工具",
-    "可用工具",
-    "capabilities",
     "catalog",
+    "capabilities",
 )
 _SCAN_KEYWORDS = (
     "scan",
@@ -242,63 +220,29 @@ _SCAN_KEYWORDS = (
 )
 _WEB_RESEARCH_QUESTION_KEYWORDS = (
     "why",
-    "how come",
-    "what makes",
+    "how",
     "reason",
-    "reasons",
-    "popular",
-    "popularity",
     "為什麼",
-    "爲什麼",
-    "为什么",
     "原因",
-    "人氣",
-    "受歡迎",
-    "受欢迎",
-    "熱門原因",
-    "人気",
     "なぜ",
 )
 _WEB_RESEARCH_SUBJECT_KEYWORDS = (
     "pokemon",
     "pikachu",
-    "pickachu",
-    "charizard",
-    "ptcg",
-    "card",
     "tcg",
-    "weiss",
-    "schwarz",
-    "yugioh",
-    "yu-gi-oh",
-    "union arena",
+    "card",
     "寶可夢",
-    "寶可卡",
-    "卡牌",
-    "カード",
-    "遊戯王",
-    "遊戲王",
-    "ユニオンアリーナ",
+    "卡片",
 )
 _OPPORTUNITY_REMOVE_KEYWORDS = (
     "remove",
     "delete",
-    "dismiss",
-    "hide",
     "not interested",
     "no interest",
-    "ignore",
-    "drop",
-    "移除",
-    "刪除",
-    "删除",
-    "不要",
     "不感興趣",
-    "不感兴趣",
     "沒興趣",
-    "没兴趣",
-    "外して",
-    "削除",
+    "移除",
+    "不要",
     "興味ない",
 )
 _OPPORTUNITY_CONTEXT_KEYWORDS = (
@@ -400,7 +344,7 @@ class TelegramNaturalLanguageRouter:
             "help, status, tools, scan_help, unknown.\n"
             + tool_spec_block +
             "Use lookup_card when the user wants the price, value, or card lookup of one specific card.\n"
-            "Use trend_board when the user asks for hot, trending, liquidity, or ranking cards.\n"
+            "Use trend_board ONLY when the user explicitly asks for a leaderboard / ranking / top-N list of currently hot cards. trend_board returns a static ranking; it does NOT analyse price direction or market sentiment.\n"
             "Use add_watch when the user wants to track/monitor a MERCARI product and be notified below a price threshold.\n"
             "  Set watch_query to the product name/keywords, watch_price_threshold to the integer JPY limit.\n"
             "Use list_watches when the user wants to see the MERCARI watchlist / tracked items (no @ handle, no SNS context).\n"
@@ -408,8 +352,9 @@ class TelegramNaturalLanguageRouter:
             "Use update_watch_price when the user wants to change the price threshold of an existing Mercari watch. Set watch_id and watch_price_threshold.\n"
             "Use reputation_snapshot when the user wants to check a seller's reputation/trust/credit or take a snapshot of a URL.\n"
             "  Set query_url to the URL found in the message (Mercari item or profile URL).\n"
-            "Use web_research when the user asks a general explanatory/news/background question that needs current web sources, "
-            "especially why/how questions about TCG cards, Pokemon cards, popularity, market context, releases, or collector demand.\n"
+            "Use web_research when the user asks about price direction, market sentiment, recent news, "
+            "or any why/how/explanatory question that needs fetching and synthesising external sources "
+            "(e.g. '寶可夢卡是不是在跌', 'why are pokemon cards popular', 'pokemon 市場最近怎麼了').\n"
             "  Set research_query to a concise web search query preserving the user's topic.\n"
             "Use opportunity_remove when the user wants to remove/dismiss a target/candidate from the opportunity/hunt list because they are not interested.\n"
             "  Set opportunity_target to the target number from /hunt status (e.g. '2') or the product name/keywords to remove.\n"
@@ -434,6 +379,8 @@ class TelegramNaturalLanguageRouter:
             "- '追蹤'/'tracking' alone is ambiguous: if it co-occurs with @handle/X/Twitter → SNS; if it co-occurs with a price (円/JPY/万) or Mercari URL → Mercari.\n"
             "- '取消'/'刪除'/'unfollow'/'unwatch' on an @ handle → sns_delete with sns_handle set, NOT remove_watch.\n"
             "- Removing a target/candidate from /hunt status or the opportunity list → opportunity_remove, NOT remove_watch.\n"
+            "- If a message asks about price direction (rising / falling / 漲 / 跌 / 在跌 / 在漲 / 暴跌 / 暴漲 / dropping / soaring) and does NOT explicitly request a ranking, top-N, or leaderboard, it is web_research, not trend_board.\n"
+            "- If the message could plausibly match more than one of the listed intents, return confidence below 0.5 instead of picking confidently. Honest uncertainty beats a confident wrong guess.\n"
             f'Game must be one of "{supported_game_hint()}" or null.\n'
             "Infer pokemon for wording like Pokemon, PTCG, 寶可夢, 寶可卡.\n"
             "Infer ws for wording like Weiss, WS, Weiß Schwarz, ヴァイス.\n"
@@ -456,8 +403,10 @@ class TelegramNaturalLanguageRouter:
             '- "取消追蹤 abc12345" -> remove_watch, watch_id="abc12345"\n'
             '- "把 abc12345 改成 4萬" -> update_watch_price, watch_id="abc12345", watch_price_threshold=40000\n'
             '- "查詢信用 https://jp.mercari.com/item/m12345" -> reputation_snapshot, query_url="https://jp.mercari.com/item/m12345"\n'
-            '- "why pokemon card pickachu card is so popular?" -> web_research, research_query="why Pokemon Pikachu cards are popular"\n'
+            '- "why pokemon Pikachu cards are so popular?" -> web_research, research_query="why Pokemon Pikachu cards are popular"\n'
             '- "為什麼噴火龍寶可夢卡那麼有人氣" -> web_research, research_query="為什麼 噴火龍 寶可夢卡 人氣"\n'
+            '- "幫我查寶可夢卡現在是不是在跌" -> web_research, research_query="Pokemon TCG card market is dropping recent trend"\n'
+            '- "遊戲王最近暴跌" -> web_research, research_query="Yu-Gi-Oh card market crash recent"\n'
             '- "remove target 2 from hunt status" -> opportunity_remove, opportunity_target="2"\n'
             '- "I am not interested in Umbreon ex SAR anymore" -> opportunity_remove, opportunity_target="Umbreon ex SAR"\n'
             '- "機會清單不要ホエルオーex" -> opportunity_remove, opportunity_target="ホエルオーex"\n'
@@ -641,15 +590,7 @@ def fallback_route_telegram_natural_language(text: str) -> TelegramNaturalLangua
     # available for the TCG trend router, where it should return None until a
     # game is provided.
     buzz_keywords = [kw for kw in _SNS_BUZZ_KEYWORDS if kw in lowered]
-    generic_buzz_keywords = {"什麼熱門", "最近熱門"}
-    generic_trend_without_game = (
-        buzz_keywords
-        and all(kw in generic_buzz_keywords for kw in buzz_keywords)
-        and not has_sns_context
-        and _infer_game(content) is None
-        and any(kw in lowered for kw in _TREND_KEYWORDS)
-    )
-    if buzz_keywords and not generic_trend_without_game:
+    if buzz_keywords:
         return TelegramNaturalLanguageIntent(
             intent="sns_buzz",
             sns_buzz_query=_extract_buzz_query(content),
@@ -1100,32 +1041,19 @@ def _extract_opportunity_target(text: str) -> str | None:
         "remove",
         "delete",
         "dismiss",
-        "hide",
-        "ignore",
-        "drop",
         "target",
         "candidate",
         "opportunity",
         "hunt",
         "機會清單",
-        "机会清单",
         "目標清單",
-        "目标清单",
         "候選清單",
-        "候选清单",
         "移除",
         "刪除",
-        "删除",
         "不要",
         "不感興趣",
-        "不感兴趣",
         "沒興趣",
-        "没兴趣",
-        "外して",
-        "削除",
         "興味ない",
-        "リスト",
-        "候補",
     )
     for phrase in phrases:
         cleaned = re.sub(re.escape(phrase), " ", cleaned, flags=re.IGNORECASE)
