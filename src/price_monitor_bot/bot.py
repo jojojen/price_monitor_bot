@@ -773,12 +773,19 @@ class TelegramCommandProcessor:
                     reply="請告訴我要追蹤哪個 X 帳號，例如：追蹤 @elonmusk",
                 )
             handle = intent.sns_handle
-            logger.info("Telegram NL routed intent=sns_add_account handle=%s", handle)
+            include_keywords = tuple(intent.sns_include_keywords)
+            logger.info(
+                "Telegram NL routed intent=sns_add_account handle=%s include_keywords=%s",
+                handle,
+                include_keywords,
+            )
             cid = str(chat_id)
+            filter_suffix = f" {json.dumps(list(include_keywords), ensure_ascii=False)}" if include_keywords else ""
+            ack_suffix = f" 並加上篩選 {', '.join(include_keywords)}" if include_keywords else ""
             return TelegramTextReplyPlan(
-                ack=f"已理解：相當於 /snsadd @{handle}，正在新增 X 追蹤…",
+                ack=f"已理解：相當於 /snsadd @{handle}{filter_suffix}，正在新增 X 追蹤{ack_suffix}…",
                 reply=None,
-                reply_factory=lambda h=handle, c=cid: self._handle_sns_add(f"@{h}", c),
+                reply_factory=lambda h=handle, c=cid, s=filter_suffix: self._handle_sns_add(f"@{h}{s}", c),
             )
         if intent.intent == "sns_add_keyword":
             if not intent.sns_keyword:
@@ -827,32 +834,46 @@ class TelegramCommandProcessor:
         """Handle /snsadd command to add an X (Twitter) account, keyword, or trend watch."""
         if self._sns_db is None:
             return "SNS 監控尚未啟用（sns_db 未設定）。"
+        from sns_monitor.filters import parse_account_watch_text
         from sns_monitor.models import AccountWatch, KeywordWatch, TrendWatch
         from sns_monitor.storage import SnsDatabase
 
         try:
             raw = raw.strip()
             if not raw:
-                return "用法：/snsadd @username 或 /snsadd keyword:搜尋詞 或 /snsadd trend:trending"
+                return '用法：/snsadd @username 或 /snsadd @username ["buy", "sell"] 或 /snsadd keyword:搜尋詞 或 /snsadd trend:trending'
 
-            # Parse: "@username" or "keyword:xxx" or "trend:xxx"
-            if raw.startswith("@"):
+            # Parse: "@username [filters]" or "keyword:xxx" or "trend:xxx"
+            account_target = parse_account_watch_text(raw)
+            if account_target is not None:
                 # Account watch
-                screen_name = raw.lstrip("@").split()[0]
+                screen_name, include_keywords = account_target
                 rule_id = SnsDatabase._watch_rule_id("account", screen_name)
+                existing_rule = self._sns_db.get_watch_rule(rule_id)
                 rule = AccountWatch(
                     rule_id=rule_id,
                     screen_name=screen_name,
-                    user_id=None,
-                    label=f"@{screen_name}",
+                    user_id=getattr(existing_rule, "user_id", None),
+                    label=getattr(existing_rule, "label", None) or f"@{screen_name}",
+                    include_keywords=include_keywords,
                     enabled=True,
                     schedule_minutes=15,
                     chat_id=chat_id,
-                    last_checked_at=None,
+                    last_checked_at=getattr(existing_rule, "last_checked_at", None),
                 )
                 self._sns_db.save_watch_rule(rule)
-                logger.info("SNS account watch added screen_name=%s chat_id=%s", screen_name, chat_id)
-                return f"✓ 已新增 X 帳號追蹤：@{screen_name}\nID: {rule_id[:8]}…"
+                logger.info(
+                    "SNS account watch added screen_name=%s chat_id=%s include_keywords=%s",
+                    screen_name,
+                    chat_id,
+                    include_keywords,
+                )
+                filter_line = (
+                    f"\n篩選：{', '.join(include_keywords)}"
+                    if include_keywords
+                    else ""
+                )
+                return f"✓ 已新增 X 帳號追蹤：@{screen_name}{filter_line}\nID: {rule_id[:8]}…"
             elif raw.startswith("keyword:"):
                 # Keyword watch
                 query = raw[8:].strip()
@@ -890,7 +911,7 @@ class TelegramCommandProcessor:
                 logger.info("SNS trend watch added category=%s chat_id=%s", category, chat_id)
                 return f"✓ 已新增 X 熱門話題追蹤：{category}\nID: {rule_id[:8]}…"
             else:
-                return "不認識的格式。用法：/snsadd @username 或 /snsadd keyword:搜尋詞 或 /snsadd trend:trending"
+                return '不認識的格式。用法：/snsadd @username 或 /snsadd @username ["buy", "sell"] 或 /snsadd keyword:搜尋詞 或 /snsadd trend:trending'
         except Exception as exc:
             logger.exception("SNS add failed raw=%s chat_id=%s", raw, chat_id)
             return f"新增失敗：{exc}"
@@ -908,7 +929,8 @@ class TelegramCommandProcessor:
             for rule in rules:
                 status = "✓" if rule.enabled else "✗"
                 if rule.__class__.__name__ == "AccountWatch":
-                    info = f"@{rule.screen_name}"
+                    filters = f" [{', '.join(rule.include_keywords)}]" if rule.include_keywords else ""
+                    info = f"@{rule.screen_name}{filters}"
                 elif rule.__class__.__name__ == "KeywordWatch":
                     info = f'"{rule.query}"'
                 elif rule.__class__.__name__ == "TrendWatch":
@@ -996,7 +1018,9 @@ class TelegramCommandProcessor:
                 continue
             screen_name = getattr(rule, "screen_name", None)
             if screen_name:
-                return f"@{screen_name}"
+                include_keywords = getattr(rule, "include_keywords", ())
+                filters = f" [{', '.join(include_keywords)}]" if include_keywords else ""
+                return f"@{screen_name}{filters}"
             query = getattr(rule, "query", None)
             if query:
                 return f"關鍵字「{query}」"
@@ -1023,11 +1047,9 @@ class TelegramCommandProcessor:
             except Exception:
                 logger.exception("Telegram natural-language router failed, falling back to keyword rules text=%s", trim_for_log(text, limit=240))
             else:
-                # LLM responded successfully — trust its answer, even if "unknown"
                 if intent is not None and intent.intent != "unknown":
                     return intent
-                logger.debug("Telegram natural-language LLM returned unknown, not overriding with keyword rules")
-                return None
+                logger.debug("Telegram natural-language LLM returned unknown; trying keyword fallback")
 
         # LLM not configured, or LLM threw an exception — use keyword fallback as last resort
         fallback_intent = fallback_route_telegram_natural_language(text)
@@ -1073,6 +1095,7 @@ class TelegramCommandProcessor:
                 "/setprice <ID> <新價格>",
                 "--- SNS (X/Twitter) 監控 ---",
                 "/snsadd @username",
+                '/snsadd @username ["buy", "sell"]',
                 "/snsadd keyword:搜詞",
                 "/snsadd trend:trending",
                 "/snslist",

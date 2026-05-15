@@ -43,11 +43,18 @@ _ROUTER_JSON_SCHEMA = {
         "sns_handle": {"type": ["string", "null"]},
         "sns_keyword": {"type": ["string", "null"]},
         "sns_buzz_query": {"type": ["string", "null"]},
+        "sns_include_keywords": {
+            "anyOf": [
+                {"type": "array", "items": {"type": "string"}},
+                {"type": "string"},
+                {"type": "null"},
+            ]
+        },
     },
     "required": [
         "intent", "game", "name", "card_number", "rarity", "set_code", "limit", "confidence",
         "watch_query", "watch_price_threshold", "watch_id", "query_url", "research_query", "opportunity_target",
-        "sns_handle", "sns_keyword", "sns_buzz_query",
+        "sns_handle", "sns_keyword", "sns_buzz_query", "sns_include_keywords",
     ],
     "additionalProperties": False,
 }
@@ -143,7 +150,45 @@ _SNS_BUZZ_KEYWORDS = (
     "buzz",
     "topic digest",
 )
+_SNS_FILTER_HINT_KEYWORDS = (
+    "篩選",
+    "过滤",
+    "過濾",
+    "filter",
+    "filters",
+    "keyword",
+    "keywords",
+    "關鍵字",
+    "关键词",
+    "加上",
+    "加入",
+    "只看",
+    "只通知",
+    "包含",
+    "提到",
+)
 _X_HANDLE_RE = re.compile(r"@([a-zA-Z0-9_]{1,15})")
+_SNS_FILTER_BRACKET_RE = re.compile(r"[\[\(]([^\]\)]+)[\]\)]")
+_SNS_FILTER_NORMALIZATION_TABLE = str.maketrans({
+    "［": "[",
+    "］": "]",
+    "【": "[",
+    "】": "]",
+    "（": "(",
+    "）": ")",
+    "，": ",",
+    "、": ",",
+    "：": ":",
+    "；": ";",
+    "「": '"',
+    "」": '"',
+    "『": '"',
+    "』": '"',
+    "“": '"',
+    "”": '"',
+    "‘": "'",
+    "’": "'",
+})
 _REPUTATION_KEYWORDS = (
     "信用",
     "信譽",
@@ -303,6 +348,7 @@ class TelegramNaturalLanguageIntent:
     sns_handle: str | None = None       # for sns_add_account / sns_delete (@username)
     sns_keyword: str | None = None      # for sns_add_keyword (keyword watch)
     sns_buzz_query: str | None = None   # for sns_buzz (LLM topic digest)
+    sns_include_keywords: tuple[str, ...] = ()
 
 
 class TelegramNaturalLanguageRouter:
@@ -369,6 +415,7 @@ class TelegramNaturalLanguageRouter:
             "  Set opportunity_target to the target number from /hunt status (e.g. '2') or the product name/keywords to remove.\n"
             "Use sns_add_account when the user wants to ADD / track / monitor an X (Twitter) account that starts with @.\n"
             "  Set sns_handle to the @username (without the @).\n"
+            "  If the user wants only tweets mentioning certain words, also set sns_include_keywords to those filter keywords.\n"
             "Use sns_add_keyword when the user wants to add an X keyword/topic watch (not an @ account).\n"
             "  Set sns_keyword to the keyword phrase.\n"
             "Use sns_list when the user wants to see the SNS / X / Twitter watch rules (NOT the Mercari watchlist).\n"
@@ -416,6 +463,7 @@ class TelegramNaturalLanguageRouter:
             '- "機會清單不要ホエルオーex" -> opportunity_remove, opportunity_target="ホエルオーex"\n'
             '- "追蹤 @elonmusk" -> sns_add_account, sns_handle="elonmusk"\n'
             '- "新增 X 監控 @aka_claw" -> sns_add_account, sns_handle="aka_claw"\n'
+            '- "幫我把 @tenbai_hakase 加上 [抽選] 篩選" -> sns_add_account, sns_handle="tenbai_hakase", sns_include_keywords=["抽選"]\n'
             '- "刪除追蹤 @elonmusk" -> sns_delete, sns_handle="elonmusk"\n'
             '- "取消追蹤 @aka_claw" -> sns_delete, sns_handle="aka_claw"\n'
             '- "unfollow @elonmusk" -> sns_delete, sns_handle="elonmusk"\n'
@@ -608,12 +656,15 @@ def fallback_route_telegram_natural_language(text: str) -> TelegramNaturalLangua
             confidence=0.6,
         )
 
-    # sns_add_account: track/monitor with @handle
-    if handle_match and any(kw in lowered for kw in _WATCH_ADD_KEYWORDS):
+    sns_include_keywords = _extract_sns_include_keywords(content)
+
+    # sns_add_account: track/monitor with @handle, including filter updates
+    if handle_match and (any(kw in lowered for kw in _WATCH_ADD_KEYWORDS) or sns_include_keywords):
         return TelegramNaturalLanguageIntent(
             intent="sns_add_account",
             sns_handle=handle_match.group(1),
-            confidence=0.8,
+            sns_include_keywords=sns_include_keywords,
+            confidence=0.85 if sns_include_keywords else 0.8,
         )
 
     # ── Opportunity agent controls (must run before Mercari watch removal) ────
@@ -832,6 +883,7 @@ def _normalize_intent(payload: dict[str, object]) -> TelegramNaturalLanguageInte
     sns_handle = _normalize_handle(payload.get("sns_handle"))
     sns_keyword = _normalize_text_field(payload.get("sns_keyword"))
     sns_buzz_query = _normalize_text_field(payload.get("sns_buzz_query"))
+    sns_include_keywords = _normalize_sns_include_keywords(payload.get("sns_include_keywords"))
 
     if intent == "trend_board" and limit is None:
         limit = 5
@@ -859,7 +911,61 @@ def _normalize_intent(payload: dict[str, object]) -> TelegramNaturalLanguageInte
         sns_handle=sns_handle,
         sns_keyword=sns_keyword,
         sns_buzz_query=sns_buzz_query,
+        sns_include_keywords=sns_include_keywords,
     )
+
+
+def _normalize_sns_include_keywords(value: object) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return _normalize_keyword_values([value])
+    if isinstance(value, list):
+        return _normalize_keyword_values([item for item in value if isinstance(item, str)])
+    return ()
+
+
+def _extract_sns_include_keywords(text: str) -> tuple[str, ...]:
+    standardized = text.translate(_SNS_FILTER_NORMALIZATION_TABLE)
+    if not any(keyword in standardized.lower() for keyword in _SNS_FILTER_HINT_KEYWORDS) and not _SNS_FILTER_BRACKET_RE.search(standardized):
+        return ()
+
+    values: list[str] = []
+    for match in _SNS_FILTER_BRACKET_RE.findall(standardized):
+        values.extend(_split_keyword_phrase(match))
+
+    if values:
+        return _normalize_keyword_values(values)
+
+    without_handle = _X_HANDLE_RE.sub(" ", standardized)
+    without_noise = without_handle
+    for token in _SNS_FILTER_HINT_KEYWORDS:
+        without_noise = re.sub(re.escape(token), " ", without_noise, flags=re.IGNORECASE)
+    return _normalize_keyword_values(_split_keyword_phrase(without_noise))
+
+
+def _normalize_keyword_values(values: list[str]) -> tuple[str, ...]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        cleaned = " ".join(value.strip().strip("\"'").split())
+        if not cleaned:
+            continue
+        lowered = cleaned.casefold()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        normalized.append(cleaned)
+    return tuple(normalized)
+
+
+def _split_keyword_phrase(value: str) -> list[str]:
+    cleaned = value.strip()
+    if not cleaned:
+        return []
+    if "," in cleaned:
+        return [part for part in cleaned.split(",")]
+    return [part for part in cleaned.split() if part]
 
 
 _RARITY_TOKEN_RE = re.compile(
