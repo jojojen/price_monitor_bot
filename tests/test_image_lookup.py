@@ -221,6 +221,22 @@ def test_parse_tcg_ocr_text_detects_pokemon_sealed_box() -> None:
     assert parsed.set_code == "sv2a"
 
 
+def test_parse_tcg_ocr_text_respects_card_item_kind_hint() -> None:
+    raw_text = "\n".join(
+        [
+            "ポケモンカードゲーム スカーレット&バイオレット",
+            "強化拡張パック",
+            "ポケモンカード151",
+            "ランダム7枚入り",
+            "SV2a",
+        ]
+    )
+
+    parsed = parse_tcg_ocr_text(raw_text, game_hint="pokemon", item_kind_hint="card")
+
+    assert parsed.item_kind == "card"
+
+
 def test_parse_tcg_ocr_text_rejects_gibberish_sealed_box_title() -> None:
     raw_text = "\n".join(
         [
@@ -966,6 +982,60 @@ def test_parse_image_escalates_when_first_local_vision_candidate_looks_slab_deri
     assert any("Applied local vision fallback via ollama:gemma3:12b." in warning for warning in parsed.warnings)
 
 
+def test_parse_image_respects_card_item_kind_hint_even_with_sealed_box_local_vision(monkeypatch, tmp_path) -> None:
+    service = TcgImagePriceService(
+        db_path=tmp_path / "monitor.sqlite3",
+        tesseract_path=str(tmp_path / "tesseract.exe"),
+    )
+    service._tesseract_path = "tesseract"
+    image_path = tmp_path / "sample.jpg"
+    image_path.write_bytes(b"stub")
+    monkeypatch.setattr(
+        service,
+        "_extract_text",
+        lambda _image_path: (
+            "\n".join(
+                [
+                    "ポケモンカードゲーム スカーレット&バイオレット",
+                    "強化拡張パック",
+                    "ポケモンカード151",
+                    "ランダム7枚入り",
+                ]
+            ),
+            (),
+        ),
+    )
+
+    class StubVisionClient:
+        descriptor = "ollama:gemma3:12b"
+
+        def analyze_card_image(
+            self,
+            image_path: Path,
+            *,
+            game_hint: str | None = None,
+            title_hint: str | None = None,
+        ) -> LocalVisionCardCandidate:
+            return LocalVisionCardCandidate(
+                backend="ollama",
+                model="gemma3:12b",
+                game="pokemon",
+                title="強化拡張パック ポケモンカード151",
+                aliases=(),
+                card_number=None,
+                rarity=None,
+                set_code="sv2a",
+                item_kind="sealed_box",
+                confidence=0.98,
+            )
+
+    service._local_vision_clients = (StubVisionClient(),)
+
+    parsed = service.parse_image(image_path, game_hint="pokemon", item_kind_hint="card")
+
+    assert parsed.item_kind == "card"
+
+
 def test_parse_image_uses_sealed_box_title_probe_when_box_title_is_weak(monkeypatch, tmp_path) -> None:
     image_path = tmp_path / "telegram-upload-box.jpg"
     image_path.write_bytes(b"fake-image")
@@ -1225,4 +1295,3 @@ def test_prepare_lookup_spec_repairs_wrong_card_number_using_slab_number(monkeyp
     assert spec.title == "メガリザードンXex"
     assert spec.card_number == "110/080"
     assert resolved_parsed.card_number == "110/080"
-

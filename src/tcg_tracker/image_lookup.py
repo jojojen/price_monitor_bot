@@ -198,6 +198,7 @@ class TcgImagePriceService:
         caption: str | None = None,
         game_hint: str | None = None,
         title_hint: str | None = None,
+        item_kind_hint: str | None = None,
         persist: bool = False,
     ) -> TcgImageLookupOutcome:
         parsed = self.parse_image(
@@ -205,6 +206,7 @@ class TcgImagePriceService:
             caption=caption,
             game_hint=game_hint,
             title_hint=title_hint,
+            item_kind_hint=item_kind_hint,
         )
         parsed, spec = self._prepare_lookup_spec(parsed)
         if parsed.status in {"unavailable", "unresolved"} or spec is None:
@@ -239,6 +241,7 @@ class TcgImagePriceService:
         caption: str | None = None,
         game_hint: str | None = None,
         title_hint: str | None = None,
+        item_kind_hint: str | None = None,
     ) -> ParsedCardImage:
         resolved_path = Path(image_path)
         hint_game, hint_title = parse_image_caption_hints(caption)
@@ -276,6 +279,7 @@ class TcgImagePriceService:
             raw_text,
             game_hint=resolved_game_hint,
             title_hint=resolved_title_hint,
+            item_kind_hint=item_kind_hint,
         )
         if path_title_hint:
             parsed = _merge_path_title_hint(parsed, path_title_hint)
@@ -286,6 +290,7 @@ class TcgImagePriceService:
                 game_hint=parsed.game or resolved_game_hint,
                 title_hint=resolved_title_hint,
                 parsed=parsed,
+                item_kind_hint=item_kind_hint,
             )
             warnings.extend(vision_warnings)
             if vision_candidate is not None:
@@ -334,6 +339,7 @@ class TcgImagePriceService:
         game_hint: str | None,
         title_hint: str | None,
         parsed: ParsedCardImage,
+        item_kind_hint: str | None,
     ) -> tuple[LocalVisionCardCandidate | None, tuple[str, ...]]:
         if not self._local_vision_clients:
             return None, ()
@@ -409,9 +415,10 @@ class TcgImagePriceService:
 
             if candidate is not None:
                 candidate = _sanitize_local_vision_candidate(candidate)
+                candidate = _apply_item_kind_hint_to_local_vision_candidate(candidate, item_kind_hint)
 
             box_title_candidate = None
-            if self._should_try_sealed_box_title_probe(parsed, candidate):
+            if self._should_try_sealed_box_title_probe(parsed, candidate, item_kind_hint=item_kind_hint):
                 box_title_candidate, box_title_warnings = self._run_sealed_box_title_probe(
                     client,
                     image_path,
@@ -507,7 +514,13 @@ class TcgImagePriceService:
         self,
         parsed: ParsedCardImage,
         candidate: LocalVisionCardCandidate | None,
+        *,
+        item_kind_hint: str | None = None,
     ) -> bool:
+        if item_kind_hint == "card":
+            return False
+        if item_kind_hint == "sealed_box":
+            return True
         if parsed.item_kind != "sealed_box" and (candidate is None or candidate.item_kind != "sealed_box"):
             return False
         if _sealed_box_title_looks_usable(parsed.title):
@@ -1027,6 +1040,7 @@ def parse_tcg_ocr_text(
     *,
     game_hint: str | None = None,
     title_hint: str | None = None,
+    item_kind_hint: str | None = None,
 ) -> ParsedCardImage:
     normalized_text = unicodedata.normalize("NFKC", raw_text or "")
     lines = _split_ocr_lines(normalized_text)
@@ -1048,7 +1062,12 @@ def parse_tcg_ocr_text(
         else slab_title or english_name or preferred_name
     )
     sanitized_title_hint = _sanitize_image_title_hint(title_hint)
-    if _looks_like_sealed_box_image(normalized_text, lines, card_number=card_number):
+    if _looks_like_sealed_box_image(
+        normalized_text,
+        lines,
+        card_number=card_number,
+        item_kind_hint=item_kind_hint,
+    ):
         item_kind = "sealed_box"
         rarity = None
         card_number = None
@@ -1097,7 +1116,12 @@ def _looks_like_sealed_box_image(
     lines: list[str],
     *,
     card_number: str | None,
+    item_kind_hint: str | None = None,
 ) -> bool:
+    if item_kind_hint == "card":
+        return False
+    if item_kind_hint == "sealed_box":
+        return True
     if card_number is not None:
         return False
 
@@ -1956,6 +1980,19 @@ def _merge_local_vision_candidate(
         item_kind=parsed.item_kind,
         warnings=tuple(warnings),
     )
+
+
+def _apply_item_kind_hint_to_local_vision_candidate(
+    candidate: LocalVisionCardCandidate,
+    item_kind_hint: str | None,
+) -> LocalVisionCardCandidate:
+    if item_kind_hint not in {"card", "sealed_box"}:
+        return candidate
+    if candidate.item_kind == item_kind_hint:
+        return candidate
+    if item_kind_hint == "card":
+        return replace(candidate, item_kind="card")
+    return replace(candidate, item_kind="sealed_box")
 
 
 def _select_best_local_vision_candidate(

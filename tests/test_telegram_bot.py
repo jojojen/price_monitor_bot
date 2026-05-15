@@ -17,11 +17,16 @@ from price_monitor_bot.natural_language import (
     fallback_route_telegram_natural_language,
 )
 from price_monitor_bot.bot import (
+    PendingTelegramPhotoClarification,
+    PendingTelegramTextClarification,
     TelegramCommandProcessor,
     TelegramFileAttachment,
+    TelegramPhotoIntentAnalysis,
+    TelegramPhotoIntentOption,
     TelegramLookupQuery,
     TelegramReputationQuery,
     TelegramReputationDelivery,
+    TelegramTextIntentOption,
     build_processing_ack,
     format_liquidity_board,
     format_photo_lookup_result,
@@ -104,6 +109,24 @@ class StubNaturalLanguageRouter:
     def route(self, text: str) -> TelegramNaturalLanguageIntent | None:
         self.seen_texts.append(text)
         return self.intent
+
+
+def _ambiguous_photo_analysis(
+    *,
+    parsed_game: str | None = "pokemon",
+    parsed_item_kind: str | None = "card",
+    parsed_title: str | None = None,
+) -> TelegramPhotoIntentAnalysis:
+    return TelegramPhotoIntentAnalysis(
+        options=(
+            TelegramPhotoIntentOption(1, "pokemon_card_price", "要我查這張寶可夢卡市價嗎？", "/scan pokemon"),
+            TelegramPhotoIntentOption(2, "yugioh_card_price", "要我查這張遊戲王卡市價嗎？", "/scan yugioh"),
+            TelegramPhotoIntentOption(3, "pokemon_box_price", "要我查這個寶可夢卡盒市價嗎？", "/scan pokemon"),
+        ),
+        parsed_game=parsed_game,
+        parsed_item_kind=parsed_item_kind,
+        parsed_title=parsed_title,
+    )
 
 
 def test_parse_lookup_command_supports_pipe_format() -> None:
@@ -414,6 +437,296 @@ def test_handle_telegram_message_ignores_generic_price_caption_as_title_hint() -
         build_processing_ack(has_photo=True),
         "photo:None:None:.jpg",
     )
+
+
+def test_handle_telegram_message_clarifies_image_without_caption() -> None:
+    sample_path = get_image_lookup_live_case("pokemon-pikachu-partial-s40").image_path
+    client = FakeTelegramClient(sample_path=sample_path)
+    processor = TelegramCommandProcessor(
+        allowed_chat_ids=frozenset({"123"}),
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        photo_intent_analyzer=lambda query: _ambiguous_photo_analysis(parsed_title="Pikachu ex"),
+    )
+
+    replies = handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: "unused",
+        message={
+            "chat": {"id": "123"},
+            "photo": [{"file_id": "photo-1", "file_size": 128}],
+        },
+    )
+
+    assert len(replies) == 1
+    assert "請回覆數字" in replies[0]
+    assert "1. 要我查這張寶可夢卡市價嗎？" in replies[0]
+    assert "4. 都不是，請回答：否，[您的意圖]" in replies[0]
+    assert client.sent_messages == list(replies)
+
+
+def test_handle_telegram_message_uses_explicit_price_caption_without_clarifying() -> None:
+    sample_path = get_image_lookup_live_case("pokemon-pikachu-partial-s40").image_path
+    client = FakeTelegramClient(sample_path=sample_path)
+
+    def analyzer(query):
+        raise AssertionError("photo intent analyzer should not run for explicit price captions")
+
+    processor = TelegramCommandProcessor(
+        allowed_chat_ids=frozenset({"123"}),
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        photo_intent_analyzer=analyzer,
+    )
+
+    replies = handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: f"photo:{query.game_hint}:{query.title_hint}",
+        message={
+            "chat": {"id": "123"},
+            "photo": [{"file_id": "photo-1", "file_size": 128}],
+            "caption": "查這張寶可夢卡市價",
+        },
+    )
+
+    assert replies == (
+        build_processing_ack(has_photo=True),
+        "photo:pokemon:None",
+    )
+
+
+def test_handle_telegram_message_runs_selected_photo_option_after_clarification() -> None:
+    sample_path = get_image_lookup_live_case("pokemon-pikachu-partial-s40").image_path
+    client = FakeTelegramClient(sample_path=sample_path)
+    processor = TelegramCommandProcessor(
+        allowed_chat_ids=frozenset({"123"}),
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        photo_intent_analyzer=lambda query: _ambiguous_photo_analysis(),
+    )
+
+    handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: "unused",
+        message={
+            "chat": {"id": "123"},
+            "photo": [{"file_id": "photo-1", "file_size": 128}],
+        },
+    )
+    replies = handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: f"resolved:{query.caption}:{query.game_hint}",
+        message={
+            "chat": {"id": "123"},
+            "text": "1",
+        },
+    )
+
+    assert replies == (
+        "收到，我就照第 1 個方式處理。",
+        "resolved:/scan pokemon:pokemon",
+    )
+
+
+def test_handle_telegram_message_supports_photo_override_text() -> None:
+    sample_path = get_image_lookup_live_case("pokemon-pikachu-partial-s40").image_path
+    client = FakeTelegramClient(sample_path=sample_path)
+    processor = TelegramCommandProcessor(
+        allowed_chat_ids=frozenset({"123"}),
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        photo_intent_analyzer=lambda query: _ambiguous_photo_analysis(),
+    )
+
+    handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: "unused",
+        message={
+            "chat": {"id": "123"},
+            "photo": [{"file_id": "photo-1", "file_size": 128}],
+        },
+    )
+    replies = handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: f"resolved:{query.caption}:{query.game_hint}:{query.item_kind_hint}",
+        message={
+            "chat": {"id": "123"},
+            "text": "否，查這張遊戲王卡市價",
+        },
+    )
+
+    assert replies == (
+        "收到，我改照你補充的意思處理：查這張遊戲王卡市價",
+        "resolved:/scan yugioh:yugioh:card",
+    )
+
+
+def test_handle_telegram_message_card_selection_overrides_box_guess() -> None:
+    sample_path = get_image_lookup_live_case("pokemon-pikachu-partial-s40").image_path
+    client = FakeTelegramClient(sample_path=sample_path)
+    processor = TelegramCommandProcessor(
+        allowed_chat_ids=frozenset({"123"}),
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        photo_intent_analyzer=lambda query: _ambiguous_photo_analysis(parsed_item_kind="sealed_box"),
+    )
+
+    handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: "unused",
+        message={"chat": {"id": "123"}, "photo": [{"file_id": "photo-1", "file_size": 128}]},
+    )
+    replies = handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: f"resolved:{query.caption}:{query.game_hint}:{query.item_kind_hint}",
+        message={"chat": {"id": "123"}, "text": "2"},
+    )
+
+    assert replies == (
+        "收到，我就照第 2 個方式處理。",
+        "resolved:/scan yugioh:yugioh:card",
+    )
+
+
+def test_handle_telegram_message_supports_photo_identify_override() -> None:
+    sample_path = get_image_lookup_live_case("pokemon-pikachu-partial-s40").image_path
+    client = FakeTelegramClient(sample_path=sample_path)
+    processor = TelegramCommandProcessor(
+        allowed_chat_ids=frozenset({"123"}),
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        photo_intent_analyzer=lambda query: _ambiguous_photo_analysis(
+            parsed_game="pokemon",
+            parsed_item_kind="sealed_box",
+            parsed_title="ポケモンカード151",
+        ),
+    )
+
+    handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: "unused",
+        message={
+            "chat": {"id": "123"},
+            "photo": [{"file_id": "photo-1", "file_size": 128}],
+        },
+    )
+    replies = handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: "unused",
+        message={
+            "chat": {"id": "123"},
+            "text": "否，這是什麼",
+        },
+    )
+
+    assert replies == ("我目前看起來比較像 寶可夢卡盒：ポケモンカード151",)
+    assert processor.get_pending_photo_clarification("123") is None
+
+
+def test_handle_telegram_message_reminds_when_photo_clarification_reply_is_unrecognized() -> None:
+    sample_path = get_image_lookup_live_case("pokemon-pikachu-partial-s40").image_path
+    client = FakeTelegramClient(sample_path=sample_path)
+    processor = TelegramCommandProcessor(
+        allowed_chat_ids=frozenset({"123"}),
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        photo_intent_analyzer=lambda query: _ambiguous_photo_analysis(),
+    )
+
+    handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: "unused",
+        message={
+            "chat": {"id": "123"},
+            "photo": [{"file_id": "photo-1", "file_size": 128}],
+        },
+    )
+    replies = handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: "unused",
+        message={
+            "chat": {"id": "123"},
+            "text": "蛤",
+        },
+    )
+
+    assert len(replies) == 1
+    assert "我現在在等你確認這張圖要怎麼處理" in replies[0]
+    assert "1. 要我查這張寶可夢卡市價嗎？" in replies[0]
+
+
+def test_handle_telegram_message_requests_override_when_other_option_is_selected() -> None:
+    sample_path = get_image_lookup_live_case("pokemon-pikachu-partial-s40").image_path
+    client = FakeTelegramClient(sample_path=sample_path)
+    processor = TelegramCommandProcessor(
+        allowed_chat_ids=frozenset({"123"}),
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        photo_intent_analyzer=lambda query: _ambiguous_photo_analysis(),
+    )
+
+    handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: "unused",
+        message={
+            "chat": {"id": "123"},
+            "photo": [{"file_id": "photo-1", "file_size": 128}],
+        },
+    )
+    replies = handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: "unused",
+        message={
+            "chat": {"id": "123"},
+            "text": "4",
+        },
+    )
+
+    assert replies == ("好，請直接回答：否，[您的意圖]",)
+
+
+def test_pending_photo_clarification_expires(tmp_path: Path) -> None:
+    sample_path = tmp_path / "pending.jpg"
+    sample_path.write_bytes(b"stub")
+    processor = TelegramCommandProcessor(
+        allowed_chat_ids=frozenset({"123"}),
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+    )
+    processor.set_pending_photo_clarification(
+        PendingTelegramPhotoClarification(
+            chat_id="123",
+            image_path=sample_path,
+            caption=None,
+            file_id="photo-1",
+            options=_ambiguous_photo_analysis().options,
+            created_at=0.0,
+        )
+    )
+    assert processor.get_pending_photo_clarification("123") is None
 
 
 def test_handle_telegram_message_sends_snapshot_ack_then_result(tmp_path: Path) -> None:
@@ -831,3 +1144,205 @@ def test_fallback_router_preserves_union_arena_card_number_in_name() -> None:
     assert intent.name == "綾波レイ"
     # `ua` must no longer be stripped out of the card-number prefix
     assert "pr/eva" not in intent.name.lower()
+
+
+# ─── Text intent clarification (mirrors the photo flow) ───────────────────────
+
+
+def _make_clarifying_processor(
+    router_intent: TelegramNaturalLanguageIntent | None,
+    *,
+    research_renderer=lambda q: f"research:{q.query}",
+    lookup_renderer=lambda q: f"lookup:{q.game}:{q.name}",
+) -> TelegramCommandProcessor:
+    return TelegramCommandProcessor(
+        allowed_chat_ids=frozenset({"123"}),
+        lookup_renderer=lookup_renderer,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        research_renderer=research_renderer,
+        natural_language_router=StubNaturalLanguageRouter(router_intent),
+    )
+
+
+def test_handle_telegram_message_clarifies_when_intent_is_unknown() -> None:
+    # Stub returns unknown — _route_natural_language filters that out and the
+    # fallback rules also return None for this neutral text, so the processor
+    # must fall back to the clarification flow rather than the generic
+    # "Unknown command" reply.
+    client = FakeTelegramClient()
+    processor = _make_clarifying_processor(
+        TelegramNaturalLanguageIntent(intent="unknown", confidence=0.1),
+    )
+
+    replies = handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: "unused",
+        message={"chat": {"id": "123"}, "text": "今天心情很差"},
+    )
+
+    assert len(replies) == 1
+    assert "請回覆數字" in replies[0]
+    # Falls back to /search + /help options when nothing else fits.
+    assert "上網搜尋" in replies[0]
+    assert "/help" in replies[0]
+    assert "都不是，請回答：否，[您的意圖]" in replies[0]
+    assert processor.get_pending_text_clarification("123") is not None
+
+
+def test_handle_telegram_message_clarifies_when_intent_confidence_is_low() -> None:
+    # Confidence below the 0.55 threshold should trigger clarification even
+    # when the LLM has a guess — exactly the "don't guess silently" rule that
+    # already applies on the photo side.
+    client = FakeTelegramClient()
+    low_conf_intent = TelegramNaturalLanguageIntent(
+        intent="web_research",
+        research_query="why are pokemon cards popular",
+        confidence=0.4,
+    )
+    processor = _make_clarifying_processor(low_conf_intent)
+
+    replies = handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: "unused",
+        message={"chat": {"id": "123"}, "text": "why are pokemon cards popular"},
+    )
+
+    assert len(replies) == 1
+    reply = replies[0]
+    assert "請回覆數字" in reply
+    # The LLM's top guess shows up first.
+    assert "1. 上網搜尋" in reply
+    # Game keyword "pokemon" added a /price alternative.
+    assert "/price" in reply
+    pending = processor.get_pending_text_clarification("123")
+    assert pending is not None
+    assert pending.original_text == "why are pokemon cards popular"
+    assert pending.options[0].intent.intent == "web_research"
+
+
+def test_handle_telegram_message_runs_selected_text_option_after_clarification() -> None:
+    client = FakeTelegramClient()
+    research_calls: list[str] = []
+
+    def research_renderer(query):
+        research_calls.append(query.query)
+        return f"web:{query.query}"
+
+    processor = _make_clarifying_processor(
+        TelegramNaturalLanguageIntent(intent="unknown", confidence=0.1),
+        research_renderer=research_renderer,
+    )
+
+    # Step 1: trigger the clarification options.
+    handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: "unused",
+        message={"chat": {"id": "123"}, "text": "ありがとう"},
+    )
+    pending = processor.get_pending_text_clarification("123")
+    assert pending is not None
+    # Find which option is web_research so we exercise the right number.
+    web_option = next(
+        opt for opt in pending.options if opt.intent.intent == "web_research"
+    )
+
+    # Step 2: reply with that option number.
+    replies = handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: "unused",
+        message={"chat": {"id": "123"}, "text": str(web_option.option_number)},
+    )
+
+    assert any(
+        reply.startswith(f"收到，我就照第 {web_option.option_number} 個方式處理。")
+        for reply in replies
+    )
+    assert research_calls == ["ありがとう"]
+    assert "web:ありがとう" in replies[-1]
+    # Pending state must be consumed after a successful selection.
+    assert processor.get_pending_text_clarification("123") is None
+
+
+def test_handle_telegram_message_text_clarification_other_option_requests_override() -> None:
+    client = FakeTelegramClient()
+    processor = _make_clarifying_processor(
+        TelegramNaturalLanguageIntent(intent="unknown", confidence=0.1),
+    )
+
+    handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: "unused",
+        message={"chat": {"id": "123"}, "text": "在嗎"},
+    )
+    pending = processor.get_pending_text_clarification("123")
+    assert pending is not None
+    sentinel = len(pending.options) + 1
+
+    replies = handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: "unused",
+        message={"chat": {"id": "123"}, "text": str(sentinel)},
+    )
+
+    assert replies == ("好，請直接回答：否，[您的意圖]",)
+    # Pending state remains so the follow-up "否，..." can be matched.
+    assert processor.get_pending_text_clarification("123") is not None
+
+
+def test_handle_telegram_message_text_clarification_override_reroutes_through_router() -> None:
+    client = FakeTelegramClient()
+    captured: list[TelegramLookupQuery] = []
+
+    def lookup_renderer(query):
+        captured.append(query)
+        return f"lookup:{query.game}:{query.name}"
+
+    # The first message is unknown; the override text "查 pokemon Pikachu ex"
+    # then comes back through the router and gets a confident lookup intent.
+    router = StubNaturalLanguageRouter(
+        TelegramNaturalLanguageIntent(intent="unknown", confidence=0.1)
+    )
+    processor = TelegramCommandProcessor(
+        allowed_chat_ids=frozenset({"123"}),
+        lookup_renderer=lookup_renderer,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        natural_language_router=router,
+    )
+
+    handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: "unused",
+        message={"chat": {"id": "123"}, "text": "蛤"},
+    )
+    assert processor.get_pending_text_clarification("123") is not None
+
+    # Re-target the stub so the override path gets a confident answer.
+    router.intent = TelegramNaturalLanguageIntent(
+        intent="lookup_card",
+        game="pokemon",
+        name="Pikachu ex",
+        confidence=0.92,
+    )
+    replies = handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: "unused",
+        message={"chat": {"id": "123"}, "text": "否，查 pokemon Pikachu ex"},
+    )
+
+    assert any("收到，我改照你補充的意思處理：查 pokemon Pikachu ex" in r for r in replies)
+    assert any(r.endswith("lookup:pokemon:Pikachu ex") for r in replies)
+    assert captured and captured[0].game == "pokemon" and captured[0].name == "Pikachu ex"
+    # Pending state was popped and not re-established because the override was confident.
+    assert processor.get_pending_text_clarification("123") is None
+
+

@@ -9,7 +9,7 @@ import tempfile
 import time
 import threading
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
@@ -44,6 +44,7 @@ from .natural_language import (
 
 LookupRenderer = Callable[["TelegramLookupQuery"], str]
 PhotoLookupRenderer = Callable[["TelegramPhotoQuery"], str]
+PhotoIntentAnalyzer = Callable[["TelegramPhotoQuery"], "TelegramPhotoIntentAnalysis"]
 ReputationRenderer = Callable[["TelegramReputationQuery"], object]
 ResearchRenderer = Callable[["TelegramResearchQuery"], str]
 OpportunityTargetRemover = Callable[[str], str]
@@ -68,6 +69,9 @@ HUNT_COMMANDS = {"/hunt", "/opportunity"}
 HEAVY_COMMANDS = PRICE_LOOKUP_COMMANDS | TREND_BOARD_COMMANDS | REPUTATION_SNAPSHOT_COMMANDS | WEB_RESEARCH_COMMANDS
 
 logger = logging.getLogger(__name__)
+PHOTO_CLARIFICATION_TTL_SECONDS = 15 * 60
+TEXT_CLARIFICATION_TTL_SECONDS = 15 * 60
+TEXT_AMBIGUITY_CONFIDENCE_THRESHOLD = 0.55
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +90,7 @@ class TelegramPhotoQuery:
     caption: str | None = None
     game_hint: str | None = None
     title_hint: str | None = None
+    item_kind_hint: str | None = None
     file_id: str | None = None
 
 
@@ -126,6 +131,165 @@ class TelegramTextReplyPlan:
         if self.reply_factory is not None:
             return self.reply_factory()
         return None
+
+
+@dataclass(frozen=True, slots=True)
+class TelegramPhotoIntentOption:
+    option_number: int
+    action_key: str
+    prompt: str
+    synthetic_caption: str
+
+
+@dataclass(frozen=True, slots=True)
+class TelegramPhotoIntentAnalysis:
+    options: tuple[TelegramPhotoIntentOption, ...]
+    parsed_game: str | None = None
+    parsed_item_kind: str | None = None
+    parsed_title: str | None = None
+    warnings: tuple[str, ...] = ()
+
+
+@dataclass(slots=True)
+class PendingTelegramPhotoClarification:
+    chat_id: str
+    image_path: Path
+    caption: str | None
+    file_id: str | None
+    options: tuple[TelegramPhotoIntentOption, ...]
+    parsed_game: str | None = None
+    parsed_item_kind: str | None = None
+    parsed_title: str | None = None
+    created_at: float = field(default_factory=time.monotonic)
+
+    def is_expired(self) -> bool:
+        return (time.monotonic() - self.created_at) > PHOTO_CLARIFICATION_TTL_SECONDS
+
+
+@dataclass(frozen=True, slots=True)
+class TelegramTextIntentOption:
+    option_number: int
+    action_key: str
+    prompt: str
+    intent: "TelegramNaturalLanguageIntent"
+
+
+@dataclass(slots=True)
+class PendingTelegramTextClarification:
+    chat_id: str
+    original_text: str
+    options: tuple[TelegramTextIntentOption, ...]
+    top_intent: "TelegramNaturalLanguageIntent | None" = None
+    created_at: float = field(default_factory=time.monotonic)
+
+    def is_expired(self) -> bool:
+        return (time.monotonic() - self.created_at) > TEXT_CLARIFICATION_TTL_SECONDS
+
+
+def default_photo_intent_analyzer(
+    *,
+    db_path: str | Path | None = None,
+    tesseract_path: str | None = None,
+    tessdata_dir: str | None = None,
+    vision_settings: TcgVisionSettings | None = None,
+) -> PhotoIntentAnalyzer:
+    image_service = TcgImagePriceService(
+        db_path=db_path,
+        tesseract_path=tesseract_path,
+        tessdata_dir=tessdata_dir,
+        vision_settings=vision_settings,
+    )
+
+    def analyze(query: TelegramPhotoQuery) -> TelegramPhotoIntentAnalysis:
+        parsed = image_service.parse_image(
+            query.image_path,
+            caption=query.caption,
+            game_hint=query.game_hint,
+            title_hint=query.title_hint,
+            item_kind_hint=query.item_kind_hint,
+        )
+        return TelegramPhotoIntentAnalysis(
+            options=_build_photo_intent_options(parsed_game=parsed.game, item_kind=parsed.item_kind),
+            parsed_game=parsed.game,
+            parsed_item_kind=parsed.item_kind,
+            parsed_title=parsed.title,
+            warnings=parsed.warnings,
+        )
+
+    return analyze
+
+
+def _build_photo_intent_options(*, parsed_game: str | None, item_kind: str | None) -> tuple[TelegramPhotoIntentOption, ...]:
+    preferred: list[str]
+    if parsed_game == "pokemon" and item_kind == "sealed_box":
+        preferred = ["pokemon_box_price", "pokemon_card_price", "yugioh_card_price"]
+    elif parsed_game == "pokemon":
+        preferred = ["pokemon_card_price", "pokemon_box_price", "yugioh_card_price"]
+    elif parsed_game == "yugioh":
+        preferred = ["yugioh_card_price", "pokemon_card_price", "pokemon_box_price"]
+    elif parsed_game == "ws":
+        preferred = ["ws_card_price", "pokemon_card_price", "yugioh_card_price"]
+    elif parsed_game == "union_arena":
+        preferred = ["union_arena_card_price", "pokemon_card_price", "yugioh_card_price"]
+    else:
+        preferred = ["pokemon_card_price", "yugioh_card_price", "pokemon_box_price"]
+
+    labels = {
+        "pokemon_card_price": ("要我查這張寶可夢卡市價嗎？", "/scan pokemon"),
+        "yugioh_card_price": ("要我查這張遊戲王卡市價嗎？", "/scan yugioh"),
+        "pokemon_box_price": ("要我查這個寶可夢卡盒市價嗎？", "/scan pokemon"),
+        "ws_card_price": ("要我查這張 Weiss Schwarz 卡市價嗎？", "/scan ws"),
+        "union_arena_card_price": ("要我查這張 Union Arena 卡市價嗎？", "/scan union_arena"),
+    }
+    options: list[TelegramPhotoIntentOption] = []
+    seen: set[str] = set()
+    for action_key in preferred:
+        if action_key in seen or action_key not in labels:
+            continue
+        seen.add(action_key)
+        prompt, caption = labels[action_key]
+        options.append(
+            TelegramPhotoIntentOption(
+                option_number=len(options) + 1,
+                action_key=action_key,
+                prompt=prompt,
+                synthetic_caption=caption,
+            )
+        )
+    return tuple(options)
+
+
+def _build_photo_clarification_reply(analysis: TelegramPhotoIntentAnalysis) -> str:
+    context = _describe_photo_analysis_context(
+        parsed_game=analysis.parsed_game,
+        parsed_item_kind=analysis.parsed_item_kind,
+        parsed_title=analysis.parsed_title,
+    )
+    lines = [context, "請回覆數字："]
+    for option in analysis.options:
+        lines.append(f"{option.option_number}. {option.prompt}")
+    lines.append(f"{len(analysis.options) + 1}. 都不是，請回答：否，[您的意圖]")
+    return "\n".join(lines)
+
+
+def _describe_photo_analysis_context(*, parsed_game: str | None, parsed_item_kind: str | None, parsed_title: str | None) -> str:
+    if parsed_title and parsed_game:
+        item_label = "卡盒" if parsed_item_kind == "sealed_box" else "卡片"
+        return f"我先看了一下，這張圖看起來比較像「{_display_game_name(parsed_game)}{item_label}」{parsed_title}，但我還不想先亂猜你的意圖。"
+    if parsed_game:
+        item_label = "卡盒" if parsed_item_kind == "sealed_box" else "卡片"
+        return f"我先看了一下，這張圖看起來比較像「{_display_game_name(parsed_game)}{item_label}」，但我還不想先亂猜你的意圖。"
+    return "我先看了一下這張圖，但我還不想先亂猜你的意圖。"
+
+
+def _display_game_name(game: str) -> str:
+    labels = {
+        "pokemon": "寶可夢",
+        "yugioh": "遊戲王",
+        "ws": "Weiss Schwarz",
+        "union_arena": "Union Arena",
+    }
+    return labels.get(game, game)
 
 
 class TelegramBotClient:
@@ -261,6 +425,7 @@ class TelegramCommandProcessor:
         lookup_renderer: LookupRenderer,
         board_loader: BoardLoader,
         catalog_renderer: CatalogRenderer,
+        photo_intent_analyzer: PhotoIntentAnalyzer | None = None,
         reputation_renderer: ReputationRenderer | None = None,
         research_renderer: ResearchRenderer | None = None,
         natural_language_router: TelegramNaturalLanguageRouter | None = None,
@@ -275,6 +440,7 @@ class TelegramCommandProcessor:
         self._lookup_renderer = lookup_renderer
         self._board_loader = board_loader
         self._catalog_renderer = catalog_renderer
+        self._photo_intent_analyzer = photo_intent_analyzer or default_photo_intent_analyzer()
         self._reputation_renderer = reputation_renderer
         self._research_renderer = research_renderer
         self._natural_language_router = natural_language_router
@@ -285,14 +451,207 @@ class TelegramCommandProcessor:
         self._sns_buzz_fn = sns_buzz_fn
         self._opportunity_status_renderer = opportunity_status_renderer
         self._opportunity_target_remover = opportunity_target_remover
+        self._pending_photo_clarifications: dict[str, PendingTelegramPhotoClarification] = {}
+        self._pending_text_clarifications: dict[str, PendingTelegramTextClarification] = {}
 
     def is_allowed_chat(self, chat_id: str | int) -> bool:
         if not self._allowed_chat_ids:
             return True
         return str(chat_id) in self._allowed_chat_ids
 
+    def get_pending_photo_clarification(self, chat_id: str | int) -> PendingTelegramPhotoClarification | None:
+        key = str(chat_id)
+        pending = self._pending_photo_clarifications.get(key)
+        if pending is None:
+            return None
+        if not pending.is_expired():
+            return pending
+        self.clear_pending_photo_clarification(chat_id)
+        return None
+
+    def set_pending_photo_clarification(self, clarification: PendingTelegramPhotoClarification) -> None:
+        existing = self._pending_photo_clarifications.get(clarification.chat_id)
+        if existing is not None:
+            self._cleanup_pending_photo_path(existing.image_path)
+        self._pending_photo_clarifications[clarification.chat_id] = clarification
+
+    def pop_pending_photo_clarification(self, chat_id: str | int) -> PendingTelegramPhotoClarification | None:
+        return self._pending_photo_clarifications.pop(str(chat_id), None)
+
+    def clear_pending_photo_clarification(self, chat_id: str | int) -> None:
+        pending = self._pending_photo_clarifications.pop(str(chat_id), None)
+        if pending is not None:
+            self._cleanup_pending_photo_path(pending.image_path)
+
+    def get_pending_text_clarification(self, chat_id: str | int) -> PendingTelegramTextClarification | None:
+        key = str(chat_id)
+        pending = self._pending_text_clarifications.get(key)
+        if pending is None:
+            return None
+        if not pending.is_expired():
+            return pending
+        self._pending_text_clarifications.pop(key, None)
+        return None
+
+    def set_pending_text_clarification(self, clarification: PendingTelegramTextClarification) -> None:
+        self._pending_text_clarifications[clarification.chat_id] = clarification
+
+    def pop_pending_text_clarification(self, chat_id: str | int) -> PendingTelegramTextClarification | None:
+        return self._pending_text_clarifications.pop(str(chat_id), None)
+
+    def clear_pending_text_clarification(self, chat_id: str | int) -> None:
+        self._pending_text_clarifications.pop(str(chat_id), None)
+
+    def analyze_photo_intent(self, query: TelegramPhotoQuery) -> TelegramPhotoIntentAnalysis:
+        return self._photo_intent_analyzer(query)
+
+    @staticmethod
+    def _cleanup_pending_photo_path(path: Path) -> None:
+        try:
+            path.unlink(missing_ok=True)
+        except PermissionError:
+            logger.debug("Could not remove pending Telegram photo path=%s", path)
+
     def build_reply(self, *, chat_id: str | int, text: str | None) -> str | None:
         return self.build_reply_plan(chat_id=chat_id, text=text).execute()
+
+    def build_pending_photo_reply_plan(
+        self,
+        *,
+        chat_id: str | int,
+        text: str | None,
+        photo_renderer: PhotoLookupRenderer,
+    ) -> TelegramTextReplyPlan | None:
+        pending = self.get_pending_photo_clarification(chat_id)
+        if pending is None or text is None:
+            return None
+
+        content = text.strip()
+        if not content or content.startswith("/"):
+            return None
+
+        if content == str(len(pending.options) + 1):
+            return TelegramTextReplyPlan(
+                ack=None,
+                reply="好，請直接回答：否，[您的意圖]",
+            )
+
+        selected_option = _match_photo_clarification_option(content, pending.options)
+        if selected_option is not None:
+            resolved = self.pop_pending_photo_clarification(chat_id)
+            assert resolved is not None
+            return TelegramTextReplyPlan(
+                ack=f"收到，我就照第 {selected_option.option_number} 個方式處理。",
+                reply=None,
+                reply_factory=lambda resolved=resolved, option=selected_option: _execute_pending_photo_lookup(
+                    pending=resolved,
+                    option=option,
+                    photo_renderer=photo_renderer,
+                ),
+            )
+
+        override_text = _extract_photo_clarification_override(content)
+        if override_text is not None:
+            override_option = _resolve_photo_override_to_option(override_text, pending.options)
+            if override_option is not None:
+                resolved = self.pop_pending_photo_clarification(chat_id)
+                assert resolved is not None
+                return TelegramTextReplyPlan(
+                    ack=f"收到，我改照你補充的意思處理：{override_text}",
+                    reply=None,
+                    reply_factory=lambda resolved=resolved, option=override_option: _execute_pending_photo_lookup(
+                        pending=resolved,
+                        option=option,
+                        photo_renderer=photo_renderer,
+                    ),
+                )
+            identify_reply = _build_photo_identify_reply(
+                pending=pending,
+                override_text=override_text,
+            )
+            if identify_reply is not None:
+                self.clear_pending_photo_clarification(chat_id)
+                return TelegramTextReplyPlan(ack=None, reply=identify_reply)
+            return TelegramTextReplyPlan(
+                ack=None,
+                reply=(
+                    "我還沒完全理解你的意思。請直接回答像這樣：\n"
+                    "否，查這張寶可夢卡市價\n"
+                    "否，查這張遊戲王卡市價\n"
+                    "否，查這個寶可夢卡盒市價"
+                ),
+            )
+
+        return TelegramTextReplyPlan(
+            ack=None,
+            reply=_build_pending_photo_retry_reply(pending.options),
+        )
+
+    def build_pending_text_reply_plan(
+        self,
+        *,
+        chat_id: str | int,
+        text: str | None,
+    ) -> TelegramTextReplyPlan | None:
+        pending = self.get_pending_text_clarification(chat_id)
+        if pending is None or text is None:
+            return None
+
+        content = text.strip()
+        if not content or content.startswith("/"):
+            return None
+
+        # "都不是" sentinel option (last numbered choice = len(options) + 1)
+        if content == str(len(pending.options) + 1):
+            return TelegramTextReplyPlan(
+                ack=None,
+                reply="好，請直接回答：否，[您的意圖]",
+            )
+
+        selected = _match_text_clarification_option(content, pending.options)
+        if selected is not None:
+            self.pop_pending_text_clarification(chat_id)
+            plan = self._build_natural_language_reply_plan(selected.intent, chat_id=chat_id)
+            ack_prefix = f"收到，我就照第 {selected.option_number} 個方式處理。"
+            if plan is not None:
+                combined_ack = ack_prefix if not plan.ack else f"{ack_prefix}\n{plan.ack}"
+                return TelegramTextReplyPlan(
+                    ack=combined_ack,
+                    reply=plan.reply,
+                    reply_factory=plan.reply_factory,
+                    reputation_delivery_factory=plan.reputation_delivery_factory,
+                )
+            return TelegramTextReplyPlan(
+                ack=None,
+                reply=f"{ack_prefix}\n但暫時無法執行該動作，請告訴我更詳細的需求。",
+            )
+
+        override_text = _extract_photo_clarification_override(content)
+        if override_text is not None:
+            self.pop_pending_text_clarification(chat_id)
+            if not override_text:
+                return TelegramTextReplyPlan(
+                    ack=None,
+                    reply="好，請直接告訴我你的意圖。",
+                )
+            rerouted_plan = self.build_reply_plan(chat_id=chat_id, text=override_text)
+            new_pending = self.get_pending_text_clarification(chat_id)
+            if new_pending is not None:
+                # Re-routing produced a fresh clarification — let it speak for itself.
+                return rerouted_plan
+            ack = f"收到，我改照你補充的意思處理：{override_text}"
+            combined_ack = ack if not rerouted_plan.ack else f"{ack}\n{rerouted_plan.ack}"
+            return TelegramTextReplyPlan(
+                ack=combined_ack,
+                reply=rerouted_plan.reply,
+                reply_factory=rerouted_plan.reply_factory,
+                reputation_delivery_factory=rerouted_plan.reputation_delivery_factory,
+            )
+
+        return TelegramTextReplyPlan(
+            ack=None,
+            reply=_build_pending_text_retry_reply(pending.options),
+        )
 
     def build_reply_plan(self, *, chat_id: str | int, text: str | None) -> TelegramTextReplyPlan:
         logger.info(
@@ -389,14 +748,52 @@ class TelegramCommandProcessor:
             )
         if not content.startswith("/"):
             intent = self._route_natural_language(content)
+            if _is_text_intent_ambiguous(intent):
+                clarification_plan = self._build_text_clarification_plan(
+                    chat_id=chat_id,
+                    text=content,
+                    top_intent=intent,
+                )
+                if clarification_plan is not None:
+                    return clarification_plan
             natural_language_plan = self._build_natural_language_reply_plan(intent, chat_id=chat_id)
             if natural_language_plan is not None:
                 return natural_language_plan
+            clarification_plan = self._build_text_clarification_plan(
+                chat_id=chat_id,
+                text=content,
+                top_intent=intent,
+            )
+            if clarification_plan is not None:
+                return clarification_plan
 
         logger.info("Telegram unknown command command=%s", command)
         return TelegramTextReplyPlan(
             ack=None,
             reply="Unknown command. Use /help, /price, /trend, /snapshot, /search, or send a photo with /scan. You can also ask in natural language.",
+        )
+
+    def _build_text_clarification_plan(
+        self,
+        *,
+        chat_id: str | int,
+        text: str,
+        top_intent: "TelegramNaturalLanguageIntent | None",
+    ) -> TelegramTextReplyPlan | None:
+        options = _build_text_intent_candidates(text, top_intent)
+        if not options:
+            return None
+        self.set_pending_text_clarification(
+            PendingTelegramTextClarification(
+                chat_id=str(chat_id),
+                original_text=text,
+                options=options,
+                top_intent=top_intent,
+            )
+        )
+        return TelegramTextReplyPlan(
+            ack=None,
+            reply=_build_text_clarification_reply(text, options, top_intent),
         )
 
     def _handle_lookup(self, raw: str) -> str:
@@ -1393,19 +1790,21 @@ def default_photo_renderer(
 
     def render(query: TelegramPhotoQuery) -> str:
         logger.info(
-            "Telegram photo renderer executing chat_id=%s file_id=%s path=%s caption=%s game_hint=%s title_hint=%s",
+            "Telegram photo renderer executing chat_id=%s file_id=%s path=%s caption=%s game_hint=%s title_hint=%s item_kind_hint=%s",
             mask_identifier(query.chat_id),
             query.file_id,
             query.image_path,
             trim_for_log(query.caption or "", limit=200),
             query.game_hint,
             query.title_hint,
+            query.item_kind_hint,
         )
         outcome = image_service.lookup_image(
             query.image_path,
             caption=query.caption,
             game_hint=query.game_hint,
             title_hint=query.title_hint,
+            item_kind_hint=query.item_kind_hint,
             persist=False,
         )
         logger.info(
@@ -1482,6 +1881,7 @@ def run_telegram_polling(
     board_loader: BoardLoader,
     catalog_renderer: CatalogRenderer,
     photo_renderer: PhotoLookupRenderer | None = None,
+    photo_intent_analyzer: PhotoIntentAnalyzer | None = None,
     reputation_renderer: ReputationRenderer | None = None,
     research_renderer: ResearchRenderer | None = None,
     natural_language_router: TelegramNaturalLanguageRouter | None = None,
@@ -1518,6 +1918,7 @@ def run_telegram_polling(
         lookup_renderer=lookup_renderer,
         board_loader=board_loader,
         catalog_renderer=catalog_renderer,
+        photo_intent_analyzer=photo_intent_analyzer,
         reputation_renderer=reputation_renderer,
         research_renderer=research_renderer,
         natural_language_router=natural_language_router,
@@ -1575,24 +1976,59 @@ def handle_telegram_message(
         return ()
 
     replies: list[str] = []
+    text = message.get("text")
+    text_value = text if isinstance(text, str) else None
     photo_items = message.get("photo")
-    if isinstance(photo_items, list) and photo_items:
-        ack = build_processing_ack(has_photo=True)
-        if ack:
-            client.send_message(chat_id=chat_id, text=ack)
-            replies.append(ack)
-        final_reply = _handle_photo_message(
+    has_photo = isinstance(photo_items, list) and bool(photo_items)
+    pending_plan = processor.build_pending_photo_reply_plan(
+        chat_id=chat_id,
+        text=text_value,
+        photo_renderer=photo_renderer,
+    )
+    if pending_plan is not None:
+        if pending_plan.ack:
+            client.send_message(chat_id=chat_id, text=pending_plan.ack)
+            replies.append(pending_plan.ack)
+        pending_reply = pending_plan.execute()
+        if pending_reply:
+            client.send_message(chat_id=chat_id, text=pending_reply)
+            replies.append(pending_reply)
+        return tuple(replies)
+
+    if not has_photo:
+        text_pending_plan = processor.build_pending_text_reply_plan(
+            chat_id=chat_id,
+            text=text_value,
+        )
+        if text_pending_plan is not None:
+            if text_pending_plan.ack:
+                client.send_message(chat_id=chat_id, text=text_pending_plan.ack)
+                replies.append(text_pending_plan.ack)
+            if text_pending_plan.reputation_delivery_factory is not None:
+                delivery = text_pending_plan.reputation_delivery_factory()
+                _send_reputation_delivery(client=client, chat_id=chat_id, delivery=delivery)
+                replies.append(delivery.summary_text)
+                return tuple(replies)
+            pending_text_reply = text_pending_plan.execute()
+            if pending_text_reply:
+                client.send_message(chat_id=chat_id, text=pending_text_reply)
+                replies.append(pending_text_reply)
+            return tuple(replies)
+
+    if has_photo:
+        final_reply, ack = _handle_photo_message(
             client=client,
+            processor=processor,
             photo_renderer=photo_renderer,
             chat_id=chat_id,
             message=message,
         )
+        if ack:
+            client.send_message(chat_id=chat_id, text=ack)
+            replies.append(ack)
         client.send_message(chat_id=chat_id, text=final_reply)
         replies.append(final_reply)
         return tuple(replies)
-
-    text = message.get("text")
-    text_value = text if isinstance(text, str) else None
     if text_value is not None and _extract_command_name(text_value) in REPUTATION_SNAPSHOT_COMMANDS:
         if not processor.is_allowed_chat(chat_id):
             return ()
@@ -1675,19 +2111,20 @@ def _send_reputation_delivery(
 def _handle_photo_message(
     *,
     client: TelegramBotClient,
+    processor: TelegramCommandProcessor,
     photo_renderer: PhotoLookupRenderer,
     chat_id: str | int,
     message: dict[str, object],
-) -> str:
+) -> tuple[str, str | None]:
     caption = message.get("caption")
     caption_text = caption if isinstance(caption, str) else None
     photo_items = message.get("photo")
     if not isinstance(photo_items, list) or not photo_items:
-        return "No image was attached."
+        return "No image was attached.", None
 
     candidates = [item for item in photo_items if isinstance(item, dict) and item.get("file_id")]
     if not candidates:
-        return "Could not resolve the Telegram file metadata for this image."
+        return "Could not resolve the Telegram file metadata for this image.", None
 
     best_item = max(
         candidates,
@@ -1695,46 +2132,367 @@ def _handle_photo_message(
     )
     file_id = best_item.get("file_id")
     if not isinstance(file_id, str):
-        return "Could not resolve the Telegram file id for this image."
+        return "Could not resolve the Telegram file id for this image.", None
 
     game_hint, title_hint = _parse_photo_caption_for_lookup(caption_text)
 
     try:
-        file_info = client.get_file(file_id=file_id)
-        file_path = file_info.get("file_path")
-        if not isinstance(file_path, str) or not file_path:
-            return "Telegram did not return a downloadable file path for this image."
-        payload = client.download_file(file_path=file_path)
-        suffix = Path(file_path).suffix or ".jpg"
-        temp_root = Path.cwd() / ".openclaw_tmp"
-        temp_root.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            mode="wb",
-            suffix=suffix,
-            prefix="telegram-upload-",
-            dir=temp_root,
-            delete=False,
-        ) as handle:
-            handle.write(payload)
-            local_path = Path(handle.name)
-        try:
-            query = TelegramPhotoQuery(
-                chat_id=chat_id,
+        local_path = _download_telegram_photo_to_temp(client=client, file_id=file_id)
+        query = TelegramPhotoQuery(
+            chat_id=chat_id,
+            image_path=local_path,
+            caption=caption_text,
+            game_hint=game_hint,
+            title_hint=title_hint,
+            item_kind_hint=None,
+            file_id=file_id,
+        )
+        if _caption_requests_direct_photo_lookup(caption_text):
+            try:
+                return photo_renderer(query), build_processing_ack(has_photo=True)
+            finally:
+                try:
+                    local_path.unlink(missing_ok=True)
+                except PermissionError:
+                    logger.debug("Could not remove temporary Telegram photo path=%s", local_path)
+
+        analysis = processor.analyze_photo_intent(query)
+        processor.set_pending_photo_clarification(
+            PendingTelegramPhotoClarification(
+                chat_id=str(chat_id),
                 image_path=local_path,
                 caption=caption_text,
-                game_hint=game_hint,
-                title_hint=title_hint,
                 file_id=file_id,
+                options=analysis.options,
+                parsed_game=analysis.parsed_game,
+                parsed_item_kind=analysis.parsed_item_kind,
+                parsed_title=analysis.parsed_title,
             )
-            return photo_renderer(query)
-        finally:
-            try:
-                local_path.unlink(missing_ok=True)
-            except PermissionError:
-                logger.debug("Could not remove temporary Telegram photo path=%s", local_path)
+        )
+        return _build_photo_clarification_reply(analysis), None
     except Exception as exc:  # pragma: no cover - network-dependent.
         logger.exception("Telegram photo handling failed chat_id=%s file_id=%s", mask_identifier(chat_id), file_id)
-        return f"Image lookup failed: {exc}"
+        return f"Image lookup failed: {exc}", None
+
+
+def _download_telegram_photo_to_temp(*, client: TelegramBotClient, file_id: str) -> Path:
+    file_info = client.get_file(file_id=file_id)
+    file_path = file_info.get("file_path")
+    if not isinstance(file_path, str) or not file_path:
+        raise RuntimeError("Telegram did not return a downloadable file path for this image.")
+    payload = client.download_file(file_path=file_path)
+    suffix = Path(file_path).suffix or ".jpg"
+    temp_root = Path.cwd() / ".openclaw_tmp"
+    temp_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="wb",
+        suffix=suffix,
+        prefix="telegram-upload-",
+        dir=temp_root,
+        delete=False,
+    ) as handle:
+        handle.write(payload)
+        return Path(handle.name)
+
+
+def _execute_pending_photo_lookup(
+    *,
+    pending: PendingTelegramPhotoClarification,
+    option: TelegramPhotoIntentOption,
+    photo_renderer: PhotoLookupRenderer,
+) -> str:
+    query = TelegramPhotoQuery(
+        chat_id=pending.chat_id,
+        image_path=pending.image_path,
+        caption=option.synthetic_caption,
+        game_hint=_parse_photo_caption_for_lookup(option.synthetic_caption)[0],
+        title_hint=None,
+        item_kind_hint="sealed_box" if option.action_key == "pokemon_box_price" else "card",
+        file_id=pending.file_id,
+    )
+    try:
+        return photo_renderer(query)
+    finally:
+        try:
+            pending.image_path.unlink(missing_ok=True)
+        except PermissionError:
+            logger.debug("Could not remove pending Telegram photo path=%s", pending.image_path)
+
+
+def _build_pending_photo_retry_reply(options: tuple[TelegramPhotoIntentOption, ...]) -> str:
+    lines = ["我現在在等你確認這張圖要怎麼處理，請直接回覆："]
+    for option in options:
+        lines.append(f"{option.option_number}. {option.prompt}")
+    lines.append(f"或輸入：否，[您的意圖]")
+    return "\n".join(lines)
+
+
+def _match_photo_clarification_option(
+    content: str,
+    options: tuple[TelegramPhotoIntentOption, ...],
+) -> TelegramPhotoIntentOption | None:
+    stripped = content.strip()
+    for option in options:
+        if stripped == str(option.option_number):
+            return option
+    return None
+
+
+def _extract_photo_clarification_override(content: str) -> str | None:
+    stripped = content.strip()
+    for prefix in ("否，", "否,", "否:", "否：", "否 ", "都不是，", "都不是,", "都不是:", "都不是：", "不是，", "不是,", "no,", "no:"):
+        if stripped.lower().startswith(prefix.lower()):
+            remainder = stripped[len(prefix):].strip()
+            return remainder or ""
+    if stripped in {"否", "都不是", "不是", "no"}:
+        return ""
+    return None
+
+
+def _resolve_photo_override_to_option(
+    override_text: str,
+    options: tuple[TelegramPhotoIntentOption, ...],
+) -> TelegramPhotoIntentOption | None:
+    lowered = override_text.lower()
+    if not _text_requests_price_lookup(lowered):
+        return None
+    desired_action = None
+    if "遊戲王" in override_text or "yugioh" in lowered or "yu-gi-oh" in lowered:
+        desired_action = "yugioh_card_price"
+    elif "weiss" in lowered or "ws" in lowered or "ヴァイス" in override_text:
+        desired_action = "ws_card_price"
+    elif "union arena" in lowered or "ユニオン" in override_text or "ua " in lowered:
+        desired_action = "union_arena_card_price"
+    elif "box" in lowered or "盒" in override_text or "ボックス" in override_text:
+        desired_action = "pokemon_box_price"
+    elif "寶可夢" in override_text or "pokemon" in lowered:
+        desired_action = "pokemon_card_price"
+    elif ("卡" in override_text or "card" in lowered) and options:
+        return options[0]
+    if desired_action is None:
+        return None
+    for option in options:
+        if option.action_key == desired_action:
+            return option
+    return None
+
+
+def _build_photo_identify_reply(
+    *,
+    pending: PendingTelegramPhotoClarification,
+    override_text: str,
+) -> str | None:
+    lowered = override_text.lower()
+    if not any(token in lowered for token in ("identify", "what is", "辨識", "辨认", "辨識", "是什麼", "这是什么", "這是什麼")):
+        return None
+    if pending.parsed_game is None:
+        return "我目前只能先判斷這大概是 TCG 相關圖片，但還沒辦法穩定確認是哪個系列。"
+    item_label = "卡盒" if pending.parsed_item_kind == "sealed_box" else "卡片"
+    title_suffix = f"：{pending.parsed_title}" if pending.parsed_title else ""
+    return f"我目前看起來比較像 {_display_game_name(pending.parsed_game)}{item_label}{title_suffix}"
+
+
+def _is_text_intent_ambiguous(intent: "TelegramNaturalLanguageIntent | None") -> bool:
+    if intent is None:
+        return True
+    if intent.intent == "unknown":
+        return True
+    if intent.confidence is None:
+        return False
+    return intent.confidence < TEXT_AMBIGUITY_CONFIDENCE_THRESHOLD
+
+
+def _build_text_intent_candidates(
+    text: str,
+    top_intent: "TelegramNaturalLanguageIntent | None",
+) -> tuple[TelegramTextIntentOption, ...]:
+    raw_candidates: list[tuple[str, str, TelegramNaturalLanguageIntent]] = []
+    seen_keys: set[str] = set()
+
+    def add(key: str, prompt: str, intent: "TelegramNaturalLanguageIntent") -> None:
+        if key in seen_keys:
+            return
+        seen_keys.add(key)
+        raw_candidates.append((key, prompt, intent))
+
+    lowered = text.lower()
+
+    if top_intent is not None and top_intent.intent != "unknown":
+        prompt = _describe_intent_for_clarification(top_intent, text)
+        if prompt is not None:
+            add(f"top_{top_intent.intent}", prompt, top_intent)
+
+    game_hint = _infer_game_hint_from_text(text)
+    if game_hint:
+        lookup_guess = TelegramNaturalLanguageIntent(
+            intent="lookup_card",
+            game=game_hint,
+            name=text.strip(),
+            confidence=0.5,
+        )
+        prompt = _describe_intent_for_clarification(lookup_guess, text)
+        if prompt is not None:
+            add(f"lookup_{game_hint}", prompt, lookup_guess)
+
+    handle_match = re.search(r"@([A-Za-z0-9_]{2,32})", text)
+    if handle_match is not None:
+        handle = handle_match.group(1)
+        sns_guess = TelegramNaturalLanguageIntent(
+            intent="sns_add_account",
+            sns_handle=handle,
+            confidence=0.5,
+        )
+        prompt = _describe_intent_for_clarification(sns_guess, text)
+        if prompt is not None:
+            add(f"sns_add_{handle.lower()}", prompt, sns_guess)
+
+    if game_hint and any(token in lowered for token in ("trending", "hot", "熱門", "排行", "流動性", "trend")):
+        trend_guess = TelegramNaturalLanguageIntent(
+            intent="trend_board",
+            game=game_hint,
+            limit=5,
+            confidence=0.5,
+        )
+        prompt = _describe_intent_for_clarification(trend_guess, text)
+        if prompt is not None:
+            add(f"trend_{game_hint}", prompt, trend_guess)
+
+    url_match = re.search(r"https?://\S+", text)
+    if url_match is not None:
+        url = url_match.group(0)
+        reputation_guess = TelegramNaturalLanguageIntent(
+            intent="reputation_snapshot",
+            query_url=url,
+            confidence=0.5,
+        )
+        prompt = _describe_intent_for_clarification(reputation_guess, text)
+        if prompt is not None:
+            add("reputation_snapshot", prompt, reputation_guess)
+
+    research_guess = TelegramNaturalLanguageIntent(
+        intent="web_research",
+        research_query=text.strip(),
+        confidence=0.5,
+    )
+    research_prompt = _describe_intent_for_clarification(research_guess, text)
+    if research_prompt is not None:
+        add("web_research", research_prompt, research_guess)
+
+    if len(raw_candidates) < 4:
+        help_guess = TelegramNaturalLanguageIntent(intent="help", confidence=0.5)
+        help_prompt = _describe_intent_for_clarification(help_guess, text)
+        if help_prompt is not None:
+            add("help", help_prompt, help_guess)
+
+    if not raw_candidates:
+        return ()
+
+    trimmed = raw_candidates[:4]
+    return tuple(
+        TelegramTextIntentOption(
+            option_number=index + 1,
+            action_key=key,
+            prompt=prompt,
+            intent=intent,
+        )
+        for index, (key, prompt, intent) in enumerate(trimmed)
+    )
+
+
+def _describe_intent_for_clarification(
+    intent: "TelegramNaturalLanguageIntent",
+    original_text: str,
+) -> str | None:
+    fallback = trim_for_log(original_text.strip(), limit=60)
+    kind = intent.intent
+    if kind == "lookup_card":
+        game_label = _display_game_name(intent.game) if intent.game else "TCG"
+        name = intent.name or intent.card_number or fallback
+        return f"查 {game_label} 卡片『{trim_for_log(name, limit=60)}』的市價 (相當於 /price)"
+    if kind == "trend_board":
+        game_label = _display_game_name(intent.game) if intent.game else "TCG"
+        limit_text = f" {intent.limit}" if intent.limit else ""
+        return f"看 {game_label} 的熱門卡排行 (相當於 /trend{limit_text})"
+    if kind == "add_watch":
+        q = intent.watch_query or fallback
+        threshold = intent.watch_price_threshold
+        if threshold:
+            return f"追蹤 Mercari 商品『{trim_for_log(q, limit=40)}』在 {threshold} 円以下 (相當於 /watch)"
+        return f"追蹤 Mercari 商品『{trim_for_log(q, limit=40)}』 (相當於 /watch)"
+    if kind == "list_watches":
+        return "列出 Mercari 追蹤清單 (相當於 /watchlist)"
+    if kind == "remove_watch":
+        target = intent.watch_id or fallback
+        return f"取消 Mercari 追蹤 {trim_for_log(target, limit=40)} (相當於 /unwatch)"
+    if kind == "update_watch_price":
+        return f"更新 Mercari 追蹤 {intent.watch_id} 的目標價 (相當於 /setprice)"
+    if kind == "reputation_snapshot":
+        url = intent.query_url or fallback
+        return f"建立賣家信譽快照：{trim_for_log(url, limit=40)} (相當於 /snapshot)"
+    if kind == "web_research":
+        q = intent.research_query or fallback
+        return f"上網搜尋『{trim_for_log(q, limit=60)}』 (相當於 /search)"
+    if kind == "opportunity_remove":
+        target = intent.opportunity_target or fallback
+        return f"從機會清單移除『{trim_for_log(target, limit=40)}』 (相當於 /hunt remove)"
+    if kind == "help":
+        return "顯示我能做什麼 (相當於 /help)"
+    if kind == "status":
+        return "顯示目前服務狀態 (相當於 /status)"
+    if kind == "tools":
+        return "列出工具目錄 (相當於 /tools)"
+    if kind == "scan_help":
+        return "說明如何用照片掃描卡片"
+    if kind == "sns_add_account":
+        handle = intent.sns_handle or fallback
+        return f"追蹤 X 帳號 @{handle} (相當於 /snsadd)"
+    if kind == "sns_add_keyword":
+        keyword = intent.sns_keyword or fallback
+        return f"監控 X 關鍵字『{trim_for_log(keyword, limit=40)}』 (相當於 /snsadd keyword:)"
+    if kind == "sns_list":
+        return "列出 SNS 監控規則 (相當於 /snslist)"
+    if kind == "sns_delete":
+        target = (intent.sns_handle and f"@{intent.sns_handle}") or intent.watch_id or fallback
+        return f"取消 SNS 監控 {trim_for_log(target, limit=40)} (相當於 /snsdelete)"
+    if kind == "sns_buzz":
+        q = intent.sns_buzz_query or fallback
+        return f"整理 X 熱門討論：{trim_for_log(q, limit=40)} (相當於 /snsbuzz)"
+    return None
+
+
+def _build_text_clarification_reply(
+    original_text: str,
+    options: tuple[TelegramTextIntentOption, ...],
+    top_intent: "TelegramNaturalLanguageIntent | None",
+) -> str:
+    if top_intent is not None and top_intent.intent != "unknown":
+        head = "我看了一下你的訊息，但我還不想先亂猜你的意圖。"
+    else:
+        head = "我還不太確定你想叫我做什麼，所以先不亂動手。"
+    lines = [head, "請回覆數字："]
+    for option in options:
+        lines.append(f"{option.option_number}. {option.prompt}")
+    lines.append(f"{len(options) + 1}. 都不是，請回答：否，[您的意圖]")
+    return "\n".join(lines)
+
+
+def _build_pending_text_retry_reply(options: tuple[TelegramTextIntentOption, ...]) -> str:
+    lines = ["我現在在等你確認剛剛那則訊息要怎麼處理，請直接回覆："]
+    for option in options:
+        lines.append(f"{option.option_number}. {option.prompt}")
+    lines.append("或輸入：否，[您的意圖]")
+    return "\n".join(lines)
+
+
+def _match_text_clarification_option(
+    content: str,
+    options: tuple[TelegramTextIntentOption, ...],
+) -> TelegramTextIntentOption | None:
+    stripped = content.strip()
+    for option in options:
+        if stripped == str(option.option_number):
+            return option
+    return None
 
 
 def _parse_photo_caption_for_lookup(caption: str | None) -> tuple[str | None, str | None]:
@@ -1756,7 +2514,49 @@ def _parse_photo_caption_for_lookup(caption: str | None) -> tuple[str | None, st
     if first is not None:
         remainder = " ".join(tokens[1:]).strip()
         return first, _sanitize_image_title_hint(remainder or None)
-    return None, _sanitize_image_title_hint(content)
+    inferred_game = _infer_game_hint_from_text(content)
+    return inferred_game, _sanitize_image_title_hint(content)
+
+
+def _caption_requests_direct_photo_lookup(caption: str | None) -> bool:
+    if caption is None:
+        return False
+    content = caption.strip()
+    if not content:
+        return False
+    lowered = content.lower()
+    if any(lowered.startswith(prefix) for prefix in PHOTO_SCAN_COMMANDS):
+        return True
+    return _text_requests_price_lookup(lowered)
+
+
+def _text_requests_price_lookup(content: str) -> bool:
+    price_tokens = (
+        "查價",
+        "查价",
+        "市價",
+        "市价",
+        "價格",
+        "价格",
+        "price",
+        "value",
+        "估價",
+        "估价",
+    )
+    return any(token in content for token in price_tokens)
+
+
+def _infer_game_hint_from_text(content: str) -> str | None:
+    lowered = content.lower()
+    if "寶可夢" in content or "宝可梦" in content or "pokemon" in lowered:
+        return "pokemon"
+    if "遊戲王" in content or "游戏王" in content or "yugioh" in lowered or "yu-gi-oh" in lowered:
+        return "yugioh"
+    if "weiss" in lowered or "ヴァイス" in content:
+        return "ws"
+    if "union arena" in lowered or "ユニオン" in content:
+        return "union_arena"
+    return None
 
 
 def _format_lookup_ack_command(query: TelegramLookupQuery) -> str:
