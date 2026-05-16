@@ -1247,28 +1247,39 @@ class TelegramCommandProcessor:
         """Handle /snsadd command to add an X (Twitter) account, keyword, or trend watch."""
         if self._sns_db is None:
             return "SNS 監控尚未啟用（sns_db 未設定）。"
-        from sns_monitor.filters import parse_account_watch_text
+        from sns_monitor.filters import extract_labeled_brackets, parse_account_watch_text
         from sns_monitor.models import AccountWatch, KeywordWatch, TrendWatch
         from sns_monitor.storage import SnsDatabase
 
         try:
             raw = raw.strip()
             if not raw:
-                return '用法：/snsadd @username 或 /snsadd @username ["buy", "sell"] 或 /snsadd keyword:搜尋詞 或 /snsadd trend:trending'
+                return (
+                    '用法：/snsadd @username\n'
+                    '     /snsadd @username filter[抽選] domain[pokemon]\n'
+                    '     /snsadd keyword:搜尋詞 domain[gundam]\n'
+                    '     /snsadd trend:trending'
+                )
 
             # Parse: "@username [filters]" or "keyword:xxx" or "trend:xxx"
             account_target = parse_account_watch_text(raw)
             if account_target is not None:
                 # Account watch
-                screen_name, include_keywords = account_target
+                screen_name, include_keywords, domains = account_target
                 rule_id = SnsDatabase._watch_rule_id("account", screen_name)
                 existing_rule = self._sns_db.get_watch_rule(rule_id)
+                # If domain[...] wasn't supplied in this call, preserve the
+                # existing rule's domains (upsert semantics).
+                resolved_domains = (
+                    domains if domains is not None else getattr(existing_rule, "domains", ())
+                )
                 rule = AccountWatch(
                     rule_id=rule_id,
                     screen_name=screen_name,
                     user_id=getattr(existing_rule, "user_id", None),
                     label=getattr(existing_rule, "label", None) or f"@{screen_name}",
                     include_keywords=include_keywords,
+                    domains=resolved_domains,
                     enabled=True,
                     schedule_minutes=15,
                     chat_id=chat_id,
@@ -1276,45 +1287,69 @@ class TelegramCommandProcessor:
                 )
                 self._sns_db.save_watch_rule(rule)
                 logger.info(
-                    "SNS account watch added screen_name=%s chat_id=%s include_keywords=%s",
+                    "SNS account watch added screen_name=%s chat_id=%s include_keywords=%s domains=%s",
                     screen_name,
                     chat_id,
                     include_keywords,
+                    resolved_domains,
                 )
                 filter_line = (
                     f"\n篩選：{', '.join(include_keywords)}"
                     if include_keywords
                     else ""
                 )
-                return f"✓ 已新增 X 帳號追蹤：@{screen_name}{filter_line}\nID: {rule_id[:8]}…"
+                domain_line = (
+                    f"\n領域：{', '.join(resolved_domains)}"
+                    if resolved_domains
+                    else ""
+                )
+                return f"✓ 已新增 X 帳號追蹤：@{screen_name}{filter_line}{domain_line}\nID: {rule_id[:8]}…"
             elif raw.startswith("keyword:"):
-                # Keyword watch
-                query = raw[8:].strip()
+                # Keyword watch — strip the keyword: prefix first, then pull
+                # out any labelled domain[...] so the remainder is the query.
+                domain_brackets, _, body = extract_labeled_brackets(raw)
+                # body still has "keyword:" prefix; trim it.
+                body = body[len("keyword:"):].strip() if body.lower().startswith("keyword:") else raw[len("keyword:"):].strip()
+                # extract_labeled_brackets removed `domain[...]`; if filter[...] was used we also want it gone.
+                explicit_filter, parsed_domains, body_clean = extract_labeled_brackets(raw[len("keyword:"):])
+                query = body_clean.strip()
                 if not query:
-                    return "請提供搜尋關鍵字。例如：/snsadd keyword:機動戰士"
+                    return "請提供搜尋關鍵字。例如：/snsadd keyword:機動戰士 domain[gundam]"
                 rule_id = SnsDatabase._watch_rule_id("keyword", query)
+                existing_rule = self._sns_db.get_watch_rule(rule_id)
+                resolved_domains = (
+                    parsed_domains if parsed_domains is not None else getattr(existing_rule, "domains", ())
+                )
                 rule = KeywordWatch(
                     rule_id=rule_id,
                     query=query,
                     label=f'"{query}"',
+                    domains=resolved_domains,
                     enabled=True,
                     schedule_minutes=30,
                     chat_id=chat_id,
                     last_checked_at=None,
                 )
                 self._sns_db.save_watch_rule(rule)
-                logger.info("SNS keyword watch added query=%s chat_id=%s", query, chat_id)
-                return f'✓ 已新增 X 關鍵字追蹤："{query}"\nID: {rule_id[:8]}…'
+                logger.info("SNS keyword watch added query=%s chat_id=%s domains=%s", query, chat_id, resolved_domains)
+                domain_line = f"\n領域：{', '.join(resolved_domains)}" if resolved_domains else ""
+                return f'✓ 已新增 X 關鍵字追蹤："{query}"{domain_line}\nID: {rule_id[:8]}…'
             elif raw.startswith("trend:"):
                 # Trend watch
-                category = raw[6:].strip()
+                _, parsed_domains, body_clean = extract_labeled_brackets(raw[len("trend:"):])
+                category = body_clean.strip()
                 if category not in {"trending", "for-you", "news", "sports", "entertainment"}:
                     return "不支援的分類。請使用：trending, for-you, news, sports, 或 entertainment"
                 rule_id = SnsDatabase._watch_rule_id("trend", category)
+                existing_rule = self._sns_db.get_watch_rule(rule_id)
+                resolved_domains = (
+                    parsed_domains if parsed_domains is not None else getattr(existing_rule, "domains", ())
+                )
                 rule = TrendWatch(
                     rule_id=rule_id,
                     category=category,
                     label=f"Trend: {category}",
+                    domains=resolved_domains,
                     enabled=True,
                     schedule_minutes=60,
                     chat_id=chat_id,
@@ -1342,7 +1377,7 @@ class TelegramCommandProcessor:
             for rule in rules:
                 status = "✓" if rule.enabled else "✗"
                 if rule.__class__.__name__ == "AccountWatch":
-                    filters = f" [{', '.join(rule.include_keywords)}]" if rule.include_keywords else ""
+                    filters = f" filter[{', '.join(rule.include_keywords)}]" if rule.include_keywords else ""
                     info = f"@{rule.screen_name}{filters}"
                 elif rule.__class__.__name__ == "KeywordWatch":
                     info = f'"{rule.query}"'
@@ -1350,7 +1385,11 @@ class TelegramCommandProcessor:
                     info = f"Trend:{rule.category}"
                 else:
                     info = "Unknown"
-                lines.append(f"  {status} {info} ({rule.rule_id[:8]}…)")
+                domains = getattr(rule, "domains", ())
+                domain_segment = (
+                    f" domain[{', '.join(domains)}]" if domains else " domain[?]"
+                )
+                lines.append(f"  {status} {info}{domain_segment} ({rule.rule_id[:8]}…)")
 
             return "\n".join(lines)
         except Exception as exc:
