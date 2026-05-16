@@ -1,4 +1,14 @@
-"""Mercari Japan search client using Playwright for keyword + price-max queries."""
+"""Mercari Japan search client using Playwright for keyword + price-max queries.
+
+Two-stage pricing:
+  1. Playwright loads the search results page and we parse it with BeautifulSoup
+     to find candidate items matching the query and price_max.
+  2. For each candidate we then fetch its detail page via plain HTTP and read
+     ``<meta name="product:price:amount">`` as the authoritative price. The
+     search-page card is unreliable because Mercari sometimes renders an
+     installment / monthly-payment estimate alongside the real price; only the
+     detail-page meta tag tells us the actual list price.
+"""
 
 from __future__ import annotations
 
@@ -6,11 +16,25 @@ import logging
 import os
 import re
 import shutil
+import urllib.error
+import urllib.request
+from typing import Any
 from urllib.parse import quote
+
+from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
 MERCARI_SEARCH_BASE = "https://jp.mercari.com/search"
+MERCARI_ITEM_BASE = "https://jp.mercari.com/item"
+
+_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
+_INSTALLMENT_MARKERS = ("月々", "分割", "/月", "～", "〜")
 
 
 def build_search_url(query: str, *, price_max: int) -> str:
@@ -44,20 +68,15 @@ def search_mercari(
         browser = playwright.chromium.launch(**_chromium_launch_options())
         context = browser.new_context(
             locale="ja-JP",
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
+            user_agent=_USER_AGENT,
             viewport={"width": 1280, "height": 900},
         )
         page = context.new_page()
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-            # Wait for item grid to appear
             try:
                 page.wait_for_selector(
-                    "mer-item-thumbnail, [data-testid='item-cell'], li[data-item-id]",
+                    'li[data-testid="item-cell"], mer-item-thumbnail, li[data-item-id]',
                     timeout=15000,
                 )
             except Exception:
@@ -65,21 +84,182 @@ def search_mercari(
                 page.evaluate("window.scrollTo(0, 300)")
                 page.wait_for_timeout(2000)
 
-            raw_items = _extract_items(page, max_results=max_results * 3)
-            query_matched = _filter_by_query(raw_items, query)
-            items = [item for item in query_matched if int(item.get("price_jpy") or 0) <= price_max]
-            dropped_price = len(query_matched) - len(items)
-            logger.info(
-                "Mercari search raw=%d matched=%d price_filtered=%d query=%s",
-                len(raw_items),
-                len(items),
-                dropped_price,
-                query,
-            )
-            return items[:max_results]
+            html = page.content()
         finally:
             context.close()
             browser.close()
+
+    raw_items = parse_search_html(html, max_results=max_results * 3)
+    query_matched = _filter_by_query(raw_items, query)
+    candidates = [item for item in query_matched if int(item.get("price_jpy") or 0) <= price_max]
+    dropped_price = len(query_matched) - len(candidates)
+
+    verified = _verify_candidates_via_detail_pages(candidates, price_max=price_max)
+
+    logger.info(
+        "Mercari search raw=%d matched=%d price_filtered=%d verified=%d query=%s",
+        len(raw_items),
+        len(candidates),
+        dropped_price,
+        len(verified),
+        query,
+    )
+    return verified[:max_results]
+
+
+# ── HTML parsing ──────────────────────────────────────────────────────────────
+
+def parse_search_html(html: str, *, max_results: int) -> list[dict[str, object]]:
+    """Parse rendered Mercari search-results HTML into item dicts.
+
+    Pure function so unit tests can call it against saved fixtures without
+    spinning up Playwright.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    items: list[dict[str, object]] = []
+    seen_ids: set[str] = set()
+
+    for li in soup.select('li[data-testid="item-cell"]'):
+        anchor = li.select_one('a[href*="/item/"]')
+        if not anchor:
+            continue
+        href = anchor.get("href") or ""
+        m = re.search(r"/item/(m[0-9a-zA-Z]+)", href)
+        if not m:
+            continue
+        item_id = m.group(1)
+        if item_id in seen_ids:
+            continue
+
+        price = _extract_price_from_card(li)
+        if price is None:
+            logger.info("Mercari: no clean price in card item_id=%s — skipping", item_id)
+            continue
+
+        title = _extract_title_from_card(li)
+        img = li.select_one("img")
+        thumb = img.get("src") if img else None
+        url = href if href.startswith("http") else f"https://jp.mercari.com{href}"
+
+        items.append({
+            "item_id": item_id,
+            "title": _clean_title(title),
+            "price_jpy": price,
+            "url": url,
+            "thumbnail_url": thumb,
+        })
+        seen_ids.add(item_id)
+        if len(items) >= max_results:
+            break
+
+    return items
+
+
+def _extract_price_from_card(card: Any) -> int | None:
+    """Pull the displayed list price from an item card, rejecting installment estimates."""
+    # Prefer the canonical .merPrice component (its text is "¥X,XXX")
+    price_el = card.select_one(".merPrice")
+    if price_el is None:
+        return None
+    text = price_el.get_text(strip=True)
+    if any(marker in text for marker in _INSTALLMENT_MARKERS):
+        return None
+    return _parse_yen_text(text)
+
+
+def _extract_title_from_card(card: Any) -> str:
+    name_el = card.select_one('[data-testid="thumbnail-item-name"]')
+    if name_el is not None:
+        return name_el.get_text(strip=True)
+    img = card.select_one("img[alt]")
+    if img is not None:
+        return img.get("alt") or ""
+    return ""
+
+
+def _parse_yen_text(text: str) -> int | None:
+    cleaned = text.replace("¥", "").replace(",", "").replace("，", "").strip()
+    m = re.search(r"(\d+)", cleaned)
+    return int(m.group(1)) if m else None
+
+
+# ── Detail-page verification ──────────────────────────────────────────────────
+
+_PRICE_META_RE = re.compile(
+    r'<meta[^>]+name=["\']product:price:amount["\'][^>]+content=["\'](\d+)["\']',
+    re.IGNORECASE,
+)
+
+
+def fetch_item_detail_price(item_id: str, *, timeout: float = 15.0) -> int | None:
+    """Fetch the authoritative price for a Mercari item via plain HTTP.
+
+    Reads ``<meta name="product:price:amount">`` from the SSR'd HTML.
+    Returns the price in JPY or None on any failure.
+    """
+    url = f"{MERCARI_ITEM_BASE}/{item_id}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": _USER_AGENT,
+            "Accept-Language": "ja-JP,ja;q=0.9",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status != 200:
+                logger.warning("Mercari detail fetch HTTP %s for %s", resp.status, item_id)
+                return None
+            html = resp.read().decode("utf-8", errors="replace")
+    except (urllib.error.URLError, TimeoutError) as exc:
+        logger.warning("Mercari detail fetch error for %s: %s", item_id, exc)
+        return None
+    return parse_detail_price(html)
+
+
+def parse_detail_price(html: str) -> int | None:
+    """Extract the authoritative price from a Mercari item detail page HTML."""
+    m = _PRICE_META_RE.search(html)
+    return int(m.group(1)) if m else None
+
+
+def _verify_candidates_via_detail_pages(
+    candidates: list[dict[str, object]],
+    *,
+    price_max: int,
+) -> list[dict[str, object]]:
+    verified: list[dict[str, object]] = []
+    for item in candidates:
+        item_id = str(item.get("item_id") or "")
+        if not item_id:
+            continue
+        detail_price = fetch_item_detail_price(item_id)
+        if detail_price is None:
+            logger.warning(
+                "Mercari: detail-page verification failed for %s — dropping (search price was ¥%s)",
+                item_id,
+                item.get("price_jpy"),
+            )
+            continue
+        if detail_price > price_max:
+            logger.info(
+                "Mercari: %s above price_max after verification (search=¥%s, detail=¥%s, max=¥%s)",
+                item_id,
+                item.get("price_jpy"),
+                detail_price,
+                price_max,
+            )
+            continue
+        search_price = int(item.get("price_jpy") or 0)
+        if search_price and detail_price != search_price:
+            logger.warning(
+                "Mercari: search/detail price mismatch for %s (search=¥%s, detail=¥%s) — using detail",
+                item_id,
+                search_price,
+                detail_price,
+            )
+        verified.append({**item, "price_jpy": detail_price})
+    return verified
 
 
 # ── Relevance filter ──────────────────────────────────────────────────────────
@@ -104,29 +284,24 @@ def _resolve_chromium_executable() -> str | None:
 
 
 def _normalise(text: str) -> str:
-    """Lower-case and normalise spaces/full-width chars for substring matching."""
     return (
         text.lower()
-        .replace("　", " ")   # full-width space → ASCII space
-        .replace("・", " ")   # middle dot → space
+        .replace("　", " ")
+        .replace("・", " ")
         .replace("【", " ").replace("】", " ")
         .replace("（", " ").replace("）", " ")
         .replace("「", " ").replace("」", " ")
-        # strip the Mercari auto-appended alt-text suffix
         .removesuffix("のサムネイル")
         .strip()
     )
 
 
 def _query_tokens(query: str) -> list[str]:
-    """Split query into non-empty tokens for AND matching."""
-    # Normalise then split on whitespace
     tokens = _normalise(query).split()
     return [t for t in tokens if t]
 
 
 def _filter_by_query(items: list[dict[str, object]], query: str) -> list[dict[str, object]]:
-    """Keep only items whose title contains ALL tokens from query."""
     tokens = _query_tokens(query)
     if not tokens:
         return items
@@ -146,173 +321,5 @@ def _filter_by_query(items: list[dict[str, object]], query: str) -> list[dict[st
     return kept
 
 
-def _extract_items(page: object, *, max_results: int) -> list[dict[str, object]]:
-    """Try multiple extraction strategies to handle Mercari's evolving DOM."""
-    items: list[dict[str, object]] = []
-
-    # Strategy 1: evaluate JS to pull structured data from the page
-    try:
-        js_items = page.evaluate(_JS_EXTRACT)  # type: ignore[attr-defined]
-        if js_items and isinstance(js_items, list):
-            for raw in js_items[:max_results]:
-                parsed = _parse_js_item(raw)
-                if parsed:
-                    items.append(parsed)
-            if items:
-                logger.debug("Mercari JS extraction succeeded items=%d", len(items))
-                return items
-    except Exception as exc:
-        logger.debug("Mercari JS extraction failed: %s", exc)
-
-    # Strategy 2: DOM selector scraping
-    try:
-        dom_items = _extract_via_dom(page, max_results=max_results)
-        if dom_items:
-            logger.debug("Mercari DOM extraction succeeded items=%d", len(dom_items))
-            return dom_items
-    except Exception as exc:
-        logger.debug("Mercari DOM extraction failed: %s", exc)
-
-    return items
-
-
-_JS_EXTRACT = """
-(() => {
-  const results = [];
-
-  // Try <mer-item-thumbnail> web components (Mercari's custom elements)
-  const thumbnails = document.querySelectorAll('mer-item-thumbnail');
-  if (thumbnails.length > 0) {
-    thumbnails.forEach(el => {
-      try {
-        const anchor = el.closest('a') || el.querySelector('a');
-        const href = anchor ? anchor.getAttribute('href') : null;
-        const itemIdMatch = href ? href.match(/\\/item\\/(m[0-9a-zA-Z]+)/) : null;
-        const itemId = itemIdMatch ? itemIdMatch[1] : null;
-        if (!itemId) return;
-
-        // Price
-        const priceEl = el.querySelector('[data-testid="thumbnail-price"]') ||
-                        el.querySelector('.merPrice') ||
-                        el.closest('li')?.querySelector('[class*="price"]');
-        const priceText = priceEl ? priceEl.textContent : '';
-        const priceMatch = priceText.replace(/[,，]/g, '').match(/([0-9]+)/);
-        const price = priceMatch ? parseInt(priceMatch[1]) : null;
-        if (!price) return;
-
-        // Title
-        const titleEl = el.querySelector('img');
-        const title = titleEl ? (titleEl.getAttribute('alt') || '') : '';
-
-        // Thumbnail
-        const imgEl = el.querySelector('img');
-        const thumbnail = imgEl ? imgEl.src : null;
-
-        results.push({ item_id: itemId, title, price_jpy: price, href, thumbnail });
-      } catch(e) {}
-    });
-    return results;
-  }
-
-  // Try generic li[data-item-id] pattern
-  const listItems = document.querySelectorAll('li[data-item-id]');
-  listItems.forEach(li => {
-    try {
-      const itemId = li.getAttribute('data-item-id');
-      if (!itemId) return;
-      const anchor = li.querySelector('a[href*="/item/"]');
-      const href = anchor ? anchor.getAttribute('href') : `/item/${itemId}`;
-      const priceEl = li.querySelector('[class*="price"]');
-      const priceText = priceEl ? priceEl.textContent : '';
-      const priceMatch = priceText.replace(/[,，]/g, '').match(/([0-9]+)/);
-      const price = priceMatch ? parseInt(priceMatch[1]) : null;
-      if (!price) return;
-      const imgEl = li.querySelector('img');
-      const title = imgEl ? imgEl.getAttribute('alt') || '' : '';
-      const thumbnail = imgEl ? imgEl.src : null;
-      results.push({ item_id: itemId, title, price_jpy: price, href, thumbnail });
-    } catch(e) {}
-  });
-  return results;
-})()
-"""
-
-
 def _clean_title(raw: str) -> str:
-    """Strip Mercari's auto-appended alt-text suffix and trim whitespace."""
     return raw.removesuffix("のサムネイル").strip()
-
-
-def _parse_js_item(raw: dict[str, object]) -> dict[str, object] | None:
-    item_id = raw.get("item_id") or ""
-    price_jpy = raw.get("price_jpy")
-    if not item_id or not isinstance(price_jpy, int) or price_jpy <= 0:
-        return None
-    href = str(raw.get("href") or f"/item/{item_id}")
-    url = href if href.startswith("http") else f"https://jp.mercari.com{href}"
-    return {
-        "item_id": str(item_id),
-        "title": _clean_title(str(raw.get("title") or "")),
-        "price_jpy": price_jpy,
-        "url": url,
-        "thumbnail_url": raw.get("thumbnail") or None,
-    }
-
-
-def _extract_via_dom(page: object, *, max_results: int) -> list[dict[str, object]]:
-    items: list[dict[str, object]] = []
-
-    # Try anchor tags pointing to /item/mXXXX
-    anchors = page.query_selector_all("a[href*='/item/m']")  # type: ignore[attr-defined]
-    seen_ids: set[str] = set()
-
-    for anchor in anchors[:max_results * 3]:
-        try:
-            href = anchor.get_attribute("href") or ""
-            m = re.search(r"/item/(m[0-9a-zA-Z]+)", href)
-            if not m:
-                continue
-            item_id = m.group(1)
-            if item_id in seen_ids:
-                continue
-            seen_ids.add(item_id)
-
-            # Walk up to find price
-            price_jpy: int | None = None
-            parent = anchor
-            for _ in range(5):
-                price_el = parent.query_selector('[class*="price"], [data-testid*="price"]')
-                if price_el:
-                    price_text = price_el.inner_text() or ""
-                    pm = re.search(r"([0-9,，]+)", price_text.replace(",", "").replace("，", ""))
-                    if pm:
-                        price_jpy = int(pm.group(1))
-                    break
-                try:
-                    parent = parent.evaluate_handle("el => el.parentElement")
-                except Exception:
-                    break
-            if not price_jpy:
-                continue
-
-            img = anchor.query_selector("img")
-            title = ""
-            thumbnail_url = None
-            if img:
-                title = _clean_title(img.get_attribute("alt") or "")
-                thumbnail_url = img.get_attribute("src")
-
-            url = href if href.startswith("http") else f"https://jp.mercari.com{href}"
-            items.append({
-                "item_id": item_id,
-                "title": title,
-                "price_jpy": price_jpy,
-                "url": url,
-                "thumbnail_url": thumbnail_url,
-            })
-            if len(items) >= max_results:
-                break
-        except Exception:
-            continue
-
-    return items
