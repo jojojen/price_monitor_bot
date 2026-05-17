@@ -328,22 +328,61 @@ class TelegramBotClient:
     def get_updates(self, *, offset: int | None = None, timeout: int = 20) -> list[dict[str, object]]:
         payload: dict[str, object] = {
             "timeout": timeout,
-            "allowed_updates": ["message"],
+            "allowed_updates": ["message", "callback_query"],
         }
         if offset is not None:
             payload["offset"] = offset
         result = self._call("getUpdates", payload)
         return result if isinstance(result, list) else []
 
-    def send_message(self, *, chat_id: str | int, text: str) -> dict[str, object]:
-        return self._call(
-            "sendMessage",
-            {
-                "chat_id": str(chat_id),
-                "text": text[:4096],
-                "disable_web_page_preview": True,
-            },
-        )
+    def send_message(
+        self,
+        *,
+        chat_id: str | int,
+        text: str,
+        reply_markup: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "chat_id": str(chat_id),
+            "text": text[:4096],
+            "disable_web_page_preview": True,
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        return self._call("sendMessage", payload)
+
+    def edit_message_text(
+        self,
+        *,
+        chat_id: str | int,
+        message_id: int,
+        text: str,
+        reply_markup: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "chat_id": str(chat_id),
+            "message_id": int(message_id),
+            "text": text[:4096],
+            "disable_web_page_preview": True,
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        return self._call("editMessageText", payload)
+
+    def answer_callback_query(
+        self,
+        *,
+        callback_query_id: str,
+        text: str | None = None,
+        show_alert: bool = False,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "callback_query_id": callback_query_id,
+            "show_alert": show_alert,
+        }
+        if text is not None:
+            payload["text"] = text[:200]
+        return self._call("answerCallbackQuery", payload)
 
     def send_photo(self, *, chat_id: str | int, photo_path: Path, caption: str | None = None) -> dict[str, object]:
         return self._call_multipart(
@@ -2064,6 +2103,14 @@ def run_telegram_polling(
             updates = client.get_updates(offset=offset, timeout=poll_timeout)
             for update in updates:
                 offset = int(update["update_id"]) + 1
+                callback_query = update.get("callback_query")
+                if isinstance(callback_query, dict):
+                    handle_telegram_callback_query(
+                        client=client,
+                        processor=processor,
+                        callback_query=callback_query,
+                    )
+                    continue
                 message = update.get("message")
                 if not isinstance(message, dict):
                     continue
@@ -2077,6 +2124,82 @@ def run_telegram_polling(
         logger.info("Telegram polling stopped by KeyboardInterrupt")
         print("Telegram polling stopped.")
     return 0
+
+
+def handle_telegram_callback_query(
+    *,
+    client: TelegramBotClient,
+    processor: TelegramCommandProcessor,
+    callback_query: dict[str, object],
+) -> None:
+    """Dispatch a Telegram callback_query (e.g. inline-button tap) to its handler.
+
+    Callback-data dispatch table:
+      - ``snsdel:<handle>``  → delete the SNS watch rule for ``@<handle>``.
+
+    On success we edit the source message to remove its inline keyboard and
+    append a `✓ 已刪除` line, then answer the callback with a brief toast.
+    """
+    callback_id = callback_query.get("id")
+    data = callback_query.get("data")
+    message = callback_query.get("message")
+    if not isinstance(callback_id, str) or not isinstance(data, str) or not isinstance(message, dict):
+        return
+
+    chat = message.get("chat")
+    chat_id = chat.get("id") if isinstance(chat, dict) else None
+    message_id = message.get("message_id")
+    original_text = message.get("text") if isinstance(message.get("text"), str) else ""
+
+    if chat_id is None or not isinstance(message_id, int):
+        return
+
+    if not processor.is_allowed_chat(chat_id):
+        logger.warning(
+            "Rejected Telegram callback_query from unauthorized chat_id=%s",
+            mask_identifier(chat_id),
+        )
+        try:
+            client.answer_callback_query(callback_query_id=callback_id)
+        except Exception:
+            logger.exception("answer_callback_query failed for unauthorized chat_id=%s", mask_identifier(chat_id))
+        return
+
+    prefix, _, payload = data.partition(":")
+    toast = "未知按鈕"
+    edited = False
+
+    if prefix == "snsdel" and payload:
+        handle = payload.lstrip("@")
+        reply = processor._handle_sns_delete(f"@{handle}")
+        if reply.startswith("✓"):
+            toast = f"已刪除 @{handle}"
+            new_text = f"{original_text}\n\n✓ 已刪除 @{handle}"
+            edited = True
+        elif reply.startswith("找不到"):
+            toast = f"已經不在追蹤 @{handle}"
+            new_text = f"{original_text}\n\n✓ 已刪除 @{handle}（先前已移除）"
+            edited = True
+        else:
+            toast = reply[:200]
+    else:
+        logger.warning("Unknown callback_query prefix=%r data=%r", prefix, data)
+
+    if edited:
+        try:
+            client.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=new_text,
+                reply_markup=None,
+            )
+        except Exception:
+            logger.exception("edit_message_text failed chat_id=%s message_id=%s", mask_identifier(chat_id), message_id)
+
+    try:
+        client.answer_callback_query(callback_query_id=callback_id, text=toast)
+    except Exception:
+        logger.exception("answer_callback_query failed callback_id=%s", callback_id)
 
 
 def handle_telegram_message(

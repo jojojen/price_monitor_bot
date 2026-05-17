@@ -31,6 +31,7 @@ from price_monitor_bot.bot import (
     build_processing_ack,
     format_liquidity_board,
     format_photo_lookup_result,
+    handle_telegram_callback_query,
     handle_telegram_message,
     parse_lookup_command,
     parse_reputation_snapshot_command,
@@ -85,10 +86,50 @@ class FakeTelegramClient:
         self.sent_messages: list[str] = []
         self.sent_documents: list[tuple[str, str | None]] = []
         self.sent_photos: list[tuple[str, str | None]] = []
+        self.edited_messages: list[dict[str, object]] = []
+        self.answered_callbacks: list[dict[str, object]] = []
 
-    def send_message(self, *, chat_id: str | int, text: str) -> dict[str, object]:
+    def send_message(
+        self,
+        *,
+        chat_id: str | int,
+        text: str,
+        reply_markup: dict[str, object] | None = None,
+    ) -> dict[str, object]:
         self.sent_messages.append(text)
-        return {"chat_id": str(chat_id), "text": text}
+        return {"chat_id": str(chat_id), "text": text, "reply_markup": reply_markup}
+
+    def edit_message_text(
+        self,
+        *,
+        chat_id: str | int,
+        message_id: int,
+        text: str,
+        reply_markup: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        record = {
+            "chat_id": str(chat_id),
+            "message_id": message_id,
+            "text": text,
+            "reply_markup": reply_markup,
+        }
+        self.edited_messages.append(record)
+        return record
+
+    def answer_callback_query(
+        self,
+        *,
+        callback_query_id: str,
+        text: str | None = None,
+        show_alert: bool = False,
+    ) -> dict[str, object]:
+        record = {
+            "callback_query_id": callback_query_id,
+            "text": text,
+            "show_alert": show_alert,
+        }
+        self.answered_callbacks.append(record)
+        return record
 
     def send_document(self, *, chat_id: str | int, document_path: Path, caption: str | None = None) -> dict[str, object]:
         self.sent_documents.append((document_path.name, caption))
@@ -1484,3 +1525,117 @@ def test_handle_photo_message_installs_clarification_when_renderer_returns_unres
     pending = processor.get_pending_photo_clarification("123")
     assert pending is not None
     assert pending.parsed_game == "pokemon"
+
+
+# ── Callback-query dispatch (inline button: ❌ 刪除追蹤) ───────────────────────
+
+class _FakeAccountRule:
+    """Stand-in for sns_monitor.models.AccountWatch used only by the
+    callback-query dispatch tests below (the real model lives in a separate
+    package that this bot's venv does not import)."""
+
+    def __init__(self, rule_id: str, screen_name: str) -> None:
+        self.rule_id = rule_id
+        self.screen_name = screen_name
+        self.include_keywords: tuple[str, ...] = ()
+        self.query: str | None = None
+
+
+class _FakeSnsDatabase:
+    def __init__(self, rules: list[_FakeAccountRule]) -> None:
+        self._rules: list[_FakeAccountRule] = list(rules)
+        self.deleted: list[str] = []
+
+    def list_watch_rules(self):
+        return list(self._rules)
+
+    def delete_watch_rule(self, rule_id: str) -> bool:
+        for idx, rule in enumerate(self._rules):
+            if rule.rule_id == rule_id:
+                self._rules.pop(idx)
+                self.deleted.append(rule_id)
+                return True
+        return False
+
+
+def _processor_with_sns_db(sns_db) -> TelegramCommandProcessor:
+    return TelegramCommandProcessor(
+        allowed_chat_ids=frozenset({"123"}),
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        sns_db=sns_db,
+    )
+
+
+def _callback_update(*, chat_id: str, data: str, text: str = "🔎 自動加入追蹤 @foo") -> dict:
+    return {
+        "id": "cbq-1",
+        "data": data,
+        "message": {
+            "message_id": 42,
+            "chat": {"id": chat_id},
+            "text": text,
+        },
+    }
+
+
+def test_callback_query_snsdel_deletes_rule_and_edits_message() -> None:
+    sns_db = _FakeSnsDatabase([_FakeAccountRule("abc12345", "foo")])
+    processor = _processor_with_sns_db(sns_db)
+    client = FakeTelegramClient()
+
+    handle_telegram_callback_query(
+        client=client,
+        processor=processor,
+        callback_query=_callback_update(chat_id="123", data="snsdel:foo"),
+    )
+
+    assert sns_db.deleted == ["abc12345"]
+    assert len(client.edited_messages) == 1
+    edited = client.edited_messages[0]
+    assert edited["message_id"] == 42
+    assert "✓ 已刪除 @foo" in edited["text"]
+    assert edited["reply_markup"] is None  # keyboard cleared
+    assert len(client.answered_callbacks) == 1
+    assert "已刪除" in client.answered_callbacks[0]["text"]
+
+
+def test_callback_query_snsdel_idempotent_when_rule_already_gone() -> None:
+    sns_db = _FakeSnsDatabase([])  # no rules
+    processor = _processor_with_sns_db(sns_db)
+    client = FakeTelegramClient()
+
+    handle_telegram_callback_query(
+        client=client,
+        processor=processor,
+        callback_query=_callback_update(chat_id="123", data="snsdel:foo"),
+    )
+
+    assert sns_db.deleted == []
+    # Still edits the source message + answers the callback so the user
+    # sees a confirmation either way.
+    assert len(client.edited_messages) == 1
+    assert "已刪除 @foo" in client.edited_messages[0]["text"]
+    assert client.answered_callbacks
+    assert "已經不在追蹤" in client.answered_callbacks[0]["text"]
+
+
+def test_callback_query_from_unauthorized_chat_is_rejected() -> None:
+    sns_db = _FakeSnsDatabase([_FakeAccountRule("abc12345", "foo")])
+    processor = _processor_with_sns_db(sns_db)
+    client = FakeTelegramClient()
+
+    handle_telegram_callback_query(
+        client=client,
+        processor=processor,
+        callback_query=_callback_update(chat_id="999", data="snsdel:foo"),
+    )
+
+    # Rule must not be touched, source message must not be edited.
+    assert sns_db.deleted == []
+    assert client.edited_messages == []
+    # We still answer the callback (Telegram requires it within ~15s to
+    # remove the loading spinner on the button), just without a toast.
+    assert client.answered_callbacks
+    assert client.answered_callbacks[0]["text"] is None
