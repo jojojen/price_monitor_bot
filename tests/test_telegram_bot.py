@@ -513,7 +513,7 @@ def test_handle_telegram_message_clarifies_image_without_caption() -> None:
 
     assert len(replies) == 2
     assert replies[0] == PHOTO_INTAKE_ACK
-    assert "請回覆數字" in replies[1]
+    assert "請點按鈕" in replies[1]
     assert "1. 要我查這張寶可夢卡市價嗎？" in replies[1]
     assert "4. 都不是，請回答：否，[您的意圖]" in replies[1]
     assert client.sent_messages == list(replies)
@@ -1244,7 +1244,7 @@ def test_handle_telegram_message_clarifies_when_intent_is_unknown() -> None:
 
     assert len(replies) == 2
     assert replies[0] == TEXT_INTAKE_ACK
-    assert "請回覆數字" in replies[1]
+    assert "請點按鈕" in replies[1]
     # Falls back to /search + /help options when nothing else fits.
     assert "上網搜尋" in replies[1]
     assert "/help" in replies[1]
@@ -1274,7 +1274,7 @@ def test_handle_telegram_message_clarifies_when_intent_confidence_is_low() -> No
     assert len(replies) == 2
     assert replies[0] == TEXT_INTAKE_ACK
     reply = replies[1]
-    assert "請回覆數字" in reply
+    assert "請點按鈕" in reply
     # The LLM's top guess shows up first.
     assert "1. 上網搜尋" in reply
     # Game keyword "pokemon" added a /price alternative.
@@ -2023,3 +2023,237 @@ def test_huntlist_view_empty_when_no_provider_results() -> None:
     assert "目前沒有 Opportunity 候選" in text
     assert kb is None
     assert page == 0
+
+
+# ── Clarification flows: inline buttons for photo / text option selection ─────
+
+def _last_message_reply_markup(client: FakeTelegramClient) -> dict[str, object] | None:
+    """Helper: the FakeTelegramClient.sent_messages list only keeps text. To
+    inspect the reply_markup we need to drop down to the underlying calls —
+    but the test fake's send_message returns the keyword dict it received,
+    so we record by patching."""
+    # No-op in current fake; tests below use a wrapper FakeClient with capture.
+    return None
+
+
+class CapturingTelegramClient(FakeTelegramClient):
+    """FakeTelegramClient that also records each send_message's reply_markup."""
+
+    def __init__(self, sample_path: Path | None = None) -> None:
+        super().__init__(sample_path=sample_path)
+        self.sent_markups: list[dict[str, object] | None] = []
+
+    def send_message(
+        self,
+        *,
+        chat_id: str | int,
+        text: str,
+        reply_markup: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        self.sent_markups.append(reply_markup)
+        return super().send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+
+
+def test_photo_clarification_message_carries_popt_inline_keyboard() -> None:
+    sample_path = get_image_lookup_live_case("pokemon-pikachu-partial-s40").image_path
+    client = CapturingTelegramClient(sample_path=sample_path)
+    processor = TelegramCommandProcessor(
+        allowed_chat_ids=frozenset({"123"}),
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        photo_intent_analyzer=lambda query: _ambiguous_photo_analysis(),
+    )
+
+    handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: "unused",
+        message={
+            "chat": {"id": "123"},
+            "photo": [{"file_id": "photo-1", "file_size": 128}],
+        },
+    )
+
+    # Find the clarification message (the one containing the numbered options
+    # — it's the final reply, not the intake/processing acks).
+    clar_idx = next(
+        i for i, t in enumerate(client.sent_messages) if "請點按鈕" in t
+    )
+    kb = client.sent_markups[clar_idx]
+    assert kb is not None
+    # `_ambiguous_photo_analysis` yields 3 numbered options.
+    buttons = [row[0] for row in kb["inline_keyboard"]]
+    assert all(b["callback_data"].startswith("popt:") for b in buttons)
+    assert [b["callback_data"] for b in buttons] == ["popt:1", "popt:2", "popt:3"]
+
+
+def test_text_clarification_message_carries_topt_inline_keyboard() -> None:
+    client = CapturingTelegramClient()
+    router = StubNaturalLanguageRouter(
+        TelegramNaturalLanguageIntent(
+            intent="unknown",
+            game=None,
+            name=None,
+            confidence=0.1,
+        )
+    )
+    processor = TelegramCommandProcessor(
+        allowed_chat_ids=frozenset({"123"}),
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        natural_language_router=router,
+    )
+
+    handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: "unused",
+        message={"chat": {"id": "123"}, "text": "why are pokemon cards popular"},
+    )
+
+    clar_idx = next(
+        (i for i, t in enumerate(client.sent_messages) if "請點按鈕" in t),
+        None,
+    )
+    assert clar_idx is not None, client.sent_messages
+    kb = client.sent_markups[clar_idx]
+    assert kb is not None
+    buttons = [row[0] for row in kb["inline_keyboard"]]
+    assert all(b["callback_data"].startswith("topt:") for b in buttons)
+    assert {int(b["callback_data"].split(":")[1]) for b in buttons} == {
+        opt for opt in range(1, len(buttons) + 1)
+    }
+
+
+def test_callback_query_popt_selects_option_and_runs_photo_action() -> None:
+    sample_path = get_image_lookup_live_case("pokemon-pikachu-partial-s40").image_path
+    client = CapturingTelegramClient(sample_path=sample_path)
+    processor = TelegramCommandProcessor(
+        allowed_chat_ids=frozenset({"123"}),
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        photo_intent_analyzer=lambda query: _ambiguous_photo_analysis(),
+    )
+
+    # 1. Upload an ambiguous photo → bot installs pending clarification.
+    handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: "unused",
+        message={
+            "chat": {"id": "123"},
+            "photo": [{"file_id": "photo-1", "file_size": 128}],
+        },
+    )
+
+    # 2. User taps `popt:1` button instead of typing "1".
+    handle_telegram_callback_query(
+        client=client,
+        processor=processor,
+        callback_query={
+            "id": "cbq-popt",
+            "data": "popt:1",
+            "message": {
+                "message_id": 31,
+                "chat": {"id": "123"},
+                "text": "我先看了一下，這張圖看起來比較像「寶可夢卡片」…\n請點按鈕…",
+            },
+        },
+        photo_renderer=lambda query: f"resolved:{query.caption}:{query.game_hint}",
+    )
+
+    # Original clarification message gets edited to show the selection and
+    # have its keyboard cleared.
+    assert len(client.edited_messages) == 1
+    edited = client.edited_messages[0]
+    assert "✓ 已選 1." in edited["text"]
+    assert edited["reply_markup"] is None
+    # Callback toast confirms the choice.
+    assert any(a["text"] == "已選 1" for a in client.answered_callbacks)
+    # The downstream action that "1" would have triggered must run — the
+    # plan's ack and reply land as fresh messages.
+    assert any("第 1 個方式處理" in m for m in client.sent_messages)
+    assert any(m.startswith("resolved:") for m in client.sent_messages)
+
+
+def test_callback_query_topt_selects_option_and_runs_text_action() -> None:
+    client = CapturingTelegramClient()
+    nl_intent = TelegramNaturalLanguageIntent(
+        intent="unknown",
+        game=None,
+        name=None,
+        confidence=0.1,
+    )
+    router = StubNaturalLanguageRouter(nl_intent)
+    processor = TelegramCommandProcessor(
+        allowed_chat_ids=frozenset({"123"}),
+        lookup_renderer=lambda query: f"price:{query.name}",
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        natural_language_router=router,
+    )
+
+    handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: "unused",
+        message={"chat": {"id": "123"}, "text": "why are pokemon cards popular"},
+    )
+
+    # Tap the first option button.
+    handle_telegram_callback_query(
+        client=client,
+        processor=processor,
+        callback_query={
+            "id": "cbq-topt",
+            "data": "topt:1",
+            "message": {
+                "message_id": 42,
+                "chat": {"id": "123"},
+                "text": "我看了一下你的訊息…\n請點按鈕…",
+            },
+        },
+    )
+
+    assert len(client.edited_messages) == 1
+    edited = client.edited_messages[0]
+    assert "✓ 已選 1." in edited["text"]
+    assert edited["reply_markup"] is None
+    assert any(a["text"] == "已選 1" for a in client.answered_callbacks)
+
+
+def test_callback_query_popt_with_no_pending_state_shows_expired_toast() -> None:
+    client = CapturingTelegramClient()
+    processor = TelegramCommandProcessor(
+        allowed_chat_ids=frozenset({"123"}),
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+    )
+
+    # No pending state set; user taps a stale button.
+    handle_telegram_callback_query(
+        client=client,
+        processor=processor,
+        callback_query={
+            "id": "cbq-stale",
+            "data": "popt:2",
+            "message": {
+                "message_id": 99,
+                "chat": {"id": "123"},
+                "text": "（已過期的釐清訊息）",
+            },
+        },
+    )
+
+    # The button is removed (keyboard cleared) and toast says expired.
+    assert client.edited_messages
+    assert client.edited_messages[0]["reply_markup"] is None
+    assert "已過期" in client.edited_messages[0]["text"]
+    assert client.answered_callbacks
+    assert client.answered_callbacks[0]["text"] == "選項已處理或過期"
+    # No fresh action messages should be sent.
+    assert client.sent_messages == []

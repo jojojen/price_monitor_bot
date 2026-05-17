@@ -346,17 +346,44 @@ def _build_photo_intent_options(*, parsed_game: str | None, item_kind: str | Non
     return tuple(options)
 
 
-def _build_photo_clarification_reply(analysis: TelegramPhotoIntentAnalysis) -> str:
+def _build_clarification_keyboard(
+    prefix: str, options: tuple
+) -> dict[str, object] | None:
+    """Build the inline keyboard for a numbered-options clarification message.
+
+    Each option becomes one row: ``[N. <prompt>]`` with callback_data
+    ``<prefix>:<N>``. The "都不是 / 否，..." free-form fallback stays as a
+    text-only instruction (Telegram inline buttons can't capture free text).
+    Returns None if there are no options to render.
+    """
+    if not options:
+        return None
+    keyboard: list[list[dict[str, object]]] = []
+    for opt in options:
+        prompt = str(opt.prompt or "").strip()
+        # Telegram renders button text on a single line; cap to keep it readable.
+        if len(prompt) > 48:
+            prompt = prompt[:47] + "…"
+        keyboard.append([{
+            "text": f"{opt.option_number}. {prompt}",
+            "callback_data": f"{prefix}:{opt.option_number}",
+        }])
+    return {"inline_keyboard": keyboard}
+
+
+def _build_photo_clarification_reply(
+    analysis: TelegramPhotoIntentAnalysis,
+) -> tuple[str, dict[str, object] | None]:
     context = _describe_photo_analysis_context(
         parsed_game=analysis.parsed_game,
         parsed_item_kind=analysis.parsed_item_kind,
         parsed_title=analysis.parsed_title,
     )
-    lines = [context, "請回覆數字："]
+    lines = [context, "請點按鈕（或回覆數字）："]
     for option in analysis.options:
         lines.append(f"{option.option_number}. {option.prompt}")
     lines.append(f"{len(analysis.options) + 1}. 都不是，請回答：否，[您的意圖]")
-    return "\n".join(lines)
+    return "\n".join(lines), _build_clarification_keyboard("popt", analysis.options)
 
 
 def _describe_photo_analysis_context(*, parsed_game: str | None, parsed_item_kind: str | None, parsed_title: str | None) -> str:
@@ -710,9 +737,11 @@ class TelegramCommandProcessor:
                 ),
             )
 
+        retry_text, retry_kb = _build_pending_photo_retry_reply(pending.options)
         return TelegramTextReplyPlan(
             ack=None,
-            reply=_build_pending_photo_retry_reply(pending.options),
+            reply=retry_text,
+            reply_markup=retry_kb,
         )
 
     def build_pending_text_reply_plan(
@@ -776,9 +805,11 @@ class TelegramCommandProcessor:
                 reputation_delivery_factory=rerouted_plan.reputation_delivery_factory,
             )
 
+        retry_text, retry_kb = _build_pending_text_retry_reply(pending.options)
         return TelegramTextReplyPlan(
             ack=None,
-            reply=_build_pending_text_retry_reply(pending.options),
+            reply=retry_text,
+            reply_markup=retry_kb,
         )
 
     def build_reply_plan(self, *, chat_id: str | int, text: str | None) -> TelegramTextReplyPlan:
@@ -930,9 +961,11 @@ class TelegramCommandProcessor:
                 top_intent=top_intent,
             )
         )
+        clar_text, clar_kb = _build_text_clarification_reply(text, options, top_intent)
         return TelegramTextReplyPlan(
             ack=None,
-            reply=_build_text_clarification_reply(text, options, top_intent),
+            reply=clar_text,
+            reply_markup=clar_kb,
         )
 
     def _handle_lookup(self, raw: str) -> str:
@@ -2315,6 +2348,7 @@ def run_telegram_polling(
                         client=client,
                         processor=processor,
                         callback_query=callback_query,
+                        photo_renderer=resolved_photo_renderer,
                     )
                     continue
                 message = update.get("message")
@@ -2357,6 +2391,7 @@ def handle_telegram_callback_query(
     client: TelegramBotClient,
     processor: TelegramCommandProcessor,
     callback_query: dict[str, object],
+    photo_renderer: PhotoLookupRenderer | None = None,
 ) -> None:
     """Dispatch a Telegram callback_query (e.g. inline-button tap) to its handler.
 
@@ -2370,6 +2405,9 @@ def handle_telegram_callback_query(
         one on the last page).
       - ``close:<list>``            → clear the inline keyboard and mark the
         message as closed.
+      - ``popt:<N>`` / ``topt:<N>`` → pick option N from a pending photo /
+        text clarification — the same action the user would have triggered by
+        typing the digit N as a normal message.
     """
     callback_id = callback_query.get("id")
     data = callback_query.get("data")
@@ -2451,6 +2489,50 @@ def handle_telegram_callback_query(
             new_reply_markup = None
             toast = None
             rerender = True
+    elif prefix in ("popt", "topt") and payload.isdigit():
+        option_n = int(payload)
+        is_photo = prefix == "popt"
+        # Peek at the pending state to find the prompt for this option — we
+        # need it for the audit line before `build_pending_*_reply_plan`
+        # consumes it.
+        pending = (
+            processor.get_pending_photo_clarification(chat_id) if is_photo
+            else processor.get_pending_text_clarification(chat_id)
+        )
+        if pending is None:
+            toast = "選項已處理或過期"
+            new_text = f"{original_text}\n\n（選項已過期）"
+            new_reply_markup = None
+            rerender = True
+        else:
+            picked_prompt = next(
+                (o.prompt for o in pending.options if o.option_number == option_n),
+                None,
+            )
+            if picked_prompt is None:
+                toast = "找不到該選項"
+            else:
+                new_text = f"{original_text}\n\n✓ 已選 {option_n}. {picked_prompt}"
+                new_reply_markup = None
+                rerender = True
+                toast = f"已選 {option_n}"
+                # Run the same plan the user would have triggered by typing N.
+                if is_photo:
+                    plan = processor.build_pending_photo_reply_plan(
+                        chat_id=chat_id, text=str(option_n), photo_renderer=photo_renderer
+                    )
+                else:
+                    plan = processor.build_pending_text_reply_plan(
+                        chat_id=chat_id, text=str(option_n)
+                    )
+                if plan is not None:
+                    try:
+                        _send_text_reply_plan(client=client, chat_id=chat_id, plan=plan)
+                    except Exception:
+                        logger.exception(
+                            "Sending clarification plan from callback failed chat_id=%s prefix=%s n=%d",
+                            mask_identifier(chat_id), prefix, option_n,
+                        )
     else:
         logger.warning("Unknown callback_query prefix=%r data=%r", prefix, data)
 
@@ -2537,13 +2619,7 @@ def handle_telegram_message(
         photo_renderer=photo_renderer,
     )
     if pending_plan is not None:
-        if pending_plan.ack:
-            client.send_message(chat_id=chat_id, text=pending_plan.ack)
-            replies.append(pending_plan.ack)
-        pending_reply = pending_plan.execute()
-        if pending_reply:
-            client.send_message(chat_id=chat_id, text=pending_reply)
-            replies.append(pending_reply)
+        replies.extend(_send_text_reply_plan(client=client, chat_id=chat_id, plan=pending_plan))
         return tuple(replies)
 
     if not has_photo:
@@ -2552,22 +2628,11 @@ def handle_telegram_message(
             text=text_value,
         )
         if text_pending_plan is not None:
-            if text_pending_plan.ack:
-                client.send_message(chat_id=chat_id, text=text_pending_plan.ack)
-                replies.append(text_pending_plan.ack)
-            if text_pending_plan.reputation_delivery_factory is not None:
-                delivery = text_pending_plan.reputation_delivery_factory()
-                _send_reputation_delivery(client=client, chat_id=chat_id, delivery=delivery)
-                replies.append(delivery.summary_text)
-                return tuple(replies)
-            pending_text_reply = text_pending_plan.execute()
-            if pending_text_reply:
-                client.send_message(chat_id=chat_id, text=pending_text_reply)
-                replies.append(pending_text_reply)
+            replies.extend(_send_text_reply_plan(client=client, chat_id=chat_id, plan=text_pending_plan))
             return tuple(replies)
 
     if has_photo:
-        final_reply, ack = _handle_photo_message(
+        final_reply, ack, reply_markup = _handle_photo_message(
             client=client,
             processor=processor,
             photo_renderer=photo_renderer,
@@ -2577,7 +2642,7 @@ def handle_telegram_message(
         if ack:
             client.send_message(chat_id=chat_id, text=ack)
             replies.append(ack)
-        client.send_message(chat_id=chat_id, text=final_reply)
+        client.send_message(chat_id=chat_id, text=final_reply, reply_markup=reply_markup)
         replies.append(final_reply)
         return tuple(replies)
     if text_value is not None and _extract_command_name(text_value) in REPUTATION_SNAPSHOT_COMMANDS:
@@ -2593,16 +2658,31 @@ def handle_telegram_message(
         return tuple(replies)
 
     plan = processor.build_reply_plan(chat_id=chat_id, text=text_value)
+    replies.extend(_send_text_reply_plan(client=client, chat_id=chat_id, plan=plan))
+    return tuple(replies)
+
+
+def _send_text_reply_plan(
+    *,
+    client: TelegramBotClient,
+    chat_id: str | int,
+    plan: TelegramTextReplyPlan,
+) -> list[str]:
+    """Send a TelegramTextReplyPlan to Telegram and return the texts sent.
+
+    Single-source-of-truth for the "ack → reputation delivery → reply"
+    sequence. Used by both the message-handler and the callback-query
+    dispatcher so they can't drift.
+    """
+    sent: list[str] = []
     if plan.ack:
         client.send_message(chat_id=chat_id, text=plan.ack)
-        replies.append(plan.ack)
-
+        sent.append(plan.ack)
     if plan.reputation_delivery_factory is not None:
         delivery = plan.reputation_delivery_factory()
         _send_reputation_delivery(client=client, chat_id=chat_id, delivery=delivery)
-        replies.append(delivery.summary_text)
-        return tuple(replies)
-
+        sent.append(delivery.summary_text)
+        return sent
     reply = plan.execute()
     if reply:
         logger.debug(
@@ -2611,8 +2691,8 @@ def handle_telegram_message(
             trim_for_log(reply, limit=320),
         )
         client.send_message(chat_id=chat_id, text=reply, reply_markup=plan.reply_markup)
-        replies.append(reply)
-    return tuple(replies)
+        sent.append(reply)
+    return sent
 
 
 def send_telegram_test_message(
@@ -2666,16 +2746,16 @@ def _handle_photo_message(
     photo_renderer: PhotoLookupRenderer,
     chat_id: str | int,
     message: dict[str, object],
-) -> tuple[str, str | None]:
+) -> tuple[str, str | None, dict[str, object] | None]:
     caption = message.get("caption")
     caption_text = caption if isinstance(caption, str) else None
     photo_items = message.get("photo")
     if not isinstance(photo_items, list) or not photo_items:
-        return "No image was attached.", None
+        return "No image was attached.", None, None
 
     candidates = [item for item in photo_items if isinstance(item, dict) and item.get("file_id")]
     if not candidates:
-        return "Could not resolve the Telegram file metadata for this image.", None
+        return "Could not resolve the Telegram file metadata for this image.", None, None
 
     best_item = max(
         candidates,
@@ -2683,7 +2763,7 @@ def _handle_photo_message(
     )
     file_id = best_item.get("file_id")
     if not isinstance(file_id, str):
-        return "Could not resolve the Telegram file id for this image.", None
+        return "Could not resolve the Telegram file id for this image.", None, None
 
     game_hint, title_hint = _parse_photo_caption_for_lookup(caption_text)
 
@@ -2706,7 +2786,13 @@ def _handle_photo_message(
                 if reply.pending_clarification is not None:
                     processor.set_pending_photo_clarification(reply.pending_clarification)
                     installed_pending = True
-                return reply.text, reply.ack or build_processing_ack(has_photo=True)
+                    # When the renderer routed the user into a clarification
+                    # we mint the same per-option keyboard the ambiguous-intake
+                    # path uses, so direct-lookup fallbacks get one-tap selection too.
+                    kb = _build_clarification_keyboard("popt", reply.pending_clarification.options)
+                else:
+                    kb = None
+                return reply.text, reply.ack or build_processing_ack(has_photo=True), kb
             finally:
                 if not installed_pending:
                     try:
@@ -2727,10 +2813,11 @@ def _handle_photo_message(
                 parsed_title=analysis.parsed_title,
             )
         )
-        return _build_photo_clarification_reply(analysis), None
+        text, kb = _build_photo_clarification_reply(analysis)
+        return text, None, kb
     except Exception as exc:  # pragma: no cover - network-dependent.
         logger.exception("Telegram photo handling failed chat_id=%s file_id=%s", mask_identifier(chat_id), file_id)
-        return f"Image lookup failed: {exc}", None
+        return f"Image lookup failed: {exc}", None, None
 
 
 def _download_telegram_photo_to_temp(*, client: TelegramBotClient, file_id: str) -> Path:
@@ -2785,12 +2872,14 @@ def _coerce_photo_lookup_reply(value: "str | PhotoLookupReply") -> PhotoLookupRe
     return PhotoLookupReply(text=str(value))
 
 
-def _build_pending_photo_retry_reply(options: tuple[TelegramPhotoIntentOption, ...]) -> str:
-    lines = ["我現在在等你確認這張圖要怎麼處理，請直接回覆："]
+def _build_pending_photo_retry_reply(
+    options: tuple[TelegramPhotoIntentOption, ...],
+) -> tuple[str, dict[str, object] | None]:
+    lines = ["我現在在等你確認這張圖要怎麼處理，請點按鈕（或回覆數字）："]
     for option in options:
         lines.append(f"{option.option_number}. {option.prompt}")
-    lines.append(f"或輸入：否，[您的意圖]")
-    return "\n".join(lines)
+    lines.append("或輸入：否，[您的意圖]")
+    return "\n".join(lines), _build_clarification_keyboard("popt", options)
 
 
 def _match_photo_clarification_option(
@@ -3030,24 +3119,26 @@ def _build_text_clarification_reply(
     original_text: str,
     options: tuple[TelegramTextIntentOption, ...],
     top_intent: "TelegramNaturalLanguageIntent | None",
-) -> str:
+) -> tuple[str, dict[str, object] | None]:
     if top_intent is not None and top_intent.intent != "unknown":
         head = "我看了一下你的訊息，但我還不想先亂猜你的意圖。"
     else:
         head = "我還不太確定你想叫我做什麼，所以先不亂動手。"
-    lines = [head, "請回覆數字："]
+    lines = [head, "請點按鈕（或回覆數字）："]
     for option in options:
         lines.append(f"{option.option_number}. {option.prompt}")
     lines.append(f"{len(options) + 1}. 都不是，請回答：否，[您的意圖]")
-    return "\n".join(lines)
+    return "\n".join(lines), _build_clarification_keyboard("topt", options)
 
 
-def _build_pending_text_retry_reply(options: tuple[TelegramTextIntentOption, ...]) -> str:
-    lines = ["我現在在等你確認剛剛那則訊息要怎麼處理，請直接回覆："]
+def _build_pending_text_retry_reply(
+    options: tuple[TelegramTextIntentOption, ...],
+) -> tuple[str, dict[str, object] | None]:
+    lines = ["我現在在等你確認剛剛那則訊息要怎麼處理，請點按鈕（或回覆數字）："]
     for option in options:
         lines.append(f"{option.option_number}. {option.prompt}")
     lines.append("或輸入：否，[您的意圖]")
-    return "\n".join(lines)
+    return "\n".join(lines), _build_clarification_keyboard("topt", options)
 
 
 def _match_text_clarification_option(
