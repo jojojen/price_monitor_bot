@@ -161,6 +161,34 @@ _SNS_FILTER_HINT_KEYWORDS = (
 )
 _X_HANDLE_RE = re.compile(r"@([a-zA-Z0-9_]{1,15})")
 _SNS_FILTER_BRACKET_RE = re.compile(r"[\[\(]([^\]\)]+)[\]\)]")
+
+# Detects bulk-update requests like "把每個跟 tcg 相關的 sns 追蹤帳號 filter 都加上「抽選」"
+# in two helpers:
+#  1) _SNS_BULK_PLURAL_TARGET_RE — pulls the domain target out of the
+#     "每個/所有 ... <domain> ..." clause.
+#  2) _SNS_BULK_KEYWORD_QUOTED_RE — pulls the quoted keyword.
+# Two separate matches let us be liberal about word order (e.g. "filter 加上
+# 抽選" vs "加上 抽選 filter") without compounding into one fragile regex.
+_BULK_PLURAL_KEYWORDS = (
+    "每個", "每个", "全部", "所有", "每隻", "每只",
+)
+_BULK_FILTER_HINT_KEYWORDS = (
+    "filter", "filters", "篩選", "筛选", "過濾", "过滤",
+    "keyword", "keywords", "關鍵字", "关键字",
+)
+_BULK_ADD_VERB_KEYWORDS = (
+    "加上", "加入", "添加", "改成", "改為", "改为", "都包含", "都加",
+)
+_SNS_BULK_TARGET_RE = re.compile(
+    r"(?P<target>tcg|pokemon|寶可夢|宝可梦|ポケモン|"
+    r"yugioh|遊戲王|遊戯王|"
+    r"ws|weiss\s*schwarz|ヴァイス|"
+    r"union[\s_]?arena|ユニオンアリーナ)",
+    re.IGNORECASE,
+)
+_SNS_BULK_KEYWORD_BRACKETED_RE = re.compile(
+    r"[「『\"\[\(【]([^」』\"\]\)】]{1,30})[」』\"\]\)】]"
+)
 _SNS_FILTER_NORMALIZATION_TABLE = str.maketrans({
     "［": "[",
     "］": "]",
@@ -293,6 +321,9 @@ class TelegramNaturalLanguageIntent:
     sns_keyword: str | None = None      # for sns_add_keyword (keyword watch)
     sns_buzz_query: str | None = None   # for sns_buzz (LLM topic digest)
     sns_include_keywords: tuple[str, ...] = ()
+    # SNS bulk filter update (sns_bulk_add_filter)
+    bulk_target_domain: str | None = None      # e.g. "tcg" / "pokemon"
+    bulk_filter_keywords: tuple[str, ...] = ()
 
 
 class TelegramNaturalLanguageRouter:
@@ -421,6 +452,9 @@ class TelegramNaturalLanguageRouter:
             '- "監控關鍵字 機動戰士" -> sns_add_keyword, sns_keyword="機動戰士"\n'
             '- "整理一下 amd 最近的熱門討論" -> sns_buzz, sns_buzz_query="amd"\n'
             '- "Trump 在 X 上最近怎樣" -> sns_buzz, sns_buzz_query="Trump"\n'
+            '- "把每個跟 tcg 相關的 sns 追蹤帳號 filter 都加上「抽選」" -> sns_bulk_add_filter, bulk_target_domain="tcg", bulk_filter_keywords=["抽選"]\n'
+            '- "幫所有 pokemon 帳號加上 抽選 filter" -> sns_bulk_add_filter, bulk_target_domain="pokemon", bulk_filter_keywords=["抽選"]\n'
+            '- "所有遊戲王帳號的篩選都改成包含 新弾" -> sns_bulk_add_filter, bulk_target_domain="yugioh", bulk_filter_keywords=["新弾"]\n'
             '- "你會什麼" -> help\n'
             '- "你現在狀態如何" -> status\n'
             '- "列出所有工具" -> tools\n'
@@ -562,6 +596,56 @@ def fallback_route_telegram_natural_language(text: str) -> TelegramNaturalLangua
             query_url=url_match.group(0),
             confidence=0.85,
         )
+
+    # ── SNS bulk filter update (must run before single-handle SNS routing) ───
+    # The shape we recognise: a plural quantifier ("每個" / "所有" / "全部"
+    # / "每隻"), a TCG-or-specific domain token, an action verb ("加上" /
+    # "加入" / "改成"...), a filter/keyword hint word, and at least one
+    # keyword. The components can be in any order — we look for each
+    # independently and accept when all four are present.
+
+    has_plural = any(kw in content for kw in _BULK_PLURAL_KEYWORDS)
+    has_verb = any(kw in content for kw in _BULK_ADD_VERB_KEYWORDS)
+    has_filter_hint = any(kw in lowered for kw in _BULK_FILTER_HINT_KEYWORDS)
+    target_match = _SNS_BULK_TARGET_RE.search(content)
+
+    if has_plural and has_verb and has_filter_hint and target_match:
+        bulk_target = _normalize_bulk_target_domain(target_match.group("target"))
+        bulk_keywords: tuple[str, ...] = ()
+        bracket_match = _SNS_BULK_KEYWORD_BRACKETED_RE.search(content)
+        if bracket_match:
+            bulk_keywords = _normalize_keyword_values(
+                _split_keyword_phrase(bracket_match.group(1))
+            )
+        else:
+            # No quoted keyword — look for the token sitting next to an
+            # action verb. "加上 抽選 filter" → keyword = "抽選".
+            for verb in _BULK_ADD_VERB_KEYWORDS:
+                idx = content.find(verb)
+                if idx < 0:
+                    continue
+                tail = content[idx + len(verb):]
+                # consume contiguous space and stop at the next filter hint
+                # word, period, or end of input.
+                stripped = tail.strip()
+                stop_idx = len(stripped)
+                for hint in _BULK_FILTER_HINT_KEYWORDS:
+                    h = stripped.lower().find(hint)
+                    if h > 0 and h < stop_idx:
+                        stop_idx = h
+                candidate = stripped[:stop_idx].strip(" 　,，、。.\"'「」『』[]()【】")
+                if candidate:
+                    bulk_keywords = _normalize_keyword_values(
+                        _split_keyword_phrase(candidate)
+                    )
+                    break
+        if bulk_target and bulk_keywords:
+            return TelegramNaturalLanguageIntent(
+                intent="sns_bulk_add_filter",
+                bulk_target_domain=bulk_target,
+                bulk_filter_keywords=bulk_keywords,
+                confidence=0.9,
+            )
 
     # ── SNS intents (must run before Mercari watch intents so @handle wins) ───
 
@@ -799,6 +883,7 @@ _ALLOWED_INTENTS = frozenset({
     "add_watch", "list_watches", "remove_watch", "update_watch_price",
     "reputation_snapshot", "web_research", "opportunity_remove",
     "sns_add_account", "sns_add_keyword", "sns_list", "sns_delete", "sns_buzz",
+    "sns_bulk_add_filter",
     "help", "status", "tools", "scan_help", "unknown",
 })
 
@@ -825,6 +910,8 @@ def _normalize_intent(payload: dict[str, object]) -> TelegramNaturalLanguageInte
     sns_keyword = _normalize_text_field(payload.get("sns_keyword"))
     sns_buzz_query = _normalize_text_field(payload.get("sns_buzz_query"))
     sns_include_keywords = _normalize_sns_include_keywords(payload.get("sns_include_keywords"))
+    bulk_target_domain = _normalize_bulk_target_domain(payload.get("bulk_target_domain"))
+    bulk_filter_keywords = _normalize_sns_include_keywords(payload.get("bulk_filter_keywords"))
 
     if intent == "trend_board" and limit is None:
         limit = 5
@@ -853,7 +940,36 @@ def _normalize_intent(payload: dict[str, object]) -> TelegramNaturalLanguageInte
         sns_keyword=sns_keyword,
         sns_buzz_query=sns_buzz_query,
         sns_include_keywords=sns_include_keywords,
+        bulk_target_domain=bulk_target_domain,
+        bulk_filter_keywords=bulk_filter_keywords,
     )
+
+
+_BULK_DOMAIN_ALIASES = {
+    "tcg": "tcg",
+    "pokemon": "pokemon", "寶可夢": "pokemon", "宝可梦": "pokemon", "pkm": "pokemon", "ポケモン": "pokemon",
+    "yugioh": "yugioh", "遊戲王": "yugioh", "遊戯王": "yugioh", "遊王": "yugioh", "yu-gi-oh": "yugioh",
+    "ws": "ws", "weiss schwarz": "ws", "weiss": "ws", "ヴァイス": "ws",
+    "union_arena": "union_arena", "union arena": "union_arena", "ua": "union_arena", "ユニオンアリーナ": "union_arena",
+}
+
+
+def _normalize_bulk_target_domain(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    cleaned = text.replace("　", " ").replace("-", " ").strip()
+    if cleaned in _BULK_DOMAIN_ALIASES:
+        return _BULK_DOMAIN_ALIASES[cleaned]
+    compact = cleaned.replace(" ", "")
+    if compact in _BULK_DOMAIN_ALIASES:
+        return _BULK_DOMAIN_ALIASES[compact]
+    underscored = cleaned.replace(" ", "_")
+    if underscored in _BULK_DOMAIN_ALIASES:
+        return _BULK_DOMAIN_ALIASES[underscored]
+    return None
 
 
 def _normalize_sns_include_keywords(value: object) -> tuple[str, ...]:

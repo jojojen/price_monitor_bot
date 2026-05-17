@@ -324,6 +324,20 @@ class PendingTelegramTextClarification:
         return (time.monotonic() - self.created_at) > TEXT_CLARIFICATION_TTL_SECONDS
 
 
+@dataclass(slots=True)
+class PendingTelegramSnsBulkUpdate:
+    """A SNS bulk-filter update that's been previewed to the user and is
+    waiting on a confirm / cancel inline-button tap."""
+    chat_id: str
+    bulk_target_domain: str
+    keywords: tuple[str, ...]
+    affected_rule_ids: tuple[str, ...]
+    created_at: float = field(default_factory=time.monotonic)
+
+    def is_expired(self) -> bool:
+        return (time.monotonic() - self.created_at) > TEXT_CLARIFICATION_TTL_SECONDS
+
+
 def default_photo_intent_analyzer(
     *,
     db_path: str | Path | None = None,
@@ -659,6 +673,7 @@ class TelegramCommandProcessor:
         self._opportunity_list_provider = opportunity_list_provider
         self._pending_photo_clarifications: dict[str, PendingTelegramPhotoClarification] = {}
         self._pending_text_clarifications: dict[str, PendingTelegramTextClarification] = {}
+        self._pending_sns_bulk_updates: dict[str, PendingTelegramSnsBulkUpdate] = {}
 
     def is_allowed_chat(self, chat_id: str | int) -> bool:
         if not self._allowed_chat_ids:
@@ -707,6 +722,22 @@ class TelegramCommandProcessor:
 
     def clear_pending_text_clarification(self, chat_id: str | int) -> None:
         self._pending_text_clarifications.pop(str(chat_id), None)
+
+    def get_pending_sns_bulk_update(self, chat_id: str | int) -> PendingTelegramSnsBulkUpdate | None:
+        key = str(chat_id)
+        pending = self._pending_sns_bulk_updates.get(key)
+        if pending is None:
+            return None
+        if not pending.is_expired():
+            return pending
+        self._pending_sns_bulk_updates.pop(key, None)
+        return None
+
+    def set_pending_sns_bulk_update(self, pending: PendingTelegramSnsBulkUpdate) -> None:
+        self._pending_sns_bulk_updates[pending.chat_id] = pending
+
+    def pop_pending_sns_bulk_update(self, chat_id: str | int) -> PendingTelegramSnsBulkUpdate | None:
+        return self._pending_sns_bulk_updates.pop(str(chat_id), None)
 
     def analyze_photo_intent(self, query: TelegramPhotoQuery) -> TelegramPhotoIntentAnalysis:
         return self._photo_intent_analyzer(query)
@@ -1538,6 +1569,13 @@ class TelegramCommandProcessor:
                 reply_factory=lambda x=q: self._handle_sns_buzz(x),
             )
 
+        if intent.intent == "sns_bulk_add_filter":
+            return self._build_sns_bulk_add_filter_plan(
+                chat_id=chat_id,
+                target_domain=intent.bulk_target_domain or "",
+                keywords=intent.bulk_filter_keywords,
+            )
+
         return None
 
     def _handle_sns_add(self, raw: str, chat_id: str) -> str:
@@ -1827,6 +1865,77 @@ class TelegramCommandProcessor:
         except Exception as exc:
             logger.exception("SNS buzz failed query=%s", query)
             return f"熱門整理失敗：{exc}"
+
+    def _build_sns_bulk_add_filter_plan(
+        self,
+        *,
+        chat_id: str | int,
+        target_domain: str,
+        keywords: tuple[str, ...],
+    ) -> "TelegramTextReplyPlan":
+        """Build the preview message for ``sns_bulk_add_filter`` and stash a
+        PendingTelegramSnsBulkUpdate so the confirm/cancel inline buttons
+        know what to do."""
+        if self._sns_db is None:
+            return TelegramTextReplyPlan(ack=None, reply="SNS 監控尚未啟用（sns_db 未設定）。")
+        if not target_domain:
+            return TelegramTextReplyPlan(ack=None, reply="我看不太懂你要對哪類帳號加 filter，請重講一次。")
+        if not keywords:
+            return TelegramTextReplyPlan(ack=None, reply="請告訴我要加哪個 filter 關鍵字。")
+
+        try:
+            from sns_monitor.bulk_filter import (
+                find_accounts_matching_domain,
+                resolve_target_domain_set,
+            )
+        except ImportError:
+            logger.exception("sns_monitor.bulk_filter import failed")
+            return TelegramTextReplyPlan(ack=None, reply="SNS bulk-filter 模組載入失敗。")
+
+        target_set = resolve_target_domain_set(target_domain)
+        accounts = find_accounts_matching_domain(self._sns_db, target_set)
+        if not accounts:
+            return TelegramTextReplyPlan(
+                ack=None,
+                reply=f"找不到任何 domain 跟 {target_domain} 有交集的 SNS 帳號。",
+            )
+
+        kw_display = "、".join(keywords)
+        lines = [
+            f"🎯 找到 {len(accounts)} 個 {target_domain} 相關帳號，要把 filter 加上：{kw_display}",
+            "",
+        ]
+        for rule in accounts[:10]:
+            existing = (
+                f" 現有 filter[{', '.join(rule.include_keywords)}]"
+                if rule.include_keywords else " 現有 filter[]"
+            )
+            domain_label = f" domain[{', '.join(rule.domains)}]" if rule.domains else ""
+            lines.append(f"- @{rule.screen_name}{domain_label}{existing}")
+        if len(accounts) > 10:
+            lines.append(f"  …以及另外 {len(accounts) - 10} 筆")
+        lines.append("")
+        lines.append(f"確認要把「{kw_display}」加進這 {len(accounts)} 個帳號的 filter 嗎？")
+
+        pending = PendingTelegramSnsBulkUpdate(
+            chat_id=str(chat_id),
+            bulk_target_domain=target_domain,
+            keywords=keywords,
+            affected_rule_ids=tuple(r.rule_id for r in accounts),
+        )
+        self.set_pending_sns_bulk_update(pending)
+
+        reply_markup = {
+            "inline_keyboard": [
+                [{"text": f"✓ 全部修改 ({len(accounts)})", "callback_data": "bulk:c"}],
+                [{"text": "✖️ 取消", "callback_data": "bulk:x"}],
+            ]
+        }
+        return TelegramTextReplyPlan(
+            ack=None,
+            reply="\n".join(lines),
+            reply_markup=reply_markup,
+        )
 
     def _route_natural_language(self, text: str) -> TelegramNaturalLanguageIntent | None:
         if self._natural_language_router is not None:
@@ -2490,6 +2599,63 @@ def _handle_condition_callback(
     return "未知操作", None, None
 
 
+def _handle_sns_bulk_update_callback(
+    *,
+    processor: TelegramCommandProcessor,
+    action: str,
+    chat_id: str | int,
+    original_text: str,
+) -> tuple[str | None, str | None, dict[str, object] | None]:
+    """Resolve a `bulk:c` / `bulk:x` callback (confirm / cancel of an SNS
+    bulk filter-add preview). Returns (toast, edit_text, edit_reply_markup).
+
+    The pending preview state is popped on either action so a second tap is
+    harmless. Confirm applies the keyword merge via
+    ``sns_monitor.bulk_filter.apply_bulk_keyword_filter_add`` against the
+    rule ids captured at preview time — fresh DB lookups, so any concurrent
+    deletion shows up as fewer updates.
+    """
+    pending = processor.pop_pending_sns_bulk_update(chat_id)
+    if pending is None:
+        return "操作已過期，請重新輸入", f"{original_text}\n\n（操作已過期）", None
+
+    if action == "x":
+        return "已取消", f"{original_text}\n\n（已取消）", None
+
+    if action != "c":
+        return "未知操作", None, None
+
+    if processor._sns_db is None:
+        return "SNS 監控未啟用", f"{original_text}\n\n（SNS 監控未啟用）", None
+
+    try:
+        from sns_monitor.bulk_filter import apply_bulk_keyword_filter_add
+    except ImportError:
+        logger.exception("sns_monitor.bulk_filter import failed in bulk callback")
+        return "套用失敗", f"{original_text}\n\n（套用失敗：模組載入錯誤）", None
+
+    fresh_accounts = []
+    for rule_id in pending.affected_rule_ids:
+        rule = processor._sns_db.get_watch_rule(rule_id)
+        if rule is not None:
+            fresh_accounts.append(rule)
+
+    updated = apply_bulk_keyword_filter_add(
+        processor._sns_db, fresh_accounts, pending.keywords
+    )
+
+    kw_display = "、".join(pending.keywords)
+    if not updated:
+        return (
+            "沒有需要更新的帳號",
+            f"{original_text}\n\n（沒有帳號需要更新，全部已經有「{kw_display}」）",
+            None,
+        )
+    toast = f"已修改 {len(updated)} 個帳號"
+    new_text = f"{original_text}\n\n✓ 已修改 {len(updated)} 個帳號 filter 加上「{kw_display}」"
+    return toast, new_text, None
+
+
 def _list_view_renderer(processor: TelegramCommandProcessor, list_kind: str):
     """Return the ``render_*_view`` method for the given list kind, or None."""
     return {
@@ -2623,6 +2789,20 @@ def handle_telegram_callback_query(
             watch_id=watch_id,
             action=action,
             extra=parts[2] if len(parts) >= 3 else "",
+            original_text=original_text,
+        )
+        if toast_out is not None:
+            toast = toast_out
+        if edit_text is not None:
+            new_text = edit_text
+            new_reply_markup = edit_kb
+            rerender = True
+    elif prefix == "bulk" and payload in ("c", "x"):
+        # bulk SNS-filter update preview confirm / cancel.
+        toast_out, edit_text, edit_kb = _handle_sns_bulk_update_callback(
+            processor=processor,
+            action=payload,
+            chat_id=chat_id,
             original_text=original_text,
         )
         if toast_out is not None:
