@@ -12,6 +12,9 @@ from tcg_tracker.image_lookup import (
     TcgImagePriceService,
     _merge_local_vision_candidate,
     _repair_pokemon_card_number_with_slab,
+    _select_footer_from_candidates,
+    _title_looks_implausible,
+    _validate_footer_candidate,
     parse_image_caption_hints,
     parse_tcg_ocr_text,
 )
@@ -1513,3 +1516,282 @@ def test_sanity_check_rejects_mismatch_in_lookup_image(monkeypatch, tmp_path) ->
     assert outcome.status == "rejected_sanity"
     assert outcome.parsed.research_hint is not None
     assert outcome.lookup_result is None
+
+
+# ── A1: structural validation of one backend's footer candidate ───────────────
+
+def test_footer_candidate_passes_with_well_formed_values() -> None:
+    out = _validate_footer_candidate(card_number="038/095", set_code="sm9", rarity="RR", game="pokemon")
+    assert out == {"card_number": "038/095", "set_code": "sm9", "rarity": "RR"}
+
+
+def test_footer_candidate_accepts_bare_numerator() -> None:
+    out = _validate_footer_candidate(card_number="38", set_code=None, rarity=None, game="pokemon")
+    assert out["card_number"] == "038"
+    assert out["set_code"] is None and out["rarity"] is None
+
+
+def test_footer_candidate_rejects_card_number_with_prefix() -> None:
+    out = _validate_footer_candidate(card_number="SM9 038", set_code=None, rarity=None, game="pokemon")
+    assert out["card_number"] is None
+
+
+def test_footer_candidate_rejects_oversized_denominator() -> None:
+    out = _validate_footer_candidate(card_number="9999/9999", set_code=None, rarity=None, game="pokemon")
+    assert out["card_number"] is None
+
+
+def test_footer_candidate_rejects_set_code_with_whitespace() -> None:
+    out = _validate_footer_candidate(card_number=None, set_code="Pokemon SV", rarity=None, game="pokemon")
+    assert out["set_code"] is None
+
+
+def test_footer_candidate_normalizes_verbose_rarity() -> None:
+    out = _validate_footer_candidate(card_number=None, set_code=None, rarity="ULTRARARE", game="pokemon")
+    assert out["rarity"] == "UR"
+    out2 = _validate_footer_candidate(card_number=None, set_code=None, rarity="Special Art Rare", game="pokemon")
+    assert out2["rarity"] == "SAR"
+
+
+def test_footer_candidate_drops_unknown_rarity() -> None:
+    out = _validate_footer_candidate(card_number=None, set_code=None, rarity="未知", game="pokemon")
+    assert out["rarity"] is None
+
+
+# ── A2: cross-backend consensus ───────────────────────────────────────────────
+
+def test_select_footer_returns_none_when_no_candidates_alive() -> None:
+    out = _select_footer_from_candidates([])
+    assert out == {"card_number": None, "set_code": None, "rarity": None}
+
+
+def test_select_footer_passes_through_single_candidate() -> None:
+    a = {"card_number": "038/095", "set_code": "sm9", "rarity": "RR"}
+    assert _select_footer_from_candidates([a]) == a
+
+
+def test_select_footer_returns_candidate_when_backends_agree() -> None:
+    a = {"card_number": "038/095", "set_code": "sm9", "rarity": "RR"}
+    b = {"card_number": "038/095", "set_code": "sm9", "rarity": "RR"}
+    assert _select_footer_from_candidates([a, b]) == a
+
+
+def test_select_footer_returns_none_when_disagreement_and_no_tiebreaker() -> None:
+    a = {"card_number": "038/095", "set_code": "sm9", "rarity": "RR"}
+    b = {"card_number": "133/196", "set_code": "sv2p", "rarity": "UR"}
+    assert _select_footer_from_candidates([a, b]) == {
+        "card_number": None, "set_code": None, "rarity": None,
+    }
+
+
+# ── A3: tesseract tiebreaker ──────────────────────────────────────────────────
+
+def test_select_footer_tiebreaker_picks_candidate_present_in_text() -> None:
+    a = {"card_number": "038/095", "set_code": "sm9", "rarity": "RR"}
+    b = {"card_number": "133/196", "set_code": "sv2p", "rarity": "UR"}
+    # Tesseract footer reads the card's actual SM9 038/095 printing.
+    out = _select_footer_from_candidates([a, b], tesseract_footer_text="ILLUS sm9 038/095 RR Mitsuhiro Arito")
+    assert out == a
+
+
+def test_select_footer_tiebreaker_returns_none_when_both_match() -> None:
+    a = {"card_number": "038/095", "set_code": "sm9", "rarity": "RR"}
+    b = {"card_number": "133/196", "set_code": "sv2p", "rarity": "UR"}
+    out = _select_footer_from_candidates(
+        [a, b], tesseract_footer_text="038/095 sm9 RR sv2p 133/196 UR"
+    )
+    assert out == {"card_number": None, "set_code": None, "rarity": None}
+
+
+def test_select_footer_tiebreaker_returns_none_when_neither_matches() -> None:
+    a = {"card_number": "038/095", "set_code": "sm9", "rarity": "RR"}
+    b = {"card_number": "133/196", "set_code": "sv2p", "rarity": "UR"}
+    out = _select_footer_from_candidates([a, b], tesseract_footer_text="totally unrelated noise")
+    assert out == {"card_number": None, "set_code": None, "rarity": None}
+
+
+# ── B: title plausibility filter (tesseract only) ─────────────────────────────
+
+def test_title_looks_implausible_flags_pure_ascii_noise() -> None:
+    assert _title_looks_implausible("SEX SELEY cer") is True
+    assert _title_looks_implausible("XYZ ABC DEF") is True
+
+
+def test_title_looks_implausible_does_not_flag_legit_titles() -> None:
+    assert _title_looks_implausible("Pikachu ex") is False
+    assert _title_looks_implausible("Charizard VMAX") is False
+    assert _title_looks_implausible("Mew V") is False
+    assert _title_looks_implausible("Mewtwo & Mew GX") is False
+    # CJK titles always pass — real Japanese / Chinese cards.
+    assert _title_looks_implausible("ゲンガー&ミミッキュGX") is False
+    assert _title_looks_implausible("リザードンex") is False
+
+
+def test_title_looks_implausible_handles_empty_and_none() -> None:
+    assert _title_looks_implausible(None) is False
+    assert _title_looks_implausible("") is False
+    assert _title_looks_implausible("   ") is False
+
+
+# ── Integration: cross-backend footer consensus kicks in ──────────────────────
+
+class _StubVisionClient:
+    """Bare-bones stub for a local vision client used in cross-backend tests.
+
+    Returns the pre-baked generic candidate from ``analyze_card_image`` and is
+    safe under the cooldown/timeout guards (``is_temporarily_disabled`` etc.).
+    """
+
+    def __init__(self, descriptor: str, generic: LocalVisionCardCandidate | None) -> None:
+        self.descriptor = descriptor
+        self._generic = generic
+
+    def analyze_card_image(self, *args, **kwargs):  # noqa: ARG002
+        return self._generic
+
+    def is_temporarily_disabled(self) -> bool:
+        return False
+
+    def cooldown_remaining_seconds(self) -> int:
+        return 0
+
+
+def _build_footer_candidate(*, card_number, set_code, rarity) -> LocalVisionCardCandidate:
+    return LocalVisionCardCandidate(
+        backend="ollama",
+        model="stub",
+        game="pokemon",
+        title=None,
+        aliases=(),
+        card_number=card_number,
+        rarity=rarity,
+        set_code=set_code,
+        item_kind="card",
+        confidence=0.9,
+    )
+
+
+def test_run_local_vision_fallback_picks_consensus_via_tesseract_tiebreaker(monkeypatch, tmp_path) -> None:
+    """The Gengar & Mimikyu GX regression: qwen2.5vl says 038/095 sm9 RR,
+    gemma3 hallucinates 133/196 sv2p UR. The tesseract footer text mentions
+    sm9 / 038 — pipeline must pick qwen's candidate, never gemma3's."""
+    image_path = tmp_path / "gengar.jpg"
+    image_path.write_bytes(b"stub")
+
+    service = TcgImagePriceService(
+        db_path=str(tmp_path / "monitor.sqlite3"),
+        tesseract_path=None,
+        vision_settings=TcgVisionSettings(backend=""),
+    )
+
+    qwen_footer = _build_footer_candidate(card_number="038/095", set_code="sm9", rarity="RR")
+    gemma_footer = _build_footer_candidate(card_number="133/196", set_code="sv2p", rarity="UR")
+
+    qwen_client = _StubVisionClient("ollama:qwen2.5vl:7b", None)
+    gemma_client = _StubVisionClient("ollama:gemma3:12b", None)
+    service._local_vision_clients = (qwen_client, gemma_client)
+
+    footer_by_descriptor = {
+        "ollama:qwen2.5vl:7b": qwen_footer,
+        "ollama:gemma3:12b": gemma_footer,
+    }
+
+    def fake_footer_probe(client, *_a, **_k):
+        return footer_by_descriptor[client.descriptor], ()
+
+    monkeypatch.setattr(service, "_run_footer_metadata_probe", fake_footer_probe)
+    monkeypatch.setattr(service, "_should_try_footer_metadata_probe", lambda *a, **k: True)
+    monkeypatch.setattr(service, "_should_try_sealed_box_title_probe", lambda *a, **k: False)
+
+    parsed = ParsedCardImage(
+        status="success",
+        game="pokemon",
+        title=None,
+        aliases=(),
+        card_number=None,
+        rarity=None,
+        set_code=None,
+        raw_text="",
+        extracted_lines=(),
+        item_kind="card",
+        warnings=(),
+        confidence=None,
+        research_hint=None,
+    )
+
+    best, _ = service._run_local_vision_fallback(
+        image_path,
+        game_hint="pokemon",
+        title_hint=None,
+        parsed=parsed,
+        item_kind_hint=None,
+        # Tesseract footer text mentions qwen's "sm9 038/095" — should win.
+        raw_text="ILLUS.Mitsuhiro Arito sm9 038/095 RR (C)2018 Pokémon",
+    )
+
+    assert best is not None
+    assert best.card_number == "038/095"
+    assert best.set_code == "sm9"
+
+
+def test_run_local_vision_fallback_drops_all_footers_when_no_tiebreaker(monkeypatch, tmp_path) -> None:
+    """When backends disagree and tesseract footer text is silent on both,
+    we must NOT pick either — the pipeline drops both footer candidates so
+    the user gets routed to clarification instead of a wrong query."""
+    image_path = tmp_path / "noisy.jpg"
+    image_path.write_bytes(b"stub")
+
+    service = TcgImagePriceService(
+        db_path=str(tmp_path / "monitor.sqlite3"),
+        tesseract_path=None,
+        vision_settings=TcgVisionSettings(backend=""),
+    )
+
+    qwen_footer = _build_footer_candidate(card_number="038/095", set_code="sm9", rarity="RR")
+    gemma_footer = _build_footer_candidate(card_number="133/196", set_code="sv2p", rarity="UR")
+
+    qwen_client = _StubVisionClient("ollama:qwen2.5vl:7b", None)
+    gemma_client = _StubVisionClient("ollama:gemma3:12b", None)
+    service._local_vision_clients = (qwen_client, gemma_client)
+
+    footer_by_descriptor = {
+        "ollama:qwen2.5vl:7b": qwen_footer,
+        "ollama:gemma3:12b": gemma_footer,
+    }
+    monkeypatch.setattr(
+        service,
+        "_run_footer_metadata_probe",
+        lambda client, *_a, **_k: (footer_by_descriptor[client.descriptor], ()),
+    )
+    monkeypatch.setattr(service, "_should_try_footer_metadata_probe", lambda *a, **k: True)
+    monkeypatch.setattr(service, "_should_try_sealed_box_title_probe", lambda *a, **k: False)
+
+    parsed = ParsedCardImage(
+        status="success",
+        game="pokemon",
+        title=None,
+        aliases=(),
+        card_number=None,
+        rarity=None,
+        set_code=None,
+        raw_text="",
+        extracted_lines=(),
+        item_kind="card",
+        warnings=(),
+        confidence=None,
+        research_hint=None,
+    )
+
+    best, warnings = service._run_local_vision_fallback(
+        image_path,
+        game_hint="pokemon",
+        title_hint=None,
+        parsed=parsed,
+        item_kind_hint=None,
+        raw_text="totally unrelated holo glare noise",
+    )
+
+    # Both footer candidates should have been dropped — best is either None
+    # or a non-footer candidate with no card_number / set_code / rarity.
+    assert best is None or (best.card_number is None and best.set_code is None)
+    assert any("disagreed" in w for w in warnings)

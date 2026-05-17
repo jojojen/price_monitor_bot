@@ -391,6 +391,13 @@ class TcgImagePriceService:
             title_hint=resolved_title_hint,
             item_kind_hint=item_kind_hint,
         )
+        if parsed.title and _title_looks_implausible(parsed.title):
+            logger.info(
+                "Tesseract title rejected as implausible value=%r path=%s",
+                parsed.title,
+                resolved_path,
+            )
+            parsed = replace(parsed, title=None)
         if path_title_hint:
             parsed = _merge_path_title_hint(parsed, path_title_hint)
         warnings = [*parsed.warnings, *extraction_warnings]
@@ -402,6 +409,7 @@ class TcgImagePriceService:
                 title_hint=resolved_title_hint,
                 parsed=parsed,
                 item_kind_hint=item_kind_hint,
+                raw_text=raw_text,
             )
             warnings.extend(vision_warnings)
             if vision_candidate is not None:
@@ -481,11 +489,16 @@ class TcgImagePriceService:
         title_hint: str | None,
         parsed: ParsedCardImage,
         item_kind_hint: str | None,
+        raw_text: str = "",
     ) -> tuple[LocalVisionCardCandidate | None, tuple[str, ...]]:
         if not self._local_vision_clients:
             return None, ()
         warnings: list[str] = []
         candidates: list[LocalVisionCardCandidate] = []
+        # Tracking footer-sourced candidates separately so we can cross-validate
+        # them against each other (and tesseract footer text) after every backend
+        # has been tried — see post-loop cross-backend consensus below.
+        footer_candidate_refs: list[LocalVisionCardCandidate] = []
         ordered_clients = list(self._local_vision_clients)
         if _pokemon_ocr_metadata_looks_suspicious(parsed):
             ordered_clients.sort(key=lambda client: _local_vision_client_priority(client.descriptor))
@@ -581,6 +594,7 @@ class TcgImagePriceService:
                 warnings.extend(footer_warnings)
                 if footer_candidate is not None:
                     footer_candidate = _sanitize_local_vision_candidate(footer_candidate)
+                    footer_candidate_refs.append(footer_candidate)
 
             selected_candidates: list[LocalVisionCardCandidate] = []
             if box_title_candidate is not None:
@@ -620,10 +634,83 @@ class TcgImagePriceService:
                 )
                 and _pokemon_card_number_looks_complete(footer_candidate.card_number)
             )
-            if should_stop_after_footer_metadata or any(
-                _local_vision_candidate_is_complete(selected_candidate) for selected_candidate in selected_candidates
-            ):
-                break
+            # We used to ``break`` here once a single backend produced a
+            # complete footer-sourced candidate. That short-circuit hid the
+            # cross-backend disagreement case (one backend hallucinates a
+            # confident-looking but wrong card number) — see the
+            # `SEX SELEY cer | 133/196 | ULTRARARE` incident in the openclaw
+            # logs from 2026-05-17. We now keep iterating every configured
+            # backend and reconcile their footer candidates below.
+            _ = should_stop_after_footer_metadata  # kept for diagnostic clarity
+
+        # Cross-backend footer consensus: if 2+ backends produced a footer
+        # candidate, validate each structurally and pick a consensus value.
+        # The chosen result is the only footer-sourced candidate we keep;
+        # disagreeing footers are dropped from the candidate pool so the
+        # downstream `_select_best_local_vision_candidate` can't pick the
+        # losing one. If consensus fails (disagreement with no tesseract
+        # tiebreaker), all footer-sourced candidates are dropped — letting
+        # `IMAGE_HARD_FLOOR` route the user to clarification.
+        if len(footer_candidate_refs) >= 2:
+            metas = [
+                _validate_footer_candidate(
+                    card_number=ref.card_number,
+                    set_code=ref.set_code,
+                    rarity=ref.rarity,
+                    game=game_hint,
+                )
+                for ref in footer_candidate_refs
+            ]
+            consensus = _select_footer_from_candidates(
+                metas, tesseract_footer_text=raw_text
+            )
+            chosen_meta_is_all_none = all(v is None for v in consensus.values())
+
+            if chosen_meta_is_all_none:
+                logger.warning(
+                    "Footer probe backends disagreed (no tiebreaker hit) image=%s metas=%s — dropping all footer-sourced candidates",
+                    image_path,
+                    metas,
+                )
+                dropped_ids = {id(ref) for ref in footer_candidate_refs}
+                candidates = [c for c in candidates if id(c) not in dropped_ids]
+                warnings.append(
+                    "Local vision footer probe results disagreed across backends; treating footer metadata as unreliable."
+                )
+            else:
+                kept_ref: LocalVisionCardCandidate | None = None
+                kept_indices: set[int] = set()
+                for index, ref in enumerate(footer_candidate_refs):
+                    if metas[index] == consensus and kept_ref is None:
+                        kept_ref = ref
+                        kept_indices.add(index)
+                        break
+                if kept_ref is None:
+                    # Consensus value didn't match any input verbatim (e.g.,
+                    # only one field survived validation). Re-find any
+                    # candidate whose validated metadata is a subset.
+                    for index, ref in enumerate(footer_candidate_refs):
+                        if all(
+                            consensus[k] in (None, metas[index].get(k))
+                            for k in ("card_number", "set_code", "rarity")
+                        ):
+                            kept_ref = ref
+                            kept_indices.add(index)
+                            break
+                dropped_refs = [
+                    ref
+                    for index, ref in enumerate(footer_candidate_refs)
+                    if index not in kept_indices
+                ]
+                if dropped_refs:
+                    logger.info(
+                        "Footer probe consensus selected one candidate; dropping %d disagreeing image=%s consensus=%s",
+                        len(dropped_refs),
+                        image_path,
+                        consensus,
+                    )
+                    dropped_ids = {id(ref) for ref in dropped_refs}
+                    candidates = [c for c in candidates if id(c) not in dropped_ids]
 
         best_candidate = _select_best_local_vision_candidate(candidates)
         if best_candidate is None:
@@ -1954,6 +2041,176 @@ def _title_looks_usable(value: str) -> bool:
     if len(stripped) > 30:
         return False
     if re.search(r"[。.!?]$", stripped):
+        return False
+    return True
+
+
+_TCG_TITLE_KEYWORD_RE = re.compile(
+    r"(?:^|[^A-Za-z])(ex|EX|GX|V|VMAX|VSTAR|MAX|SR|SAR|UR|HR|PSA|TAG|TEAM|LV)(?:[^A-Za-z]|$)"
+)
+
+
+_VALID_RARITIES: frozenset[str] = frozenset({
+    # Pokemon
+    "C", "U", "R", "RR", "SR", "SSR", "SAR", "UR", "HR", "AR", "S", "P",
+    "GX", "V", "VMAX", "VSTAR", "EX", "ex", "TR", "TG", "CHR", "CSR",
+    # Weiss Schwarz
+    "RRR", "PR",
+})
+
+_RARITY_NORMALIZE: dict[str, str] = {
+    "ULTRARARE": "UR", "ULTRA RARE": "UR",
+    "SUPERRARE": "SR", "SUPER RARE": "SR",
+    "DOUBLERARE": "RR", "DOUBLE RARE": "RR",
+    "HOLORARE": "R", "HOLO RARE": "R",
+    "SECRETRARE": "SR", "SECRET RARE": "SR",
+    "SPECIALARTRARE": "SAR", "SPECIAL ART RARE": "SAR",
+    "HYPERRARE": "HR", "HYPER RARE": "HR",
+    "CHARACTERRARE": "CHR", "CHARACTER RARE": "CHR",
+    "CHARACTERSUPERRARE": "CSR", "CHARACTER SUPER RARE": "CSR",
+}
+
+
+def _validate_footer_candidate(
+    *,
+    card_number: str | None,
+    set_code: str | None,
+    rarity: str | None,
+    game: str | None,
+) -> dict[str, str | None]:
+    """Structural-format sanity check for one backend's footer-metadata
+    candidate. Any field that doesn't pass its format rule is set to None;
+    the other fields are kept. Returns a dict shaped
+    ``{"card_number": str|None, "set_code": str|None, "rarity": str|None}``.
+
+    Rules (pokemon — other games inherit the same general checks for now):
+      - ``card_number``: ``<1-3 digits>/<1-3 digits>`` with numerator ≤
+        denominator and denominator in [10, 500]; or a naked numerator (no
+        slash) in [1, 999]. Numbers normalised to zero-padded width 3.
+      - ``set_code``: short lowercase alphanumeric, 2-8 chars.
+      - ``rarity``: in ``_VALID_RARITIES`` or one of the known verbose
+        forms (e.g. ``ULTRARARE`` → ``UR``).
+    """
+    result: dict[str, str | None] = {"card_number": None, "set_code": None, "rarity": None}
+
+    if card_number:
+        cleaned = card_number.strip().lower()
+        cleaned = re.sub(r"^(no\.|nº)\s*", "", cleaned)
+        slash_match = re.fullmatch(r"\s*(\d{1,3})\s*/\s*(\d{1,3})\s*", cleaned)
+        if slash_match:
+            num = int(slash_match.group(1))
+            denom = int(slash_match.group(2))
+            if 1 <= num <= denom and 10 <= denom <= 500:
+                result["card_number"] = f"{num:03d}/{denom:03d}"
+        else:
+            bare_match = re.fullmatch(r"\s*(\d{1,3})\s*", cleaned)
+            if bare_match:
+                num = int(bare_match.group(1))
+                if 1 <= num <= 999:
+                    result["card_number"] = f"{num:03d}"
+
+    if set_code:
+        cleaned = set_code.strip().lower()
+        if re.fullmatch(r"[a-z0-9]{2,8}", cleaned):
+            result["set_code"] = cleaned
+
+    if rarity:
+        raw = rarity.strip()
+        upper_compact = raw.upper().replace(" ", "")
+        if raw in _VALID_RARITIES:
+            result["rarity"] = raw
+        elif upper_compact in _VALID_RARITIES:
+            result["rarity"] = upper_compact
+        elif upper_compact in _RARITY_NORMALIZE:
+            result["rarity"] = _RARITY_NORMALIZE[upper_compact]
+
+    return result
+
+
+def _select_footer_from_candidates(
+    candidates: list[dict[str, str | None]],
+    *,
+    tesseract_footer_text: str | None = None,
+) -> dict[str, str | None]:
+    """Pick one footer-metadata dict from multiple backend candidates.
+
+    Strategy (A2 consensus → A3 tesseract tiebreaker):
+      - Discard candidates that have nothing useful (all three fields None).
+      - 0 left → all-None dict.
+      - 1 left → return it.
+      - 2+ left, all agree on ``(card_number, set_code)`` → return first.
+      - 2+ left, disagree → tesseract footer text (if any) decides; pick the
+        unique candidate whose card_number numerator OR set_code appears in
+        the text. Otherwise → all-None dict (safest: route to clarification).
+    """
+    none_dict: dict[str, str | None] = {"card_number": None, "set_code": None, "rarity": None}
+    alive = [
+        c for c in candidates
+        if (c.get("card_number") or c.get("set_code") or c.get("rarity"))
+    ]
+    if not alive:
+        return none_dict
+    if len(alive) == 1:
+        return alive[0]
+
+    keys = {(c.get("card_number"), c.get("set_code")) for c in alive}
+    if len(keys) == 1:
+        return alive[0]
+
+    if not tesseract_footer_text:
+        return none_dict
+    text_lower = tesseract_footer_text.lower()
+    matched: list[dict[str, str | None]] = []
+    for cand in alive:
+        cn = (cand.get("card_number") or "").lower()
+        sc = (cand.get("set_code") or "").lower()
+        cn_hit = False
+        if cn:
+            numerator = cn.split("/", 1)[0]
+            stripped_numerator = numerator.lstrip("0") or numerator
+            if cn in text_lower or numerator in text_lower or stripped_numerator in text_lower:
+                cn_hit = True
+        sc_hit = bool(sc and sc in text_lower)
+        if cn_hit or sc_hit:
+            matched.append(cand)
+    if len(matched) == 1:
+        return matched[0]
+    return none_dict
+
+
+def _title_looks_implausible(text: str | None) -> bool:
+    """Stricter than ``_title_looks_usable``, applied only to tesseract OCR
+    output. Returns True when the candidate title looks like noise that
+    could not plausibly be a real TCG title.
+
+    Heuristic — title is rejected if ALL three hold:
+      1. Contains no CJK characters (no Japanese / Chinese / Korean).
+      2. Contains no recognized TCG suffix / keyword
+         (ex / EX / GX / V / VMAX / VSTAR / SR / SAR / UR / HR / PSA / ★ …).
+      3. Is short (≤30 chars) and ≥70% ASCII letters/spaces.
+
+    Vision-model titles SHOULD NOT be filtered with this — those usually
+    contain CJK on Japanese cards or proper-noun structure on English ones.
+    """
+    if not text:
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return False
+    # CJK present → trust it (real Japanese / Chinese / Korean card titles).
+    if _contains_japanese(stripped):
+        return False
+    if any("一" <= c <= "鿿" or "가" <= c <= "힯" for c in stripped):
+        return False
+    # A recognised TCG keyword anywhere → trust it.
+    if _TCG_TITLE_KEYWORD_RE.search(stripped) or "★" in stripped:
+        return False
+    if len(stripped) > 30:
+        # Long non-CJK strings are out of scope for this filter; existing
+        # heuristics (`_title_looks_usable`) handle them better.
+        return False
+    letter_or_space = sum(1 for c in stripped if c.isascii() and (c.isalpha() or c == " "))
+    if letter_or_space / max(len(stripped), 1) < 0.70:
         return False
     return True
 
