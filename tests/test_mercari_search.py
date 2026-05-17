@@ -6,7 +6,9 @@ import pytest
 
 from market_monitor import mercari_search
 from market_monitor.mercari_search import (
+    DEFAULT_CONDITION_IDS,
     _chromium_launch_options,
+    build_search_url,
     parse_detail_price,
     parse_search_html,
     search_mercari,
@@ -29,6 +31,22 @@ def test_chromium_launch_options_fall_back_to_playwright_bundle(monkeypatch) -> 
     monkeypatch.setattr("market_monitor.mercari_search.shutil.which", lambda command: None)
 
     assert _chromium_launch_options() == {"headless": True}
+
+
+def test_build_search_url_without_condition_ids_omits_param() -> None:
+    url = build_search_url("test", price_max=5000)
+    assert "item_condition_id" not in url
+
+
+def test_build_search_url_with_condition_ids_appends_param_per_id() -> None:
+    url = build_search_url("test", price_max=5000, condition_ids=(1, 2, 3))
+    assert url.count("item_condition_id=") == 3
+    for cid in (1, 2, 3):
+        assert f"item_condition_id={cid}" in url
+
+
+def test_default_condition_ids_is_top_three() -> None:
+    assert DEFAULT_CONDITION_IDS == (1, 2, 3)
 
 
 # ── Search-results parser ─────────────────────────────────────────────────────

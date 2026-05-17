@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 from hashlib import sha1
 
 from market_monitor.http import HttpClient
+from market_monitor.mercari_search import MERCARI_CONDITION_LABELS
 from market_monitor.storage import MercariWatch, MonitorDatabase
 from tcg_tracker.catalog import normalize_game_key, supported_game_hint
 from tcg_tracker.hot_cards import HotCardBoard, TcgHotCardService
@@ -89,11 +90,59 @@ class _ListRow:
     enough to keep `del:<kind>:<id>` under Telegram's 64-byte limit.
     `text` is the rendered multi-line block for read mode; `short_label`
     is the truncated label shown on the delete button in edit mode.
+    `extra_buttons` is appended next to the delete button on the same row
+    (used by /watchlist to add a "🎛 設定狀態" button).
     """
 
     id: str
     text: str
     short_label: str
+    extra_buttons: tuple[dict[str, object], ...] = ()
+
+
+_CONDITION_PICKER_TITLE = "🎛 設定狀態"
+
+
+def _summarize_condition_ids_short(condition_ids: tuple[int, ...]) -> str:
+    """One-line summary for /watchlist's per-watch row."""
+    if not condition_ids:
+        return "未設定"
+    if condition_ids == (1, 2, 3):
+        return "目立った傷や汚れなし以上（預設）"
+    return " / ".join(
+        MERCARI_CONDITION_LABELS.get(cid, f"ID{cid}") for cid in condition_ids
+    )
+
+
+def _build_condition_picker_view(
+    *, watch_id: str, query: str, condition_ids: tuple[int, ...]
+) -> tuple[str, dict[str, object]]:
+    """Render the per-watch condition checkbox picker.
+
+    Each of the six Mercari conditions appears as one row with a checkbox
+    indicator. Tapping a row toggles that condition in the watch's
+    condition_ids set. The "完成並返回清單" row returns the user to /watchlist.
+    """
+    active = set(condition_ids)
+    lines = [
+        f"{_CONDITION_PICKER_TITLE}：{query}",
+        f"目前接受：{_summarize_condition_ids_short(condition_ids)}",
+        "",
+        "勾選你想保留的狀態（至少要留一個）：",
+    ]
+    keyboard: list[list[dict[str, object]]] = []
+    for cid in sorted(MERCARI_CONDITION_LABELS.keys()):
+        label = MERCARI_CONDITION_LABELS[cid]
+        marker = "☑" if cid in active else "☐"
+        keyboard.append([{
+            "text": f"{marker} {label}",
+            "callback_data": f"cond:{watch_id}:t:{cid}",
+        }])
+    keyboard.append([{
+        "text": "💾 完成並返回清單",
+        "callback_data": f"cond:{watch_id}:done",
+    }])
+    return "\n".join(lines), {"inline_keyboard": keyboard}
 
 
 def _build_list_view(
@@ -127,10 +176,12 @@ def _build_list_view(
     keyboard: list[list[dict[str, object]]] = []
     if mode == LIST_VIEW_MODE_EDIT:
         for row in visible:
-            keyboard.append([{
+            row_buttons: list[dict[str, object]] = [{
                 "text": f"❌ 刪除 {row.short_label}",
                 "callback_data": f"del:{list_kind}:{row.id}",
-            }])
+            }]
+            row_buttons.extend(row.extra_buttons)
+            keyboard.append(row_buttons)
 
     nav: list[dict[str, object]] = []
     if clamped > 0:
@@ -1075,14 +1126,23 @@ class TelegramCommandProcessor:
         for w in watches:
             status = "✓ 啟用" if w.enabled else "✗ 停用"
             checked = _format_local_time(w.last_checked_at) if w.last_checked_at else "尚未檢查"
+            condition_summary = _summarize_condition_ids_short(w.condition_ids)
             text_block = (
                 f"[{w.watch_id}] {status}\n"
                 f"  關鍵字：{w.query}\n"
                 f"  上限：¥{w.price_threshold_jpy:,}\n"
+                f"  狀態：{condition_summary}\n"
                 f"  最後檢查：{checked}"
             )
             short = f"[{w.watch_id[:8]}] {w.query[:18]}"
-            items.append(_ListRow(id=w.watch_id, text=text_block, short_label=short))
+            items.append(_ListRow(
+                id=w.watch_id,
+                text=text_block,
+                short_label=short,
+                extra_buttons=(
+                    {"text": "🎛 設定狀態", "callback_data": f"cond:{w.watch_id}:open"},
+                ),
+            ))
 
         return _build_list_view(
             list_kind="wl",
@@ -2366,6 +2426,70 @@ def run_telegram_polling(
     return 0
 
 
+def _handle_condition_callback(
+    *,
+    processor: TelegramCommandProcessor,
+    watch_id: str,
+    action: str,
+    extra: str,
+    original_text: str,
+) -> tuple[str | None, str | None, dict[str, object] | None]:
+    """Resolve a `cond:<watch_id>:<action>` callback.
+
+    Returns ``(toast_text, new_message_text, new_reply_markup)``. When
+    ``new_message_text`` is None the caller should NOT edit the message;
+    the toast still fires so the user gets feedback.
+    """
+    watch_db = getattr(processor, "_watch_db", None)
+    if watch_db is None or not watch_id:
+        return "追蹤功能未啟用", None, None
+    watch = watch_db.get_mercari_watch(watch_id)
+    if watch is None:
+        return "找不到該追蹤", None, None
+
+    if action == "open":
+        text, kb = _build_condition_picker_view(
+            watch_id=watch_id, query=watch.query, condition_ids=watch.condition_ids
+        )
+        return None, text, kb
+
+    if action == "done":
+        text, kb, _ = processor.render_watchlist_view(
+            page=_guess_current_page(original_text), mode=LIST_VIEW_MODE_EDIT
+        )
+        return "✓ 已更新狀態條件", text, kb
+
+    if action == "t" and extra.isdigit():
+        cid = int(extra)
+        if cid not in MERCARI_CONDITION_LABELS:
+            return "未知狀態", None, None
+        current = set(watch.condition_ids)
+        if cid in current:
+            if len(current) == 1:
+                # Re-render the picker with the same state — visual feedback
+                # only.
+                text, kb = _build_condition_picker_view(
+                    watch_id=watch_id,
+                    query=watch.query,
+                    condition_ids=watch.condition_ids,
+                )
+                return "至少要保留一個狀態", text, kb
+            current.remove(cid)
+        else:
+            current.add(cid)
+        new_ids = tuple(sorted(current))
+        watch_db.update_mercari_watch(watch_id, condition_ids=new_ids)
+        # Re-fetch (defensive) and re-render picker with the new state.
+        watch = watch_db.get_mercari_watch(watch_id)
+        condition_ids = watch.condition_ids if watch is not None else new_ids
+        text, kb = _build_condition_picker_view(
+            watch_id=watch_id, query=(watch.query if watch else ""), condition_ids=condition_ids
+        )
+        return None, text, kb
+
+    return "未知操作", None, None
+
+
 def _list_view_renderer(processor: TelegramCommandProcessor, list_kind: str):
     """Return the ``render_*_view`` method for the given list kind, or None."""
     return {
@@ -2488,6 +2612,24 @@ def handle_telegram_callback_query(
             new_text = f"{original_text}\n\n（已關閉）"
             new_reply_markup = None
             toast = None
+            rerender = True
+    elif prefix == "cond" and payload:
+        # `cond:<watch_id>:open` | `cond:<watch_id>:t:<id>` | `cond:<watch_id>:done`
+        parts = payload.split(":")
+        watch_id = parts[0] if parts else ""
+        action = parts[1] if len(parts) >= 2 else ""
+        toast_out, edit_text, edit_kb = _handle_condition_callback(
+            processor=processor,
+            watch_id=watch_id,
+            action=action,
+            extra=parts[2] if len(parts) >= 3 else "",
+            original_text=original_text,
+        )
+        if toast_out is not None:
+            toast = toast_out
+        if edit_text is not None:
+            new_text = edit_text
+            new_reply_markup = edit_kb
             rerender = True
     elif prefix in ("popt", "topt") and payload.isdigit():
         option_n = int(payload)

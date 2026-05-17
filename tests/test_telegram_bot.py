@@ -1844,7 +1844,7 @@ def test_snslist_view_empty_shows_friendly_text_and_no_keyboard() -> None:
 # ── Paginated /watchlist view ─────────────────────────────────────────────────
 
 class _FakeMercariWatch:
-    def __init__(self, watch_id: str, query: str, *, price: int = 5000, enabled: bool = True) -> None:
+    def __init__(self, watch_id: str, query: str, *, price: int = 5000, enabled: bool = True, condition_ids: tuple[int, ...] = (1, 2, 3)) -> None:
         self.watch_id = watch_id
         self.query = query
         self.price_threshold_jpy = price
@@ -1853,6 +1853,7 @@ class _FakeMercariWatch:
         self.last_checked_at = None
         self.created_at = "2026-01-01"
         self.updated_at = "2026-01-01"
+        self.condition_ids = condition_ids
 
 
 class _FakeWatchDatabase:
@@ -1924,6 +1925,167 @@ def test_callback_query_del_wl_removes_watch_and_rerenders() -> None:
     assert "第 1/2 頁" in edited["text"]
     assert "共 7 筆" in edited["text"]
     assert client.answered_callbacks[0]["text"] == "✓ 已刪除"
+
+
+# ── /watchlist 編輯模式的「🎛 設定狀態」按鈕 + cond: callback dispatch ─────────
+
+def test_watchlist_edit_mode_each_row_has_delete_and_condition_buttons() -> None:
+    processor, _ = _make_watchlist_processor(["alpha", "beta"])
+    _, kb, _ = processor.render_watchlist_view(mode="e")
+    # 2 watches → 2 rows of (delete, condition) + 1 nav row
+    assert len(kb["inline_keyboard"]) == 3
+    first_watch_row = kb["inline_keyboard"][0]
+    assert len(first_watch_row) == 2
+    assert first_watch_row[0]["callback_data"] == "del:wl:wid0000"
+    assert first_watch_row[1]["callback_data"] == "cond:wid0000:open"
+    assert "🎛" in first_watch_row[1]["text"]
+
+
+def _setup_watchlist_callback(client_cls=FakeTelegramClient):
+    """Helper: build processor + client with one watch and a mutable DB
+    that simulates condition_ids updates."""
+
+    class _DB:
+        def __init__(self):
+            self._w = _FakeMercariWatch("wid0000", "alpha")
+            self.update_calls: list[dict] = []
+
+        def list_mercari_watchlist(self):
+            return [self._w]
+
+        def get_mercari_watch(self, watch_id):
+            return self._w if watch_id == self._w.watch_id else None
+
+        def delete_mercari_watch(self, watch_id):
+            if watch_id == self._w.watch_id:
+                return True
+            return False
+
+        def update_mercari_watch(self, watch_id, *, condition_ids=None, **_kwargs):
+            self.update_calls.append({"watch_id": watch_id, "condition_ids": condition_ids})
+            if condition_ids is not None:
+                self._w.condition_ids = tuple(condition_ids)
+            return True
+
+    db = _DB()
+    proc = TelegramCommandProcessor(
+        allowed_chat_ids=frozenset({"123"}),
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        watch_db=db,
+    )
+    return proc, db, client_cls()
+
+
+def test_callback_query_cond_open_renders_picker_with_six_checkboxes() -> None:
+    processor, db, client = _setup_watchlist_callback()
+
+    handle_telegram_callback_query(
+        client=client,
+        processor=processor,
+        callback_query={
+            "id": "cbq-cond-open",
+            "data": "cond:wid0000:open",
+            "message": {
+                "message_id": 7,
+                "chat": {"id": "123"},
+                "text": "📋 Mercari 追蹤  第 1/1 頁（共 1 筆）",
+            },
+        },
+    )
+
+    assert db.update_calls == []  # opening shouldn't write
+    edited = client.edited_messages[0]
+    assert "🎛 設定狀態" in edited["text"]
+    assert "alpha" in edited["text"]
+    kb = edited["reply_markup"]["inline_keyboard"]
+    # 6 condition rows + 1 done row
+    assert len(kb) == 7
+    callback_data = [row[0]["callback_data"] for row in kb[:6]]
+    assert callback_data == [
+        "cond:wid0000:t:1", "cond:wid0000:t:2", "cond:wid0000:t:3",
+        "cond:wid0000:t:4", "cond:wid0000:t:5", "cond:wid0000:t:6",
+    ]
+    # Top 3 should already be checked.
+    assert "☑" in kb[0][0]["text"]
+    assert "☑" in kb[1][0]["text"]
+    assert "☑" in kb[2][0]["text"]
+    assert "☐" in kb[3][0]["text"]
+    assert kb[6][0]["callback_data"] == "cond:wid0000:done"
+
+
+def test_callback_query_cond_toggle_adds_new_condition_and_persists() -> None:
+    processor, db, client = _setup_watchlist_callback()
+
+    handle_telegram_callback_query(
+        client=client,
+        processor=processor,
+        callback_query={
+            "id": "cbq-cond-t",
+            "data": "cond:wid0000:t:4",
+            "message": {
+                "message_id": 7,
+                "chat": {"id": "123"},
+                "text": "🎛 設定狀態：alpha\n目前接受：…",
+            },
+        },
+    )
+
+    assert db.update_calls == [{"watch_id": "wid0000", "condition_ids": (1, 2, 3, 4)}]
+    # Re-rendered picker should now show 4 boxes ticked.
+    edited = client.edited_messages[0]
+    kb = edited["reply_markup"]["inline_keyboard"]
+    assert "☑" in kb[3][0]["text"]  # ID 4 now ticked
+
+
+def test_callback_query_cond_toggle_refuses_to_empty_all_conditions() -> None:
+    processor, db, client = _setup_watchlist_callback()
+    # Pre-shrink to only ID 3 so the next toggle would clear all.
+    processor._watch_db._w.condition_ids = (3,)
+
+    handle_telegram_callback_query(
+        client=client,
+        processor=processor,
+        callback_query={
+            "id": "cbq-cond-empty",
+            "data": "cond:wid0000:t:3",
+            "message": {
+                "message_id": 7,
+                "chat": {"id": "123"},
+                "text": "🎛 設定狀態：alpha\n…",
+            },
+        },
+    )
+
+    # DB must NOT have been touched.
+    assert db.update_calls == []
+    assert client.answered_callbacks[0]["text"] == "至少要保留一個狀態"
+
+
+def test_callback_query_cond_done_returns_to_watchlist_edit_mode() -> None:
+    processor, db, client = _setup_watchlist_callback()
+
+    handle_telegram_callback_query(
+        client=client,
+        processor=processor,
+        callback_query={
+            "id": "cbq-cond-done",
+            "data": "cond:wid0000:done",
+            "message": {
+                "message_id": 7,
+                "chat": {"id": "123"},
+                "text": "🎛 設定狀態：alpha\n…",
+            },
+        },
+    )
+
+    edited = client.edited_messages[0]
+    assert "📋 Mercari 追蹤" in edited["text"]
+    # Re-rendered in edit mode → first row has delete + condition buttons.
+    first_row = edited["reply_markup"]["inline_keyboard"][0]
+    assert first_row[0]["callback_data"].startswith("del:wl:")
+    assert first_row[1]["callback_data"].startswith("cond:")
 
 
 # ── Paginated /hunt view ──────────────────────────────────────────────────────

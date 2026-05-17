@@ -79,7 +79,8 @@ CREATE TABLE IF NOT EXISTS mercari_watchlist (
     chat_id TEXT NOT NULL,
     last_checked_at TEXT,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    condition_ids TEXT NOT NULL DEFAULT '1,2,3'
 );
 
 CREATE TABLE IF NOT EXISTS mercari_watch_hits (
@@ -98,6 +99,9 @@ CREATE TABLE IF NOT EXISTS mercari_watch_hits (
 """
 
 
+_DEFAULT_CONDITION_IDS: tuple[int, ...] = (1, 2, 3)  # 目立った傷や汚れなし以上
+
+
 @dataclass
 class MercariWatch:
     watch_id: str
@@ -108,6 +112,28 @@ class MercariWatch:
     last_checked_at: str | None
     created_at: str
     updated_at: str
+    condition_ids: tuple[int, ...] = _DEFAULT_CONDITION_IDS
+
+
+def _encode_condition_ids(condition_ids: tuple[int, ...]) -> str:
+    return ",".join(str(c) for c in condition_ids)
+
+
+def _decode_condition_ids(raw: str | None) -> tuple[int, ...]:
+    if not raw:
+        return _DEFAULT_CONDITION_IDS
+    out: list[int] = []
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            value = int(token)
+        except ValueError:
+            continue
+        if 1 <= value <= 6:
+            out.append(value)
+    return tuple(out) if out else _DEFAULT_CONDITION_IDS
 
 
 @dataclass
@@ -145,6 +171,17 @@ class MonitorDatabase:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as connection:
             connection.executescript(SCHEMA)
+            self._migrate_mercari_watchlist_condition_ids(connection)
+
+    def _migrate_mercari_watchlist_condition_ids(self, connection) -> None:
+        """Add `condition_ids` to mercari_watchlist on databases created before
+        the column existed. Existing rows get the safe default '1,2,3'."""
+        cursor = connection.execute("PRAGMA table_info(mercari_watchlist)")
+        columns = {row[1] for row in cursor.fetchall()}
+        if "condition_ids" not in columns:
+            connection.execute(
+                "ALTER TABLE mercari_watchlist ADD COLUMN condition_ids TEXT NOT NULL DEFAULT '1,2,3'"
+            )
 
     def upsert_item(self, item: TrackedItem) -> None:
         timestamp = utc_now().isoformat()
@@ -274,15 +311,16 @@ class MonitorDatabase:
                 """
                 INSERT INTO mercari_watchlist (
                     watch_id, query, price_threshold_jpy, enabled, chat_id,
-                    last_checked_at, created_at, updated_at
+                    last_checked_at, created_at, updated_at, condition_ids
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(watch_id) DO UPDATE SET
                     query=excluded.query,
                     price_threshold_jpy=excluded.price_threshold_jpy,
                     enabled=excluded.enabled,
                     chat_id=excluded.chat_id,
-                    updated_at=excluded.updated_at
+                    updated_at=excluded.updated_at,
+                    condition_ids=excluded.condition_ids
                 """,
                 (
                     watch.watch_id,
@@ -293,6 +331,7 @@ class MonitorDatabase:
                     watch.last_checked_at,
                     timestamp,
                     timestamp,
+                    _encode_condition_ids(watch.condition_ids),
                 ),
             )
 
@@ -312,7 +351,14 @@ class MonitorDatabase:
             )
             return cursor.rowcount > 0
 
-    def update_mercari_watch(self, watch_id: str, *, query: str | None = None, price_threshold_jpy: int | None = None) -> bool:
+    def update_mercari_watch(
+        self,
+        watch_id: str,
+        *,
+        query: str | None = None,
+        price_threshold_jpy: int | None = None,
+        condition_ids: tuple[int, ...] | None = None,
+    ) -> bool:
         timestamp = utc_now().isoformat()
         sets = []
         params: list[object] = []
@@ -322,6 +368,9 @@ class MonitorDatabase:
         if price_threshold_jpy is not None:
             sets.append("price_threshold_jpy = ?")
             params.append(price_threshold_jpy)
+        if condition_ids is not None:
+            sets.append("condition_ids = ?")
+            params.append(_encode_condition_ids(condition_ids))
         if not sets:
             return False
         sets.append("updated_at = ?")
@@ -459,6 +508,10 @@ class MonitorDatabase:
 
 
 def _row_to_watch(row: sqlite3.Row) -> MercariWatch:
+    try:
+        condition_raw = row["condition_ids"]
+    except (IndexError, KeyError):
+        condition_raw = None
     return MercariWatch(
         watch_id=row["watch_id"],
         query=row["query"],
@@ -468,6 +521,7 @@ def _row_to_watch(row: sqlite3.Row) -> MercariWatch:
         last_checked_at=row["last_checked_at"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        condition_ids=_decode_condition_ids(condition_raw),
     )
 
 

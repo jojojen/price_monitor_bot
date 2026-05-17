@@ -7,7 +7,7 @@ import threading
 from pathlib import Path
 from typing import Callable
 
-from market_monitor.mercari_search import search_mercari
+from market_monitor.mercari_search import MERCARI_CONDITION_LABELS, search_mercari
 from market_monitor.storage import MercariWatch, MonitorDatabase
 
 logger = logging.getLogger(__name__)
@@ -72,12 +72,17 @@ class MercariWatchMonitor:
 
     def _check_watch(self, watch: MercariWatch) -> None:
         logger.info(
-            "MercariWatchMonitor: searching query=%s price_max=%d watch_id=%s",
+            "MercariWatchMonitor: searching query=%s price_max=%d condition_ids=%s watch_id=%s",
             watch.query,
             watch.price_threshold_jpy,
+            watch.condition_ids,
             watch.watch_id,
         )
-        results = search_mercari(watch.query, price_max=watch.price_threshold_jpy)
+        results = search_mercari(
+            watch.query,
+            price_max=watch.price_threshold_jpy,
+            condition_ids=watch.condition_ids,
+        )
 
         # If this watch has never been checked before, treat the first scan as a
         # baseline snapshot — record all current items as already-seen so we only
@@ -141,6 +146,12 @@ class MercariWatchMonitor:
             logger.debug("MercariWatchMonitor: no new or changed items watch_id=%s", watch.watch_id)
 
 
+def _summarize_condition_ids(condition_ids: tuple[int, ...]) -> str:
+    if not condition_ids:
+        return "未設定"
+    return " / ".join(MERCARI_CONDITION_LABELS.get(cid, f"ID{cid}") for cid in condition_ids)
+
+
 def _format_notification(watch: MercariWatch, new_or_changed: list[dict[str, object]]) -> str:
     new_count = sum(1 for i in new_or_changed if i.get("_event") != "price_changed")
     changed_count = sum(1 for i in new_or_changed if i.get("_event") == "price_changed")
@@ -155,6 +166,7 @@ def _format_notification(watch: MercariWatch, new_or_changed: list[dict[str, obj
         "Mercari 通知",
         f"追蹤條件：{watch.query}",
         f"價格上限：¥{watch.price_threshold_jpy:,}",
+        f"狀態條件：{_summarize_condition_ids(watch.condition_ids)}",
         f"發現：{' / '.join(summary_parts)}",
     ]
     for item in new_or_changed[:5]:

@@ -36,10 +36,51 @@ _USER_AGENT = (
 
 _INSTALLMENT_MARKERS = ("月々", "分割", "/月", "～", "〜")
 
+# Mercari Japan item-condition (商品の状態) enum. IDs match what the public
+# search URL accepts as `item_condition_id`.
+MERCARI_CONDITION_NEW = 1            # 新品、未使用
+MERCARI_CONDITION_LIKE_NEW = 2       # 未使用に近い
+MERCARI_CONDITION_GOOD = 3           # 目立った傷や汚れなし
+MERCARI_CONDITION_FAIR = 4           # やや傷や汚れあり
+MERCARI_CONDITION_POOR = 5           # 傷や汚れあり
+MERCARI_CONDITION_VERY_POOR = 6      # 全体的に状態が悪い
 
-def build_search_url(query: str, *, price_max: int) -> str:
-    params = f"keyword={quote(query)}&price_max={price_max}&status=on_sale&sort=updated_time&order=desc"
-    return f"{MERCARI_SEARCH_BASE}?{params}"
+MERCARI_CONDITION_LABELS: dict[int, str] = {
+    MERCARI_CONDITION_NEW: "新品、未使用",
+    MERCARI_CONDITION_LIKE_NEW: "未使用に近い",
+    MERCARI_CONDITION_GOOD: "目立った傷や汚れなし",
+    MERCARI_CONDITION_FAIR: "やや傷や汚れあり",
+    MERCARI_CONDITION_POOR: "傷や汚れあり",
+    MERCARI_CONDITION_VERY_POOR: "全体的に状態が悪い",
+}
+
+# "Good and above" — the default filter applied to user watches and the
+# opportunity hunter. Anything dirtier than this clutters notifications.
+DEFAULT_CONDITION_IDS: tuple[int, ...] = (
+    MERCARI_CONDITION_NEW,
+    MERCARI_CONDITION_LIKE_NEW,
+    MERCARI_CONDITION_GOOD,
+)
+
+
+def build_search_url(
+    query: str,
+    *,
+    price_max: int,
+    condition_ids: tuple[int, ...] | None = None,
+) -> str:
+    parts = [
+        f"keyword={quote(query)}",
+        f"price_max={price_max}",
+        "status=on_sale",
+        "sort=updated_time",
+        "order=desc",
+    ]
+    if condition_ids:
+        # Mercari expects the param to repeat once per condition id.
+        for cid in condition_ids:
+            parts.append(f"item_condition_id={cid}")
+    return f"{MERCARI_SEARCH_BASE}?{'&'.join(parts)}"
 
 
 def search_mercari(
@@ -48,8 +89,13 @@ def search_mercari(
     price_max: int,
     max_results: int = 30,
     timeout_ms: int = 30000,
+    condition_ids: tuple[int, ...] | None = None,
 ) -> list[dict[str, object]]:
     """Search Mercari Japan and return items below price_max that match ALL query tokens.
+
+    ``condition_ids`` is the Mercari item-condition (商品の状態) filter; pass
+    e.g. ``(1, 2, 3)`` to limit results to 目立った傷や汚れなし以上. When
+    omitted no condition filter is applied.
 
     Returns a list of dicts with keys:
       item_id, title, price_jpy, url, thumbnail_url
@@ -61,8 +107,14 @@ def search_mercari(
             "playwright is not installed; run: pip install playwright && playwright install chromium"
         ) from exc
 
-    url = build_search_url(query, price_max=price_max)
-    logger.info("Mercari search query=%s price_max=%d url=%s", query, price_max, url)
+    url = build_search_url(query, price_max=price_max, condition_ids=condition_ids)
+    logger.info(
+        "Mercari search query=%s price_max=%d condition_ids=%s url=%s",
+        query,
+        price_max,
+        condition_ids,
+        url,
+    )
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(**_chromium_launch_options())
