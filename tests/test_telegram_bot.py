@@ -1639,3 +1639,387 @@ def test_callback_query_from_unauthorized_chat_is_rejected() -> None:
     # remove the loading spinner on the button), just without a toast.
     assert client.answered_callbacks
     assert client.answered_callbacks[0]["text"] is None
+
+
+# ── Paginated /snslist view (read mode + edit mode + callback nav) ────────────
+
+def _make_snslist_processor(handles: list[str], *, enabled: bool = True) -> tuple[TelegramCommandProcessor, _FakeSnsDatabase]:
+    rules = [_FakeAccountRule(f"rid{i:04x}", handle) for i, handle in enumerate(handles)]
+    if not enabled:
+        for r in rules:
+            r.enabled = False  # type: ignore[attr-defined]
+    db = _FakeSnsDatabase(rules)
+    proc = _processor_with_sns_db(db)
+    return proc, db
+
+
+# `enabled` is read by render_snslist_view sort key — patch FakeAccountRule.
+_FakeAccountRule.enabled = True  # type: ignore[attr-defined]
+_FakeAccountRule.domains = ()  # type: ignore[attr-defined]
+
+
+def test_snslist_view_read_mode_no_delete_buttons() -> None:
+    """Read mode shows text only; keyboard has no per-row delete rows."""
+    processor, _ = _make_snslist_processor(["alice", "bob", "carol"])
+
+    text, kb, page = processor.render_snslist_view()
+
+    assert "📋 SNS 監控規則" in text
+    assert "第 1/1 頁" in text
+    assert "共 3 筆" in text
+    assert "@alice" in text and "@bob" in text and "@carol" in text
+    assert page == 0
+    assert kb is not None
+    # Only one row of buttons (navigation), no delete rows.
+    assert len(kb["inline_keyboard"]) == 1
+    nav_buttons = kb["inline_keyboard"][0]
+    button_texts = {b["text"] for b in nav_buttons}
+    assert "✏️ 編輯" in button_texts
+    assert "✖️ 關閉" in button_texts
+    # Single page: no prev/next.
+    assert "⬅️ 上頁" not in button_texts
+    assert "下頁 ➡️" not in button_texts
+
+
+def test_snslist_view_edit_mode_has_one_delete_button_per_visible_row() -> None:
+    processor, _ = _make_snslist_processor(["alice", "bob", "carol"])
+
+    text, kb, _ = processor.render_snslist_view(mode="e")
+
+    # 3 delete-button rows + 1 navigation row
+    assert len(kb["inline_keyboard"]) == 4
+    delete_rows = kb["inline_keyboard"][:3]
+    delete_data = [row[0]["callback_data"] for row in delete_rows]
+    assert delete_data == ["del:sl:rid0000", "del:sl:rid0001", "del:sl:rid0002"]
+    assert all("❌ 刪除" in row[0]["text"] for row in delete_rows)
+    nav_button_texts = {b["text"] for b in kb["inline_keyboard"][-1]}
+    assert "✓ 完成" in nav_button_texts
+
+
+def test_snslist_view_pagination_boundaries_first_and_last_page() -> None:
+    handles = [f"user{i:02d}" for i in range(12)]  # 12 items → 3 pages of 5/5/2
+    processor, _ = _make_snslist_processor(handles)
+
+    # Page 0
+    _, kb0, page0 = processor.render_snslist_view(page=0)
+    nav0 = {b["text"] for b in kb0["inline_keyboard"][-1]}
+    assert page0 == 0
+    assert "⬅️ 上頁" not in nav0  # no prev on first page
+    assert "下頁 ➡️" in nav0
+
+    # Page 2 (last)
+    _, kb2, page2 = processor.render_snslist_view(page=2)
+    nav2 = {b["text"] for b in kb2["inline_keyboard"][-1]}
+    assert page2 == 2
+    assert "⬅️ 上頁" in nav2
+    assert "下頁 ➡️" not in nav2  # no next on last page
+
+    # Out-of-bounds page is clamped
+    _, _, clamped = processor.render_snslist_view(page=99)
+    assert clamped == 2
+
+
+def test_callback_query_pg_renders_target_page_without_db_mutation() -> None:
+    """A `pg:sl:1:e` tap should edit_message_text the page-2 view and NOT
+    touch the database."""
+    handles = [f"u{i:02d}" for i in range(8)]  # 8 → 2 pages
+    processor, db = _make_snslist_processor(handles)
+    client = FakeTelegramClient()
+
+    handle_telegram_callback_query(
+        client=client,
+        processor=processor,
+        callback_query={
+            "id": "cbq-1",
+            "data": "pg:sl:1:e",
+            "message": {
+                "message_id": 7,
+                "chat": {"id": "123"},
+                "text": "stale text — will be replaced",
+            },
+        },
+    )
+
+    assert db.deleted == []  # navigation must not delete anything
+    assert len(client.edited_messages) == 1
+    edited = client.edited_messages[0]
+    assert "第 2/2 頁" in edited["text"]
+    assert edited["reply_markup"] is not None  # has keyboard
+    assert client.answered_callbacks
+    assert client.answered_callbacks[0]["text"] is None
+
+
+def test_callback_query_del_sl_removes_row_and_rerenders_same_page() -> None:
+    handles = [f"u{i:02d}" for i in range(8)]
+    processor, db = _make_snslist_processor(handles)
+    client = FakeTelegramClient()
+
+    handle_telegram_callback_query(
+        client=client,
+        processor=processor,
+        callback_query={
+            "id": "cbq-2",
+            "data": "del:sl:rid0003",
+            "message": {
+                "message_id": 7,
+                "chat": {"id": "123"},
+                "text": "📋 SNS 監控規則  第 1/2 頁（共 8 筆）\n...",
+            },
+        },
+    )
+
+    assert db.deleted == ["rid0003"]
+    edited = client.edited_messages[0]
+    # After deletion total is 7 → 2 pages of 5/2; we were on page 0, still page 0.
+    assert "第 1/2 頁" in edited["text"]
+    assert "共 7 筆" in edited["text"]
+    # Re-render is in edit mode so we can keep deleting.
+    nav_buttons = {b["text"] for b in edited["reply_markup"]["inline_keyboard"][-1]}
+    assert "✓ 完成" in nav_buttons
+    assert client.answered_callbacks[0]["text"] == "✓ 已刪除"
+
+
+def test_callback_query_del_sl_last_row_on_last_page_jumps_back() -> None:
+    """If the deleted row was the only item on the last page, the re-render
+    should drop back to the previous page rather than showing an empty page."""
+    handles = [f"u{i:02d}" for i in range(6)]  # 6 → page 0 has 5, page 1 has 1
+    processor, db = _make_snslist_processor(handles)
+    client = FakeTelegramClient()
+
+    # The only item on page 1 is "rid0005" (sorted by rule_id).
+    handle_telegram_callback_query(
+        client=client,
+        processor=processor,
+        callback_query={
+            "id": "cbq-3",
+            "data": "del:sl:rid0005",
+            "message": {
+                "message_id": 7,
+                "chat": {"id": "123"},
+                "text": "📋 SNS 監控規則  第 2/2 頁（共 6 筆）\n...",
+            },
+        },
+    )
+
+    assert db.deleted == ["rid0005"]
+    edited = client.edited_messages[0]
+    # 5 items left → 1 page. After deleting the lone item on page 2, we land
+    # on page 1.
+    assert "第 1/1 頁" in edited["text"]
+    assert "共 5 筆" in edited["text"]
+
+
+def test_callback_query_close_sl_clears_keyboard() -> None:
+    processor, db = _make_snslist_processor(["alice"])
+    client = FakeTelegramClient()
+
+    handle_telegram_callback_query(
+        client=client,
+        processor=processor,
+        callback_query={
+            "id": "cbq-4",
+            "data": "close:sl",
+            "message": {
+                "message_id": 7,
+                "chat": {"id": "123"},
+                "text": "📋 SNS 監控規則  第 1/1 頁",
+            },
+        },
+    )
+
+    assert db.deleted == []
+    edited = client.edited_messages[0]
+    assert "（已關閉）" in edited["text"]
+    assert edited["reply_markup"] is None
+
+
+def test_snslist_view_empty_shows_friendly_text_and_no_keyboard() -> None:
+    processor, _ = _make_snslist_processor([])
+    text, kb, page = processor.render_snslist_view()
+    assert "尚無 SNS 監控規則" in text
+    assert kb is None
+    assert page == 0
+
+
+# ── Paginated /watchlist view ─────────────────────────────────────────────────
+
+class _FakeMercariWatch:
+    def __init__(self, watch_id: str, query: str, *, price: int = 5000, enabled: bool = True) -> None:
+        self.watch_id = watch_id
+        self.query = query
+        self.price_threshold_jpy = price
+        self.enabled = enabled
+        self.chat_id = "0"
+        self.last_checked_at = None
+        self.created_at = "2026-01-01"
+        self.updated_at = "2026-01-01"
+
+
+class _FakeWatchDatabase:
+    def __init__(self, watches: list[_FakeMercariWatch]) -> None:
+        self._watches = list(watches)
+        self.deleted: list[str] = []
+
+    def list_mercari_watchlist(self):
+        return list(self._watches)
+
+    def delete_mercari_watch(self, watch_id: str) -> bool:
+        for idx, w in enumerate(self._watches):
+            if w.watch_id == watch_id:
+                self._watches.pop(idx)
+                self.deleted.append(watch_id)
+                return True
+        return False
+
+
+def _make_watchlist_processor(queries: list[str]) -> tuple[TelegramCommandProcessor, _FakeWatchDatabase]:
+    watches = [_FakeMercariWatch(f"wid{i:04x}", q) for i, q in enumerate(queries)]
+    db = _FakeWatchDatabase(watches)
+    proc = TelegramCommandProcessor(
+        allowed_chat_ids=frozenset({"123"}),
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        watch_db=db,
+    )
+    return proc, db
+
+
+def test_watchlist_view_renders_with_per_item_delete_in_edit_mode() -> None:
+    processor, _ = _make_watchlist_processor(["pikachu", "charizard", "umbreon"])
+
+    text_read, kb_read, _ = processor.render_watchlist_view()
+    assert "📋 Mercari 追蹤" in text_read
+    assert "共 3 筆" in text_read
+    # Read mode: 1 nav row only
+    assert len(kb_read["inline_keyboard"]) == 1
+
+    text_edit, kb_edit, _ = processor.render_watchlist_view(mode="e")
+    # 3 delete rows + 1 nav row
+    assert len(kb_edit["inline_keyboard"]) == 4
+    delete_data = [row[0]["callback_data"] for row in kb_edit["inline_keyboard"][:3]]
+    assert delete_data == ["del:wl:wid0000", "del:wl:wid0001", "del:wl:wid0002"]
+
+
+def test_callback_query_del_wl_removes_watch_and_rerenders() -> None:
+    processor, db = _make_watchlist_processor([f"q{i:02d}" for i in range(8)])
+    client = FakeTelegramClient()
+
+    handle_telegram_callback_query(
+        client=client,
+        processor=processor,
+        callback_query={
+            "id": "cbq-wl",
+            "data": "del:wl:wid0003",
+            "message": {
+                "message_id": 11,
+                "chat": {"id": "123"},
+                "text": "📋 Mercari 追蹤  第 1/2 頁（共 8 筆）\n…",
+            },
+        },
+    )
+
+    assert db.deleted == ["wid0003"]
+    edited = client.edited_messages[0]
+    assert "第 1/2 頁" in edited["text"]
+    assert "共 7 筆" in edited["text"]
+    assert client.answered_callbacks[0]["text"] == "✓ 已刪除"
+
+
+# ── Paginated /hunt view ──────────────────────────────────────────────────────
+
+def _make_huntlist_processor(candidates: list[dict[str, object]]) -> tuple[TelegramCommandProcessor, dict]:
+    """Build a processor wired with stub opportunity providers.
+
+    Returns (processor, scratch) where scratch is a dict the test can inspect
+    to see which candidate_id the remover was called with.
+    """
+    scratch: dict[str, object] = {"removed": [], "candidates": list(candidates)}
+
+    def list_provider():
+        return list(scratch["candidates"])
+
+    def remover(target):
+        # `dismiss_opportunity_target` accepts candidate_id as selector; mimic
+        # its success-message contract so `delete_huntlist_item_by_id`'s
+        # prefix-based check works.
+        for c in scratch["candidates"]:
+            if c["candidate_id"] == target:
+                scratch["candidates"].remove(c)
+                scratch["removed"].append(target)
+                return f"已從機會清單移除\n目標：[{c['game']}] {c['title']}\n之後相同 candidate_id 再出現時會保持隱藏。"
+        return f"找不到可移除的 active 目標：{target}"
+
+    proc = TelegramCommandProcessor(
+        allowed_chat_ids=frozenset({"123"}),
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        opportunity_list_provider=list_provider,
+        opportunity_target_remover=remover,
+    )
+    return proc, scratch
+
+
+def _make_hunt_candidate(i: int) -> dict[str, object]:
+    return {
+        "candidate_id": f"opp_{i:016x}",
+        "game": "pokemon",
+        "product_type": "single_card",
+        "title": f"Test card #{i}",
+        "heat_score": 100 + i,
+        "search_query": f"q{i}",
+        "last_checked_at": None,
+        "reason": None,
+    }
+
+
+def test_huntlist_view_renders_with_per_item_delete_in_edit_mode() -> None:
+    processor, _ = _make_huntlist_processor([_make_hunt_candidate(i) for i in range(3)])
+
+    text_r, kb_r, _ = processor.render_huntlist_view()
+    assert "📋 Opportunity 候選" in text_r
+    assert "共 3 筆" in text_r
+    assert len(kb_r["inline_keyboard"]) == 1  # nav only
+
+    _, kb_e, _ = processor.render_huntlist_view(mode="e")
+    assert len(kb_e["inline_keyboard"]) == 4  # 3 deletes + nav
+    delete_data = [row[0]["callback_data"] for row in kb_e["inline_keyboard"][:3]]
+    assert delete_data == [
+        "del:hl:opp_0000000000000000",
+        "del:hl:opp_0000000000000001",
+        "del:hl:opp_0000000000000002",
+    ]
+
+
+def test_callback_query_del_hl_dismisses_candidate_and_rerenders() -> None:
+    processor, scratch = _make_huntlist_processor([_make_hunt_candidate(i) for i in range(8)])
+    client = FakeTelegramClient()
+
+    handle_telegram_callback_query(
+        client=client,
+        processor=processor,
+        callback_query={
+            "id": "cbq-hl",
+            "data": "del:hl:opp_0000000000000003",
+            "message": {
+                "message_id": 21,
+                "chat": {"id": "123"},
+                "text": "📋 Opportunity 候選  第 1/2 頁（共 8 筆）\n…",
+            },
+        },
+    )
+
+    assert scratch["removed"] == ["opp_0000000000000003"]
+    edited = client.edited_messages[0]
+    assert "第 1/2 頁" in edited["text"]
+    assert "共 7 筆" in edited["text"]
+    assert client.answered_callbacks[0]["text"] == "✓ 已刪除"
+
+
+def test_huntlist_view_empty_when_no_provider_results() -> None:
+    processor, _ = _make_huntlist_processor([])
+    text, kb, page = processor.render_huntlist_view()
+    assert "目前沒有 Opportunity 候選" in text
+    assert kb is None
+    assert page == 0

@@ -76,6 +76,76 @@ PHOTO_CLARIFICATION_TTL_SECONDS = 15 * 60
 TEXT_CLARIFICATION_TTL_SECONDS = 15 * 60
 TEXT_AMBIGUITY_CONFIDENCE_THRESHOLD = 0.55
 
+LIST_VIEW_PAGE_SIZE = 5
+LIST_VIEW_MODE_READ = "r"
+LIST_VIEW_MODE_EDIT = "e"
+
+
+@dataclass(frozen=True, slots=True)
+class _ListRow:
+    """One row of a paginated /snslist // /watchlist // /hunt view.
+
+    `id` lands in the delete-button's callback_data, so it must be short
+    enough to keep `del:<kind>:<id>` under Telegram's 64-byte limit.
+    `text` is the rendered multi-line block for read mode; `short_label`
+    is the truncated label shown on the delete button in edit mode.
+    """
+
+    id: str
+    text: str
+    short_label: str
+
+
+def _build_list_view(
+    *,
+    list_kind: str,
+    items: list[_ListRow],
+    page: int,
+    mode: str,
+    list_title: str,
+    empty_message: str,
+) -> tuple[str, dict[str, object] | None, int]:
+    """Render a paginated list view. Returns (text, reply_markup, clamped_page).
+
+    `clamped_page` is `page` snapped into `[0, total_pages)`; callers that
+    re-render after deletion can pass `page=current_page` and read back the
+    page actually shown (it may shift up by one if they just removed the
+    last item on the last page).
+    """
+    if not items:
+        return empty_message, None, 0
+
+    total = len(items)
+    total_pages = max(1, (total + LIST_VIEW_PAGE_SIZE - 1) // LIST_VIEW_PAGE_SIZE)
+    clamped = max(0, min(page, total_pages - 1))
+    start = clamped * LIST_VIEW_PAGE_SIZE
+    visible = items[start : start + LIST_VIEW_PAGE_SIZE]
+
+    header = f"{list_title}  第 {clamped + 1}/{total_pages} 頁（共 {total} 筆）"
+    text = "\n".join([header, "", *(row.text for row in visible)])
+
+    keyboard: list[list[dict[str, object]]] = []
+    if mode == LIST_VIEW_MODE_EDIT:
+        for row in visible:
+            keyboard.append([{
+                "text": f"❌ 刪除 {row.short_label}",
+                "callback_data": f"del:{list_kind}:{row.id}",
+            }])
+
+    nav: list[dict[str, object]] = []
+    if clamped > 0:
+        nav.append({"text": "⬅️ 上頁", "callback_data": f"pg:{list_kind}:{clamped - 1}:{mode}"})
+    if mode == LIST_VIEW_MODE_READ:
+        nav.append({"text": "✏️ 編輯", "callback_data": f"pg:{list_kind}:{clamped}:{LIST_VIEW_MODE_EDIT}"})
+    else:
+        nav.append({"text": "✓ 完成", "callback_data": f"pg:{list_kind}:{clamped}:{LIST_VIEW_MODE_READ}"})
+    if clamped < total_pages - 1:
+        nav.append({"text": "下頁 ➡️", "callback_data": f"pg:{list_kind}:{clamped + 1}:{mode}"})
+    nav.append({"text": "✖️ 關閉", "callback_data": f"close:{list_kind}"})
+    keyboard.append(nav)
+
+    return text, {"inline_keyboard": keyboard}, clamped
+
 
 @dataclass(frozen=True, slots=True)
 class TelegramLookupQuery:
@@ -127,6 +197,7 @@ class TelegramTextReplyPlan:
     reply: str | None
     reply_factory: Callable[[], str] | None = None
     reputation_delivery_factory: "Callable[[], TelegramReputationDelivery] | None" = None
+    reply_markup: dict[str, object] | None = None  # optional inline keyboard for list views
 
     def execute(self) -> str | None:
         if self.reply is not None:
@@ -491,6 +562,7 @@ class TelegramCommandProcessor:
         sns_buzz_fn: Callable[[str], str] | None = None,
         opportunity_status_renderer: Callable[[], str] | None = None,
         opportunity_target_remover: OpportunityTargetRemover | None = None,
+        opportunity_list_provider: Callable[[], list[dict[str, object]]] | None = None,
     ) -> None:
         self._lookup_renderer = lookup_renderer
         self._board_loader = board_loader
@@ -506,6 +578,7 @@ class TelegramCommandProcessor:
         self._sns_buzz_fn = sns_buzz_fn
         self._opportunity_status_renderer = opportunity_status_renderer
         self._opportunity_target_remover = opportunity_target_remover
+        self._opportunity_list_provider = opportunity_list_provider
         self._pending_photo_clarifications: dict[str, PendingTelegramPhotoClarification] = {}
         self._pending_text_clarifications: dict[str, PendingTelegramTextClarification] = {}
 
@@ -737,6 +810,15 @@ class TelegramCommandProcessor:
         if command == "/tools":
             return TelegramTextReplyPlan(ack=None, reply=self._catalog_renderer())
         if command in HUNT_COMMANDS:
+            action = remainder.strip().lower()
+            # `/hunt`、`/hunt list`、空動作 → 進入分頁清單（若 provider 有設定）。
+            # `/hunt status` 維持舊「狀態 + 推薦紀錄」純文字輸出。
+            if (
+                self._opportunity_list_provider is not None
+                and action in {"", "list", "candidates", "targets", "目標", "候選"}
+            ):
+                text, reply_markup, _ = self.render_huntlist_view()
+                return TelegramTextReplyPlan(ack=None, reply=text, reply_markup=reply_markup)
             return TelegramTextReplyPlan(ack=None, reply=self._handle_hunt(remainder))
         if command in PRICE_LOOKUP_COMMANDS:
             return TelegramTextReplyPlan(
@@ -774,7 +856,8 @@ class TelegramCommandProcessor:
                 reply_factory=lambda remainder=remainder, cid=chat_id: self._handle_watch(remainder, str(cid)),
             )
         if command in WATCHLIST_COMMANDS:
-            return TelegramTextReplyPlan(ack=None, reply=self._handle_watchlist())
+            text, reply_markup, _ = self.render_watchlist_view()
+            return TelegramTextReplyPlan(ack=None, reply=text, reply_markup=reply_markup)
         if command in UNWATCH_COMMANDS:
             return TelegramTextReplyPlan(
                 ack=None,
@@ -792,7 +875,8 @@ class TelegramCommandProcessor:
                 reply_factory=lambda remainder=remainder, cid=chat_id: self._handle_sns_add(remainder, str(cid)),
             )
         if command in SNS_LIST_COMMANDS:
-            return TelegramTextReplyPlan(ack=None, reply=self._handle_sns_list())
+            text, reply_markup, _ = self.render_snslist_view()
+            return TelegramTextReplyPlan(ack=None, reply=text, reply_markup=reply_markup)
         if command in SNS_DELETE_COMMANDS:
             return TelegramTextReplyPlan(ack=None, reply=self._handle_sns_delete(remainder))
         if command in SNS_BUZZ_COMMANDS:
@@ -942,23 +1026,48 @@ class TelegramCommandProcessor:
         )
 
     def _handle_watchlist(self) -> str:
+        text, _, _ = self.render_watchlist_view(page=0, mode=LIST_VIEW_MODE_READ)
+        return text
+
+    def render_watchlist_view(
+        self, *, page: int = 0, mode: str = LIST_VIEW_MODE_READ
+    ) -> tuple[str, dict[str, object] | None, int]:
+        """Render the paginated Mercari watch view. Returns (text, reply_markup, page)."""
         if self._watch_db is None:
-            return "追蹤功能尚未啟用（watch_db 未設定）。"
-        watches = self._watch_db.list_mercari_watchlist()
-        if not watches:
-            return "目前沒有任何追蹤項目。\n使用 /watch 關鍵字 on 價格 來新增。"
-        lines = [f"目前追蹤清單（共 {len(watches)} 項）："]
+            return "追蹤功能尚未啟用（watch_db 未設定）。", None, 0
+        watches = list(self._watch_db.list_mercari_watchlist())
+        watches.sort(key=lambda w: (not w.enabled, w.watch_id))
+
+        items: list[_ListRow] = []
         for w in watches:
             status = "✓ 啟用" if w.enabled else "✗ 停用"
             checked = _format_local_time(w.last_checked_at) if w.last_checked_at else "尚未檢查"
-            lines.append(
-                f"\n[{w.watch_id}] {status}\n"
+            text_block = (
+                f"[{w.watch_id}] {status}\n"
                 f"  關鍵字：{w.query}\n"
                 f"  上限：¥{w.price_threshold_jpy:,}\n"
                 f"  最後檢查：{checked}"
             )
-        lines.append("\n/unwatch <ID> 可移除追蹤")
-        return "\n".join(lines)
+            short = f"[{w.watch_id[:8]}] {w.query[:18]}"
+            items.append(_ListRow(id=w.watch_id, text=text_block, short_label=short))
+
+        return _build_list_view(
+            list_kind="wl",
+            items=items,
+            page=page,
+            mode=mode,
+            list_title="📋 Mercari 追蹤",
+            empty_message="目前沒有任何追蹤項目。\n使用 /watch 關鍵字 on 價格 來新增。",
+        )
+
+    def delete_mercari_watch_by_id(self, watch_id: str) -> bool:
+        if self._watch_db is None:
+            return False
+        try:
+            return bool(self._watch_db.delete_mercari_watch(watch_id))
+        except Exception:
+            logger.exception("Mercari watch delete failed watch_id=%s", watch_id)
+            return False
 
     def _handle_unwatch(self, raw: str) -> str:
         if self._watch_db is None:
@@ -1006,6 +1115,60 @@ class TelegramCommandProcessor:
                 return "請提供要移除的目標，例如：/hunt remove 2 或 /hunt remove Umbreon ex SAR"
             return self._opportunity_target_remover(target)
         return "可用格式：/hunt status 或 /hunt remove <編號或名稱>"
+
+    def render_huntlist_view(
+        self, *, page: int = 0, mode: str = LIST_VIEW_MODE_READ
+    ) -> tuple[str, dict[str, object] | None, int]:
+        """Render the paginated Opportunity candidate view. Returns (text, reply_markup, page)."""
+        if self._opportunity_list_provider is None:
+            return "Opportunity 候選清單未啟用（list provider 未設定）。", None, 0
+        try:
+            candidates = list(self._opportunity_list_provider())
+        except Exception as exc:
+            logger.exception("Hunt list provider failed")
+            return f"列表失敗：{exc}", None, 0
+
+        items: list[_ListRow] = []
+        for candidate in candidates:
+            candidate_id = str(candidate.get("candidate_id") or "")
+            if not candidate_id:
+                continue
+            game = str(candidate.get("game") or "?")
+            product_type = str(candidate.get("product_type") or "other")
+            title = str(candidate.get("title") or "(no title)")
+            heat = candidate.get("heat_score")
+            heat_text = f"{float(heat):.0f}" if heat is not None else "?"
+            search_query = str(candidate.get("search_query") or "")
+            text_block = (
+                f"[{game} / {product_type}] {title}\n"
+                f"  heat={heat_text}  search: {search_query}"
+            )
+            short = f"[{game}] {title[:18]}"
+            items.append(_ListRow(id=candidate_id, text=text_block, short_label=short))
+
+        return _build_list_view(
+            list_kind="hl",
+            items=items,
+            page=page,
+            mode=mode,
+            list_title="📋 Opportunity 候選",
+            empty_message="目前沒有 Opportunity 候選。等下一輪 agent tick 收集到目標後再看。",
+        )
+
+    def delete_huntlist_item_by_id(self, candidate_id: str) -> bool:
+        """Dismiss an opportunity candidate by id via the existing remover.
+
+        Returns True only on confirmed removal (the remover's reply starts
+        with the success prefix from ``dismiss_opportunity_target``).
+        """
+        if self._opportunity_target_remover is None:
+            return False
+        try:
+            reply = self._opportunity_target_remover(candidate_id)
+        except Exception:
+            logger.exception("Hunt delete failed candidate_id=%s", candidate_id)
+            return False
+        return isinstance(reply, str) and reply.startswith("已從機會清單移除")
 
     def build_reputation_delivery(self, raw: str) -> TelegramReputationDelivery:
         if self._reputation_renderer is None:
@@ -1131,7 +1294,8 @@ class TelegramCommandProcessor:
             )
         if intent.intent == "list_watches":
             logger.info("Telegram natural-language routed intent=list_watches confidence=%s", intent.confidence)
-            return TelegramTextReplyPlan(ack=None, reply=self._handle_watchlist())
+            text, reply_markup, _ = self.render_watchlist_view()
+            return TelegramTextReplyPlan(ack=None, reply=text, reply_markup=reply_markup)
         if intent.intent == "remove_watch":
             if not intent.watch_id:
                 return TelegramTextReplyPlan(
@@ -1252,7 +1416,8 @@ class TelegramCommandProcessor:
             )
         if intent.intent == "sns_list":
             logger.info("Telegram NL routed intent=sns_list")
-            return TelegramTextReplyPlan(ack=None, reply=self._handle_sns_list())
+            text, reply_markup, _ = self.render_snslist_view()
+            return TelegramTextReplyPlan(ack=None, reply=text, reply_markup=reply_markup)
         if intent.intent == "sns_delete":
             target = (intent.sns_handle and f"@{intent.sns_handle}") or intent.watch_id
             if not target:
@@ -1404,36 +1569,75 @@ class TelegramCommandProcessor:
             return f"新增失敗：{exc}"
 
     def _handle_sns_list(self) -> str:
-        """Handle /snslist command to list all SNS watch rules."""
+        """Backward-compatible thin wrapper. Returns plain text only.
+
+        The interactive paginated + edit-mode keyboard lives on
+        ``render_snslist_view`` and is reached via the
+        TelegramCommandProcessor dispatch path that consults it directly.
+        """
+        text, _, _ = self.render_snslist_view(page=0, mode=LIST_VIEW_MODE_READ)
+        return text
+
+    def render_snslist_view(
+        self, *, page: int = 0, mode: str = LIST_VIEW_MODE_READ
+    ) -> tuple[str, dict[str, object] | None, int]:
+        """Render the paginated SNS-list view. Returns (text, reply_markup, page)."""
         if self._sns_db is None:
-            return "SNS 監控尚未啟用（sns_db 未設定）。"
+            return "SNS 監控尚未啟用（sns_db 未設定）。", None, 0
         try:
-            rules = self._sns_db.list_watch_rules()
-            if not rules:
-                return "尚無 SNS 監控規則。\n用法：/snsadd @username"
-
-            lines = [f"📋 SNS 監控規則 ({len(rules)} 項)："]
-            for rule in rules:
-                status = "✓" if rule.enabled else "✗"
-                if rule.__class__.__name__ == "AccountWatch":
-                    filters = f" filter[{', '.join(rule.include_keywords)}]" if rule.include_keywords else ""
-                    info = f"@{rule.screen_name}{filters}"
-                elif rule.__class__.__name__ == "KeywordWatch":
-                    info = f'"{rule.query}"'
-                elif rule.__class__.__name__ == "TrendWatch":
-                    info = f"Trend:{rule.category}"
-                else:
-                    info = "Unknown"
-                domains = getattr(rule, "domains", ())
-                domain_segment = (
-                    f" domain[{', '.join(domains)}]" if domains else " domain[?]"
-                )
-                lines.append(f"  {status} {info}{domain_segment} ({rule.rule_id[:8]}…)")
-
-            return "\n".join(lines)
+            rules = list(self._sns_db.list_watch_rules())
         except Exception as exc:
             logger.exception("SNS list failed")
-            return f"列表失敗：{exc}"
+            return f"列表失敗：{exc}", None, 0
+
+        # Stable order: enabled-first (so deactivated rules sink to the bottom),
+        # then by rule_id so the page slice doesn't shift mid-session.
+        rules.sort(key=lambda r: (not r.enabled, r.rule_id))
+
+        items: list[_ListRow] = []
+        for rule in rules:
+            status = "✓" if rule.enabled else "✗"
+            screen_name = getattr(rule, "screen_name", None)
+            query_text = getattr(rule, "query", None)
+            category = getattr(rule, "category", None)
+            if screen_name:
+                include_kw = getattr(rule, "include_keywords", ()) or ()
+                filters = f" filter[{', '.join(include_kw)}]" if include_kw else ""
+                info = f"@{screen_name}{filters}"
+                short = f"@{screen_name}"
+            elif query_text:
+                info = f'"{query_text}"'
+                short = f'"{query_text[:18]}"'
+            elif category:
+                info = f"Trend:{category}"
+                short = f"Trend:{category}"
+            else:
+                info = "Unknown"
+                short = rule.rule_id[:8]
+            domains = getattr(rule, "domains", ())
+            domain_segment = f" domain[{', '.join(domains)}]" if domains else " domain[?]"
+            text_block = f"  {status} {info}{domain_segment} ({rule.rule_id[:8]}…)"
+            items.append(_ListRow(id=rule.rule_id, text=text_block, short_label=short))
+
+        text, reply_markup, clamped = _build_list_view(
+            list_kind="sl",
+            items=items,
+            page=page,
+            mode=mode,
+            list_title="📋 SNS 監控規則",
+            empty_message="尚無 SNS 監控規則。\n用法：/snsadd @username",
+        )
+        return text, reply_markup, clamped
+
+    def delete_sns_rule_by_id(self, rule_id: str) -> bool:
+        """Delete a SNS watch rule by its full rule_id. Returns True if a row was removed."""
+        if self._sns_db is None:
+            return False
+        try:
+            return bool(self._sns_db.delete_watch_rule(rule_id))
+        except Exception:
+            logger.exception("SNS delete by id failed rule_id=%s", rule_id)
+            return False
 
     def _handle_sns_delete(self, raw: str) -> str:
         """Handle /snsdelete to remove an SNS rule by rule_id, @handle, or keyword:xxx."""
@@ -2053,6 +2257,7 @@ def run_telegram_polling(
     sns_buzz_fn: Callable[[str], str] | None = None,
     opportunity_status_renderer: Callable[[], str] | None = None,
     opportunity_target_remover: OpportunityTargetRemover | None = None,
+    opportunity_list_provider: Callable[[], list[dict[str, object]]] | None = None,
     poll_timeout: int = 20,
     notify_startup: bool = False,
     drop_pending_updates: bool = True,
@@ -2089,6 +2294,7 @@ def run_telegram_polling(
         sns_buzz_fn=sns_buzz_fn,
         opportunity_status_renderer=opportunity_status_renderer,
         opportunity_target_remover=opportunity_target_remover,
+        opportunity_list_provider=opportunity_list_provider,
     )
     resolved_photo_renderer = photo_renderer or default_photo_renderer()
 
@@ -2126,6 +2332,26 @@ def run_telegram_polling(
     return 0
 
 
+def _list_view_renderer(processor: TelegramCommandProcessor, list_kind: str):
+    """Return the ``render_*_view`` method for the given list kind, or None."""
+    return {
+        "sl": getattr(processor, "render_snslist_view", None),
+        "wl": getattr(processor, "render_watchlist_view", None),
+        "hl": getattr(processor, "render_huntlist_view", None),
+    }.get(list_kind)
+
+
+def _list_item_deleter(processor: TelegramCommandProcessor, list_kind: str):
+    """Return ``(callable(item_id) -> bool, label)`` for the given list kind, or (None, None)."""
+    if list_kind == "sl":
+        return processor.delete_sns_rule_by_id, "SNS 規則"
+    if list_kind == "wl":
+        return processor.delete_mercari_watch_by_id, "Mercari 追蹤"
+    if list_kind == "hl":
+        return processor.delete_huntlist_item_by_id, "Opportunity 候選"
+    return None, None
+
+
 def handle_telegram_callback_query(
     *,
     client: TelegramBotClient,
@@ -2135,10 +2361,15 @@ def handle_telegram_callback_query(
     """Dispatch a Telegram callback_query (e.g. inline-button tap) to its handler.
 
     Callback-data dispatch table:
-      - ``snsdel:<handle>``  → delete the SNS watch rule for ``@<handle>``.
-
-    On success we edit the source message to remove its inline keyboard and
-    append a `✓ 已刪除` line, then answer the callback with a brief toast.
+      - ``snsdel:<handle>``         → notification one-tap delete (legacy path
+        used by the SNS auto-add notice).
+      - ``pg:<list>:<page>:<mode>`` → repaginate / toggle a list view
+        (read mode ↔ edit mode), where ``list`` is ``sl`` / ``wl`` / ``hl``.
+      - ``del:<list>:<id>``         → delete one list row and re-render the
+        same page in edit mode (drops back a page if the row was the last
+        one on the last page).
+      - ``close:<list>``            → clear the inline keyboard and mark the
+        message as closed.
     """
     callback_id = callback_query.get("id")
     data = callback_query.get("data")
@@ -2166,40 +2397,98 @@ def handle_telegram_callback_query(
         return
 
     prefix, _, payload = data.partition(":")
-    toast = "未知按鈕"
-    edited = False
+    toast: str | None = "未知按鈕"
+    new_text: str | None = None
+    new_reply_markup: dict[str, object] | None = None
+    rerender = False
 
     if prefix == "snsdel" and payload:
+        # Legacy notification path: delete by @handle, replace keyboard.
         handle = payload.lstrip("@")
         reply = processor._handle_sns_delete(f"@{handle}")
         if reply.startswith("✓"):
             toast = f"已刪除 @{handle}"
             new_text = f"{original_text}\n\n✓ 已刪除 @{handle}"
-            edited = True
+            rerender = True
         elif reply.startswith("找不到"):
             toast = f"已經不在追蹤 @{handle}"
             new_text = f"{original_text}\n\n✓ 已刪除 @{handle}（先前已移除）"
-            edited = True
+            rerender = True
         else:
             toast = reply[:200]
+    elif prefix == "pg" and payload.count(":") == 2:
+        list_kind, page_str, mode = payload.split(":", 2)
+        renderer = _list_view_renderer(processor, list_kind)
+        if renderer is None:
+            toast = "未知清單"
+        else:
+            try:
+                page = int(page_str)
+            except ValueError:
+                page = 0
+            new_text, new_reply_markup, _ = renderer(page=page, mode=mode)
+            toast = None
+            rerender = True
+    elif prefix == "del" and payload.count(":") == 1:
+        list_kind, item_id = payload.split(":", 1)
+        deleter, label = _list_item_deleter(processor, list_kind)
+        renderer = _list_view_renderer(processor, list_kind)
+        if deleter is None or renderer is None:
+            toast = "未知清單"
+        else:
+            removed = deleter(item_id)
+            toast = "✓ 已刪除" if removed else "已經不在清單"
+            # Re-read the same page in edit mode; helper auto-clamps if the
+            # last item on the last page just vanished.
+            new_text, new_reply_markup, _ = renderer(page=_guess_current_page(original_text), mode=LIST_VIEW_MODE_EDIT)
+            rerender = True
+    elif prefix == "close" and payload:
+        list_kind = payload
+        if _list_view_renderer(processor, list_kind) is None:
+            toast = "未知清單"
+        else:
+            new_text = f"{original_text}\n\n（已關閉）"
+            new_reply_markup = None
+            toast = None
+            rerender = True
     else:
         logger.warning("Unknown callback_query prefix=%r data=%r", prefix, data)
 
-    if edited:
+    if rerender and new_text is not None:
         try:
             client.edit_message_text(
                 chat_id=chat_id,
                 message_id=message_id,
                 text=new_text,
-                reply_markup=None,
+                reply_markup=new_reply_markup,
             )
         except Exception:
-            logger.exception("edit_message_text failed chat_id=%s message_id=%s", mask_identifier(chat_id), message_id)
+            logger.exception(
+                "edit_message_text failed chat_id=%s message_id=%s",
+                mask_identifier(chat_id),
+                message_id,
+            )
 
     try:
         client.answer_callback_query(callback_query_id=callback_id, text=toast)
     except Exception:
         logger.exception("answer_callback_query failed callback_id=%s", callback_id)
+
+
+_PAGE_HEADER_RE = re.compile(r"第\s*(\d+)\s*/\s*(\d+)\s*頁")
+
+
+def _guess_current_page(message_text: str) -> int:
+    """Pull the 0-based page index out of a list-view header line.
+
+    The header looks like "📋 SNS 監控規則  第 2/3 頁（共 13 筆）"; we read
+    the "2" and return it as a 0-based index (so 2 → 1). Returns 0 if no
+    header is found.
+    """
+    match = _PAGE_HEADER_RE.search(message_text)
+    if not match:
+        return 0
+    return max(0, int(match.group(1)) - 1)
 
 
 def handle_telegram_message(
@@ -2321,7 +2610,7 @@ def handle_telegram_message(
             mask_identifier(chat_id),
             trim_for_log(reply, limit=320),
         )
-        client.send_message(chat_id=chat_id, text=reply)
+        client.send_message(chat_id=chat_id, text=reply, reply_markup=plan.reply_markup)
         replies.append(reply)
     return tuple(replies)
 
