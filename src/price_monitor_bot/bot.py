@@ -1593,81 +1593,106 @@ class TelegramCommandProcessor:
         return None
 
     def _handle_sns_add(self, raw: str, chat_id: str) -> str:
-        """Handle /snsadd command to add an X (Twitter) account, keyword, or trend watch."""
+        """Handle /snsadd command to add an X/Reddit account, keyword, or trend watch."""
         if self._sns_db is None:
             return "SNS 監控尚未啟用（sns_db 未設定）。"
-        from sns_monitor.filters import extract_labeled_brackets, parse_account_watch_text
+        from sns_monitor.filters import (
+            extract_labeled_brackets,
+            extract_schedule_minutes,
+            parse_account_watch_text,
+            split_source_prefix,
+        )
         from sns_monitor.models import AccountWatch, KeywordWatch, TrendWatch
         from sns_monitor.storage import SnsDatabase
+
+        # Per-source defaults — kept in sync with sources/*.py default_*_schedule_minutes.
+        # Inlined here to avoid import cycles via sources -> reddit_buzz -> subprocess.
+        default_schedules: dict[tuple[str, str], int] = {
+            ("x", "account"): 15, ("x", "keyword"): 30, ("x", "trend"): 60,
+            ("reddit", "account"): 30, ("reddit", "keyword"): 60,
+        }
+        source_label = {"x": "X", "reddit": "Reddit"}
 
         try:
             raw = raw.strip()
             if not raw:
                 return (
-                    '用法：/snsadd @username\n'
-                    '     /snsadd @username filter[抽選] domain[pokemon]\n'
-                    '     /snsadd keyword:搜尋詞 domain[gundam]\n'
-                    '     /snsadd trend:trending'
+                    '用法：/snsadd x:@username\n'
+                    '     /snsadd x:@username filter[抽選] domain[pokemon] schedule:30\n'
+                    '     /snsadd x:keyword:搜尋詞 domain[gundam]\n'
+                    '     /snsadd x:trend:trending\n'
+                    '     /snsadd reddit:r/PokemonTCG domain[pokemon] schedule:30\n'
+                    '     /snsadd reddit:keyword:Umbreon ex domain[pokemon]'
                 )
 
-            # Parse: "@username [filters]" or "keyword:xxx" or "trend:xxx"
-            account_target = parse_account_watch_text(raw)
+            # 1. Pull `schedule:NN` out of the raw text first so it doesn't
+            #    leak into source / kind parsing downstream.
+            schedule_override, raw = extract_schedule_minutes(raw)
+
+            # 2. Strip `<source>:` prefix. No prefix → backcompat default "x".
+            source, body = split_source_prefix(raw)
+
+            # 3. Reddit trend watches don't exist — fail loudly.
+            if source == "reddit" and body.lower().startswith("trend:"):
+                return "Reddit 來源不支援 trend 追蹤。請改用 reddit:r/<subreddit> 或 reddit:keyword:<關鍵字>。"
+
+            # Reddit account form is `r/<subreddit>` (parse_account_watch_text
+            # already handles both `@xxx` and `r/xxx`); X account form is `@<handle>`.
+            account_target = parse_account_watch_text(body)
             if account_target is not None:
-                # Account watch
                 screen_name, include_keywords, domains = account_target
-                rule_id = SnsDatabase._watch_rule_id("account", screen_name)
+                rule_id = SnsDatabase._watch_rule_id("account", screen_name, source)
                 existing_rule = self._sns_db.get_watch_rule(rule_id)
-                # If domain[...] wasn't supplied in this call, preserve the
-                # existing rule's domains (upsert semantics).
                 resolved_domains = (
                     domains if domains is not None else getattr(existing_rule, "domains", ())
                 )
+                schedule_minutes = (
+                    schedule_override
+                    if schedule_override is not None
+                    else getattr(existing_rule, "schedule_minutes", None)
+                    or default_schedules.get((source, "account"), 30)
+                )
+                display = f"r/{screen_name}" if source == "reddit" else f"@{screen_name}"
                 rule = AccountWatch(
                     rule_id=rule_id,
                     screen_name=screen_name,
                     user_id=getattr(existing_rule, "user_id", None),
-                    label=getattr(existing_rule, "label", None) or f"@{screen_name}",
+                    label=getattr(existing_rule, "label", None) or display,
                     include_keywords=include_keywords,
                     domains=resolved_domains,
                     enabled=True,
-                    schedule_minutes=15,
+                    schedule_minutes=schedule_minutes,
                     chat_id=chat_id,
                     last_checked_at=getattr(existing_rule, "last_checked_at", None),
+                    source=source,
                 )
                 self._sns_db.save_watch_rule(rule)
                 logger.info(
-                    "SNS account watch added screen_name=%s chat_id=%s include_keywords=%s domains=%s",
-                    screen_name,
-                    chat_id,
-                    include_keywords,
-                    resolved_domains,
+                    "SNS account watch added source=%s target=%s chat_id=%s include_keywords=%s domains=%s schedule=%dm",
+                    source, screen_name, chat_id, include_keywords, resolved_domains, schedule_minutes,
                 )
-                filter_line = (
-                    f"\n篩選：{', '.join(include_keywords)}"
-                    if include_keywords
-                    else ""
+                filter_line = f"\n篩選：{', '.join(include_keywords)}" if include_keywords else ""
+                domain_line = f"\n領域：{', '.join(resolved_domains)}" if resolved_domains else ""
+                kind_label = "subreddit" if source == "reddit" else "帳號"
+                return (
+                    f"✓ 已新增 {source_label.get(source, source)} {kind_label}追蹤：{display}"
+                    f"{filter_line}{domain_line}\n排程：每 {schedule_minutes} 分鐘\nID: {rule_id[:8]}…"
                 )
-                domain_line = (
-                    f"\n領域：{', '.join(resolved_domains)}"
-                    if resolved_domains
-                    else ""
-                )
-                return f"✓ 已新增 X 帳號追蹤：@{screen_name}{filter_line}{domain_line}\nID: {rule_id[:8]}…"
-            elif raw.startswith("keyword:"):
-                # Keyword watch — strip the keyword: prefix first, then pull
-                # out any labelled domain[...] so the remainder is the query.
-                domain_brackets, _, body = extract_labeled_brackets(raw)
-                # body still has "keyword:" prefix; trim it.
-                body = body[len("keyword:"):].strip() if body.lower().startswith("keyword:") else raw[len("keyword:"):].strip()
-                # extract_labeled_brackets removed `domain[...]`; if filter[...] was used we also want it gone.
-                explicit_filter, parsed_domains, body_clean = extract_labeled_brackets(raw[len("keyword:"):])
+            elif body.lower().startswith("keyword:"):
+                explicit_filter, parsed_domains, body_clean = extract_labeled_brackets(body[len("keyword:"):])
                 query = body_clean.strip()
                 if not query:
-                    return "請提供搜尋關鍵字。例如：/snsadd keyword:機動戰士 domain[gundam]"
-                rule_id = SnsDatabase._watch_rule_id("keyword", query)
+                    return "請提供搜尋關鍵字。例如：/snsadd x:keyword:機動戰士 domain[gundam]"
+                rule_id = SnsDatabase._watch_rule_id("keyword", query, source)
                 existing_rule = self._sns_db.get_watch_rule(rule_id)
                 resolved_domains = (
                     parsed_domains if parsed_domains is not None else getattr(existing_rule, "domains", ())
+                )
+                schedule_minutes = (
+                    schedule_override
+                    if schedule_override is not None
+                    else getattr(existing_rule, "schedule_minutes", None)
+                    or default_schedules.get((source, "keyword"), 60)
                 )
                 rule = KeywordWatch(
                     rule_id=rule_id,
@@ -1675,24 +1700,36 @@ class TelegramCommandProcessor:
                     label=f'"{query}"',
                     domains=resolved_domains,
                     enabled=True,
-                    schedule_minutes=30,
+                    schedule_minutes=schedule_minutes,
                     chat_id=chat_id,
                     last_checked_at=None,
+                    source=source,
                 )
                 self._sns_db.save_watch_rule(rule)
-                logger.info("SNS keyword watch added query=%s chat_id=%s domains=%s", query, chat_id, resolved_domains)
+                logger.info(
+                    "SNS keyword watch added source=%s query=%s chat_id=%s domains=%s schedule=%dm",
+                    source, query, chat_id, resolved_domains, schedule_minutes,
+                )
                 domain_line = f"\n領域：{', '.join(resolved_domains)}" if resolved_domains else ""
-                return f'✓ 已新增 X 關鍵字追蹤："{query}"{domain_line}\nID: {rule_id[:8]}…'
-            elif raw.startswith("trend:"):
-                # Trend watch
-                _, parsed_domains, body_clean = extract_labeled_brackets(raw[len("trend:"):])
+                return (
+                    f'✓ 已新增 {source_label.get(source, source)} 關鍵字追蹤："{query}"{domain_line}'
+                    f"\n排程：每 {schedule_minutes} 分鐘\nID: {rule_id[:8]}…"
+                )
+            elif body.lower().startswith("trend:"):
+                _, parsed_domains, body_clean = extract_labeled_brackets(body[len("trend:"):])
                 category = body_clean.strip()
                 if category not in {"trending", "for-you", "news", "sports", "entertainment"}:
                     return "不支援的分類。請使用：trending, for-you, news, sports, 或 entertainment"
-                rule_id = SnsDatabase._watch_rule_id("trend", category)
+                rule_id = SnsDatabase._watch_rule_id("trend", category, source)
                 existing_rule = self._sns_db.get_watch_rule(rule_id)
                 resolved_domains = (
                     parsed_domains if parsed_domains is not None else getattr(existing_rule, "domains", ())
+                )
+                schedule_minutes = (
+                    schedule_override
+                    if schedule_override is not None
+                    else getattr(existing_rule, "schedule_minutes", None)
+                    or default_schedules.get((source, "trend"), 60)
                 )
                 rule = TrendWatch(
                     rule_id=rule_id,
@@ -1700,15 +1737,27 @@ class TelegramCommandProcessor:
                     label=f"Trend: {category}",
                     domains=resolved_domains,
                     enabled=True,
-                    schedule_minutes=60,
+                    schedule_minutes=schedule_minutes,
                     chat_id=chat_id,
                     last_checked_at=None,
+                    source=source,
                 )
                 self._sns_db.save_watch_rule(rule)
-                logger.info("SNS trend watch added category=%s chat_id=%s", category, chat_id)
-                return f"✓ 已新增 X 熱門話題追蹤：{category}\nID: {rule_id[:8]}…"
+                logger.info(
+                    "SNS trend watch added source=%s category=%s chat_id=%s schedule=%dm",
+                    source, category, chat_id, schedule_minutes,
+                )
+                return (
+                    f"✓ 已新增 {source_label.get(source, source)} 熱門話題追蹤：{category}"
+                    f"\n排程：每 {schedule_minutes} 分鐘\nID: {rule_id[:8]}…"
+                )
             else:
-                return '不認識的格式。用法：/snsadd @username 或 /snsadd @username ["buy", "sell"] 或 /snsadd keyword:搜尋詞 或 /snsadd trend:trending'
+                return (
+                    '不認識的格式。用法：\n'
+                    '  /snsadd x:@username [filter[…] domain[…] schedule:NN]\n'
+                    '  /snsadd x:keyword:搜尋詞 / x:trend:trending\n'
+                    '  /snsadd reddit:r/<subreddit> / reddit:keyword:<關鍵字>'
+                )
         except Exception as exc:
             logger.exception("SNS add failed raw=%s chat_id=%s", raw, chat_id)
             return f"新增失敗：{exc}"
@@ -1742,14 +1791,17 @@ class TelegramCommandProcessor:
         items: list[_ListRow] = []
         for rule in rules:
             status = "✓" if rule.enabled else "✗"
+            source = getattr(rule, "source", "x")
+            source_tag = f"[{source}] "
             screen_name = getattr(rule, "screen_name", None)
             query_text = getattr(rule, "query", None)
             category = getattr(rule, "category", None)
             if screen_name:
+                handle_display = f"r/{screen_name}" if source == "reddit" else f"@{screen_name}"
                 include_kw = getattr(rule, "include_keywords", ()) or ()
                 filters = f" filter[{', '.join(include_kw)}]" if include_kw else ""
-                info = f"@{screen_name}{filters}"
-                short = f"@{screen_name}"
+                info = f"{handle_display}{filters}"
+                short = handle_display
             elif query_text:
                 info = f'"{query_text}"'
                 short = f'"{query_text[:18]}"'
@@ -1761,7 +1813,8 @@ class TelegramCommandProcessor:
                 short = rule.rule_id[:8]
             domains = getattr(rule, "domains", ())
             domain_segment = f" domain[{', '.join(domains)}]" if domains else " domain[?]"
-            text_block = f"  {status} {info}{domain_segment} ({rule.rule_id[:8]}…)"
+            schedule_segment = f" schedule:{rule.schedule_minutes}m" if getattr(rule, "schedule_minutes", None) else ""
+            text_block = f"  {status} {source_tag}{info}{domain_segment}{schedule_segment} ({rule.rule_id[:8]}…)"
             items.append(_ListRow(id=rule.rule_id, text=text_block, short_label=short))
 
         text, reply_markup, clamped = _build_list_view(
@@ -1810,11 +1863,13 @@ class TelegramCommandProcessor:
     def _resolve_sns_rule_id(self, target: str) -> str | None:
         """Resolve a user-supplied target to a SNS rule_id.
 
-        Accepts: a hex rule_id prefix, '@handle' for account watches,
-        or 'keyword:xxx' for keyword watches.
+        Accepts: a hex rule_id prefix, '@handle' / 'r/sub' for account watches,
+        'keyword:xxx' for keyword watches, and the source-prefixed forms
+        ('reddit:r/sub', 'reddit:keyword:xxx', 'x:@handle', ...).
         """
         if self._sns_db is None:
             return None
+
         cleaned = target.strip()
         if not cleaned:
             return None
@@ -1826,26 +1881,62 @@ class TelegramCommandProcessor:
             if rule.rule_id == cleaned or rule.rule_id.startswith(cleaned):
                 return rule.rule_id
 
-        # 2) @handle → account watch
-        if cleaned.startswith("@"):
-            handle = cleaned.lstrip("@").lower()
+        # 2) Optional `<source>:` prefix narrows the search. Inline a small
+        #    prefix-split here to avoid a hard sns_monitor dependency in the
+        #    test path (test venv may not have sns_monitor installed).
+        source_filter = "x"
+        had_source_prefix = False
+        body = cleaned
+        for src in ("reddit:", "x:"):
+            if cleaned.lower().startswith(src):
+                source_filter = src[:-1]
+                had_source_prefix = True
+                body = cleaned[len(src):].strip()
+                break
+
+        def _source_matches(rule) -> bool:
+            return (not had_source_prefix) or getattr(rule, "source", "x") == source_filter
+
+        # 3) @handle → X account watch
+        if body.startswith("@"):
+            handle = body.lstrip("@").lower()
             for rule in rules:
-                if getattr(rule, "screen_name", "").lower() == handle:
+                if (
+                    getattr(rule, "screen_name", "").lower() == handle
+                    and _source_matches(rule)
+                ):
                     return rule.rule_id
             return None
 
-        # 3) keyword:xxx → keyword watch
-        if cleaned.lower().startswith("keyword:"):
-            query = cleaned.split(":", 1)[1].strip().lower()
+        # 4) r/<sub> → Reddit subreddit account watch
+        if body.lower().startswith("r/"):
+            sub = body[2:].strip().lower()
             for rule in rules:
-                if getattr(rule, "query", "").lower() == query:
+                if (
+                    getattr(rule, "screen_name", "").lower() == sub
+                    and (getattr(rule, "source", "x") == "reddit" if not had_source_prefix else _source_matches(rule))
+                ):
                     return rule.rule_id
             return None
 
-        # 4) Bare token: try as a handle (without @) since users often forget it
-        bare = cleaned.lstrip("@").lower()
+        # 5) keyword:xxx → keyword watch
+        if body.lower().startswith("keyword:"):
+            query = body.split(":", 1)[1].strip().lower()
+            for rule in rules:
+                if (
+                    getattr(rule, "query", "").lower() == query
+                    and _source_matches(rule)
+                ):
+                    return rule.rule_id
+            return None
+
+        # 6) Bare token → try as handle (without @ or r/)
+        bare = body.lstrip("@").lower()
         for rule in rules:
-            if getattr(rule, "screen_name", "").lower() == bare:
+            if (
+                getattr(rule, "screen_name", "").lower() == bare
+                and _source_matches(rule)
+            ):
                 return rule.rule_id
 
         return None
