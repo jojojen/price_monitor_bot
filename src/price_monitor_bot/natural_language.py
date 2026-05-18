@@ -50,11 +50,21 @@ _ROUTER_JSON_SCHEMA = {
                 {"type": "null"},
             ]
         },
+        # SNS bulk-filter update (sns_bulk_add_filter)
+        "bulk_target_domain": {"type": ["string", "null"]},
+        "bulk_filter_keywords": {
+            "anyOf": [
+                {"type": "array", "items": {"type": "string"}},
+                {"type": "string"},
+                {"type": "null"},
+            ]
+        },
     },
     "required": [
         "intent", "game", "name", "card_number", "rarity", "set_code", "limit", "confidence",
         "watch_query", "watch_price_threshold", "watch_id", "query_url", "research_query", "opportunity_target",
         "sns_handle", "sns_keyword", "sns_buzz_query", "sns_include_keywords",
+        "bulk_target_domain", "bulk_filter_keywords",
     ],
     "additionalProperties": False,
 }
@@ -178,6 +188,16 @@ _BULK_FILTER_HINT_KEYWORDS = (
 )
 _BULK_ADD_VERB_KEYWORDS = (
     "加上", "加入", "添加", "改成", "改為", "改为", "都包含", "都加",
+)
+# Verbs that mean "clear/empty the filter" on a single @handle. Used together
+# with _BULK_FILTER_HINT_KEYWORDS to recognise "把 @X 的 filter 拿掉" without
+# colliding with sns_delete (which uses 刪除/取消/unfollow). Deliberately omits
+# 刪除 to keep sns_delete unambiguous.
+_FILTER_CLEAR_VERB_KEYWORDS = (
+    "拿掉", "全部拿掉", "都拿掉",
+    "清除", "清空", "清光",
+    "去掉", "移除掉", "全部移除",
+    "clear", "wipe", "remove all",
 )
 _SNS_BULK_TARGET_RE = re.compile(
     r"(?P<target>tcg|pokemon|寶可夢|宝可梦|ポケモン|"
@@ -371,7 +391,7 @@ class TelegramNaturalLanguageRouter:
         return (
             "You route Telegram messages for a trading-card price assistant and must return only JSON.\n"
             "Allowed intents: lookup_card, trend_board, add_watch, list_watches, remove_watch, update_watch_price, reputation_snapshot, "
-            "web_research, opportunity_remove, sns_add_account, sns_add_keyword, sns_list, sns_delete, sns_buzz, "
+            "web_research, opportunity_remove, sns_add_account, sns_add_keyword, sns_list, sns_delete, sns_buzz, sns_bulk_add_filter, sns_clear_filter, "
             "help, status, tools, scan_help, unknown.\n"
             + tool_spec_block +
             "Use lookup_card when the user wants the price, value, or card lookup of one specific card.\n"
@@ -395,10 +415,18 @@ class TelegramNaturalLanguageRouter:
             "Use sns_add_keyword when the user wants to add an X keyword/topic watch (not an @ account).\n"
             "  Set sns_keyword to the keyword phrase.\n"
             "Use sns_list when the user wants to see the SNS / X / Twitter watch rules (NOT the Mercari watchlist).\n"
-            "Use sns_delete when the user wants to REMOVE / unfollow / unwatch / 取消追蹤 / 刪除 an X account or SNS rule, especially when the message references an @ handle.\n"
+            "Use sns_delete when the user wants to REMOVE THE WHOLE WATCH RULE (unfollow / unwatch / 取消追蹤 / 停止追蹤 / 刪除追蹤) for an X account.\n"
             "  Set sns_handle to the @username if mentioned (without the @). Set watch_id only if a hex SNS rule ID is given.\n"
+            "  Do NOT use sns_delete merely because the user said '拿掉/清除/清空 filter' — that's sns_clear_filter (which keeps the watch rule).\n"
+            "Use sns_clear_filter when the user wants to clear/empty the filter (include_keywords) on ONE @handle while KEEPING the watch rule active. Signals: one @handle plus a verb like '拿掉/清除/清空/clear/remove' applied to 'filter/篩選/過濾/關鍵字'.\n"
+            "  Set sns_handle to the @username (without the @).\n"
             "Use sns_buzz when the user wants a Reddit/X topic digest, hot discussion, summary, 'what's buzzing about X'.\n"
             "  Set sns_buzz_query to the topic keyword.\n"
+            "Use sns_bulk_add_filter when the user wants to update filters on EVERY account matching a TCG domain in bulk "
+            "(signals: plural quantifier like '每個/所有/全部', a domain word like 'tcg/pokemon/寶可夢/遊戲王/ws/union arena', "
+            "an action like '加上/加入/改成', and a filter/keyword hint word).\n"
+            "  Set bulk_target_domain to one of: tcg, pokemon, yugioh, ws, union_arena.\n"
+            "  Set bulk_filter_keywords to the list of keywords to append (e.g. [\"抽選\"]).\n"
             "Use help when the user asks what the bot can do.\n"
             "Use status when the user asks about current runtime state, models, or service health.\n"
             "Use tools when the user explicitly asks for the full tool catalog or list of available tools.\n"
@@ -411,6 +439,8 @@ class TelegramNaturalLanguageRouter:
             "- '取消'/'刪除'/'unfollow'/'unwatch' on an @ handle → sns_delete with sns_handle set, NOT remove_watch.\n"
             "- Removing a target/candidate from /hunt status or the opportunity list → opportunity_remove, NOT remove_watch.\n"
             "- If a message asks about price direction (rising / falling / 漲 / 跌 / 在跌 / 在漲 / 暴跌 / 暴漲 / dropping / soaring) and does NOT explicitly request a ranking, top-N, or leaderboard, it is web_research, not trend_board.\n"
+            "- A message about adding filter to a SINGLE @handle → sns_add_account. A message about adding filter to EVERY account in a domain (no @handle, plural quantifier present like 每個/所有/全部) → sns_bulk_add_filter.\n"
+            "- '拿掉/清除/清空 @X 的 filter/篩選/關鍵字' → sns_clear_filter (clears include_keywords only). '取消追蹤/停止追蹤/刪除追蹤/unfollow @X' → sns_delete (removes the whole rule).\n"
             "- If the message could plausibly match more than one of the listed intents, return confidence below 0.5 instead of picking confidently. Honest uncertainty beats a confident wrong guess.\n"
             f'Game must be one of "{supported_game_hint()}" or null.\n'
             "Infer pokemon for wording like Pokemon, PTCG, 寶可夢, 寶可卡.\n"
@@ -447,6 +477,9 @@ class TelegramNaturalLanguageRouter:
             '- "刪除追蹤 @elonmusk" -> sns_delete, sns_handle="elonmusk"\n'
             '- "取消追蹤 @aka_claw" -> sns_delete, sns_handle="aka_claw"\n'
             '- "unfollow @elonmusk" -> sns_delete, sns_handle="elonmusk"\n'
+            '- "把 @ARS_Arsales 的 filter 全部拿掉" -> sns_clear_filter, sns_handle="ARS_Arsales"\n'
+            '- "清空 @elonmusk 的篩選" -> sns_clear_filter, sns_handle="elonmusk"\n'
+            '- "clear filter on @aka_claw" -> sns_clear_filter, sns_handle="aka_claw"\n'
             '- "我的 X 追蹤清單" -> sns_list\n'
             '- "看一下推主追蹤" -> sns_list\n'
             '- "監控關鍵字 機動戰士" -> sns_add_keyword, sns_keyword="機動戰士"\n'
@@ -651,6 +684,21 @@ def fallback_route_telegram_natural_language(text: str) -> TelegramNaturalLangua
 
     handle_match = _X_HANDLE_RE.search(content)
     has_sns_context = any(kw in lowered for kw in _SNS_CONTEXT_KEYWORDS) or handle_match is not None
+
+    # sns_clear_filter: @handle + filter-hint noun + clear-verb. Must match
+    # BEFORE sns_delete so phrases like "把 @X 的 filter 全部拿掉" don't get
+    # interpreted as a watch-rule removal. The double-signal requirement
+    # (filter-noun AND clear-verb) prevents bare "拿掉 @X" from being captured
+    # here — those still fall through to sns_delete or remain unrouted.
+    if handle_match:
+        has_filter_noun = any(kw in lowered for kw in _BULK_FILTER_HINT_KEYWORDS)
+        has_clear_verb = any(kw in lowered for kw in _FILTER_CLEAR_VERB_KEYWORDS)
+        if has_filter_noun and has_clear_verb:
+            return TelegramNaturalLanguageIntent(
+                intent="sns_clear_filter",
+                sns_handle=handle_match.group(1),
+                confidence=0.85,
+            )
 
     # sns_delete: any remove/unfollow phrase combined with @handle or SNS context
     if handle_match and any(kw in lowered for kw in _WATCH_REMOVE_KEYWORDS):
@@ -883,7 +931,7 @@ _ALLOWED_INTENTS = frozenset({
     "add_watch", "list_watches", "remove_watch", "update_watch_price",
     "reputation_snapshot", "web_research", "opportunity_remove",
     "sns_add_account", "sns_add_keyword", "sns_list", "sns_delete", "sns_buzz",
-    "sns_bulk_add_filter",
+    "sns_bulk_add_filter", "sns_clear_filter",
     "help", "status", "tools", "scan_help", "unknown",
 })
 

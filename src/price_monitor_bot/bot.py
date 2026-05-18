@@ -1576,6 +1576,20 @@ class TelegramCommandProcessor:
                 keywords=intent.bulk_filter_keywords,
             )
 
+        if intent.intent == "sns_clear_filter":
+            if not intent.sns_handle:
+                return TelegramTextReplyPlan(
+                    ack=None,
+                    reply="請告訴我要清空哪個 @ 帳號的 filter，例如：把 @elonmusk 的 filter 拿掉。",
+                )
+            handle = intent.sns_handle
+            logger.info("Telegram NL routed intent=sns_clear_filter handle=%s", handle)
+            return TelegramTextReplyPlan(
+                ack=f"已理解：把 @{handle} 的 filter 清空（保留追蹤）",
+                reply=None,
+                reply_factory=lambda h=handle: self._handle_sns_clear_filter(h),
+            )
+
         return None
 
     def _handle_sns_add(self, raw: str, chat_id: str) -> str:
@@ -1853,6 +1867,35 @@ class TelegramCommandProcessor:
             return rule.rule_id[:8]
         return rule_id[:8]
 
+    def _handle_sns_clear_filter(self, handle: str) -> str:
+        """Clear include_keywords on an account watch while keeping the rule active."""
+        if self._sns_db is None:
+            return "SNS 監控尚未啟用（sns_db 未設定）。"
+        from dataclasses import replace
+        from sns_monitor.models import AccountWatch
+        from sns_monitor.storage import SnsDatabase
+
+        try:
+            screen_name = handle.lstrip("@").strip()
+            if not screen_name:
+                return "請提供 @ 帳號，例如：把 @elonmusk 的 filter 拿掉。"
+            rule_id = SnsDatabase._watch_rule_id("account", screen_name)
+            existing_rule = self._sns_db.get_watch_rule(rule_id)
+            if not isinstance(existing_rule, AccountWatch):
+                return f"找不到 @{screen_name} 的 X 帳號追蹤規則（請先用 /snsadd 新增）。"
+            if not existing_rule.include_keywords:
+                return f"✓ @{screen_name} 目前沒有 filter，無需清空。"
+            previous = existing_rule.include_keywords
+            cleared = replace(existing_rule, include_keywords=())
+            self._sns_db.save_watch_rule(cleared)
+            logger.info(
+                "SNS filter cleared screen_name=%s previous=%s", screen_name, previous,
+            )
+            return f"✓ 已清空 @{screen_name} 的 filter（追蹤仍啟用，原本：{', '.join(previous)}）。"
+        except Exception as exc:
+            logger.exception("SNS clear filter failed handle=%s", handle)
+            return f"清空 filter 失敗：{exc}"
+
     def _handle_sns_buzz(self, raw: str) -> str:
         """Handle /snsbuzz <keyword> command: summarize X buzz on a topic via LLM."""
         if self._sns_buzz_fn is None:
@@ -1938,21 +1981,50 @@ class TelegramCommandProcessor:
         )
 
     def _route_natural_language(self, text: str) -> TelegramNaturalLanguageIntent | None:
+        llm_intent: TelegramNaturalLanguageIntent | None = None
         if self._natural_language_router is not None:
             try:
-                intent = self._natural_language_router.route(text)
+                llm_intent = self._natural_language_router.route(text)
             except Exception:
                 logger.exception("Telegram natural-language router failed, falling back to keyword rules text=%s", trim_for_log(text, limit=240))
-            else:
-                if intent is not None and intent.intent != "unknown":
-                    return intent
-                logger.debug("Telegram natural-language LLM returned unknown; trying keyword fallback")
 
-        # LLM not configured, or LLM threw an exception — use keyword fallback as last resort
         fallback_intent = fallback_route_telegram_natural_language(text)
+
+        # Bulk-filter sentences (e.g. "把每個跟 pokemon 相關的 sns 追蹤帳號 filter 都加上「抽選」")
+        # are unreliable through the LLM — the structured fields it must populate are easy to drop.
+        # When the deterministic regex fallback identifies this intent, prefer it over the LLM result.
+        if (
+            fallback_intent is not None
+            and fallback_intent.intent == "sns_bulk_add_filter"
+            and (llm_intent is None or llm_intent.intent != "sns_bulk_add_filter")
+        ):
+            logger.info(
+                "Telegram natural-language fallback rescued sns_bulk_add_filter (llm_intent=%s)",
+                getattr(llm_intent, "intent", None),
+            )
+            return fallback_intent
+
+        # Clear-filter sentences (e.g. "把 @ARS_Arsales 的 filter 全部拿掉") get
+        # routinely mis-mapped by the LLM to sns_delete because "拿掉" reads as
+        # a remove-verb. The fallback's double-signal regex (filter-noun + clear-verb)
+        # is the reliable detector — prefer it over the LLM when it fires.
+        if (
+            fallback_intent is not None
+            and fallback_intent.intent == "sns_clear_filter"
+            and (llm_intent is None or llm_intent.intent != "sns_clear_filter")
+        ):
+            logger.info(
+                "Telegram natural-language fallback rescued sns_clear_filter (llm_intent=%s)",
+                getattr(llm_intent, "intent", None),
+            )
+            return fallback_intent
+
+        if llm_intent is not None and llm_intent.intent != "unknown":
+            return llm_intent
+
         if fallback_intent is not None and fallback_intent.intent != "unknown":
             logger.info(
-                "Telegram natural-language fallback (no LLM) intent=%s confidence=%s",
+                "Telegram natural-language fallback intent=%s confidence=%s",
                 fallback_intent.intent,
                 fallback_intent.confidence,
             )
