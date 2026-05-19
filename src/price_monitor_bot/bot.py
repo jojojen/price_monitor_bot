@@ -52,6 +52,8 @@ PhotoIntentAnalyzer = Callable[["TelegramPhotoQuery"], "TelegramPhotoIntentAnaly
 ReputationRenderer = Callable[["TelegramReputationQuery"], object]
 ResearchRenderer = Callable[["TelegramResearchQuery"], str]
 OpportunityTargetRemover = Callable[[str], str]
+# (selector, kind, action, names) -> reply text. kind in {"aliases","related"}, action in {"add","remove"}.
+OpportunityAliasUpdater = Callable[[str, str, str, list[str]], str]
 BoardLoader = Callable[[], tuple[HotCardBoard, ...]]
 CatalogRenderer = Callable[[], str]
 WatchlistStore = object  # MonitorDatabase or None
@@ -655,6 +657,7 @@ class TelegramCommandProcessor:
         opportunity_status_renderer: Callable[[], str] | None = None,
         opportunity_target_remover: OpportunityTargetRemover | None = None,
         opportunity_list_provider: Callable[[], list[dict[str, object]]] | None = None,
+        opportunity_alias_updater: OpportunityAliasUpdater | None = None,
     ) -> None:
         self._lookup_renderer = lookup_renderer
         self._board_loader = board_loader
@@ -671,6 +674,7 @@ class TelegramCommandProcessor:
         self._opportunity_status_renderer = opportunity_status_renderer
         self._opportunity_target_remover = opportunity_target_remover
         self._opportunity_list_provider = opportunity_list_provider
+        self._opportunity_alias_updater = opportunity_alias_updater
         self._pending_photo_clarifications: dict[str, PendingTelegramPhotoClarification] = {}
         self._pending_text_clarifications: dict[str, PendingTelegramTextClarification] = {}
         self._pending_sns_bulk_updates: dict[str, PendingTelegramSnsBulkUpdate] = {}
@@ -1238,7 +1242,53 @@ class TelegramCommandProcessor:
             if not target:
                 return "請提供要移除的目標，例如：/hunt remove 2 或 /hunt remove Umbreon ex SAR"
             return self._opportunity_target_remover(target)
-        return "可用格式：/hunt status 或 /hunt remove <編號或名稱>"
+        alias_reply = self._maybe_handle_hunt_alias(raw)
+        if alias_reply is not None:
+            return alias_reply
+        return (
+            "可用格式：\n"
+            "  /hunt status\n"
+            "  /hunt remove <編號或名稱>\n"
+            "  /hunt alias <編號或id> add 別名A, 別名B\n"
+            "  /hunt alias <編號或id> remove 別名A\n"
+            "  /hunt related <編號或id> add 關鍵字"
+        )
+
+    def _maybe_handle_hunt_alias(self, raw: str) -> str | None:
+        """Parse `/hunt alias|related <selector> add|remove <names>`.
+
+        Returns the reply text when matched, None otherwise so the caller falls
+        back to the generic usage hint. Names accept ','/'、'/'，' separators.
+        """
+        import re as _re
+
+        match = _re.match(
+            r"^\s*(?P<kind>alias|aliases|related|related_keywords)\s+(?P<rest>.+)$",
+            raw,
+            _re.IGNORECASE,
+        )
+        if match is None:
+            return None
+        kind_raw = match.group("kind").lower()
+        kind = "aliases" if kind_raw.startswith("alias") else "related"
+        rest = match.group("rest").strip()
+        action_match = _re.search(r"\b(add|remove|rm|del|delete)\b", rest, _re.IGNORECASE)
+        if action_match is None:
+            return f"請指定 add 或 remove。例如：/hunt {kind_raw} <編號或id> add 別名A"
+        selector = rest[: action_match.start()].strip()
+        if not selector:
+            return f"請提供候選編號或 id。例如：/hunt {kind_raw} 2 add 別名A"
+        action_word = action_match.group(1).lower()
+        action = "remove" if action_word in {"remove", "rm", "del", "delete"} else "add"
+        tail = rest[action_match.end():].strip()
+        if not tail:
+            return f"請提供至少一個名稱。例如：/hunt {kind_raw} {selector} {action} ピカチュウex SAR"
+        names = _split_alias_names(tail)
+        if not names:
+            return "請提供至少一個有效的名稱。"
+        if self._opportunity_alias_updater is None:
+            return "Opportunity alias updater is not configured in this runtime."
+        return self._opportunity_alias_updater(selector, kind, action, names)
 
     def render_huntlist_view(
         self, *, page: int = 0, mode: str = LIST_VIEW_MODE_READ
@@ -2346,6 +2396,22 @@ def _extract_hunt_remove_target(raw: str) -> str:
     return " ".join(target.split()).strip()
 
 
+def _split_alias_names(tail: str) -> list[str]:
+    """Split a /hunt alias names string into individual names.
+
+    Accepts ASCII comma, full-width comma (，) and Japanese enumeration (、)
+    as separators. When no separator is present, the entire tail is treated
+    as a single name (so multi-word aliases like "テラスタル ピカチュウ sar"
+    survive without manual quoting).
+    """
+    standardized = tail.replace("，", ",").replace("、", ",").strip()
+    if not standardized:
+        return []
+    if "," in standardized:
+        return [part.strip() for part in standardized.split(",") if part.strip()]
+    return [standardized]
+
+
 def format_liquidity_board(board: HotCardBoard, *, limit: int = 5) -> str:
     lines = [board.label]
     for item in board.items[:limit]:
@@ -2623,6 +2689,7 @@ def run_telegram_polling(
     opportunity_status_renderer: Callable[[], str] | None = None,
     opportunity_target_remover: OpportunityTargetRemover | None = None,
     opportunity_list_provider: Callable[[], list[dict[str, object]]] | None = None,
+    opportunity_alias_updater: OpportunityAliasUpdater | None = None,
     poll_timeout: int = 20,
     notify_startup: bool = False,
     drop_pending_updates: bool = True,
@@ -2660,6 +2727,7 @@ def run_telegram_polling(
         opportunity_status_renderer=opportunity_status_renderer,
         opportunity_target_remover=opportunity_target_remover,
         opportunity_list_provider=opportunity_list_provider,
+        opportunity_alias_updater=opportunity_alias_updater,
     )
     resolved_photo_renderer = photo_renderer or default_photo_renderer()
 
