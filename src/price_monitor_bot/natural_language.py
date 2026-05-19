@@ -50,6 +50,8 @@ _ROUTER_JSON_SCHEMA = {
                 {"type": "null"},
             ]
         },
+        # SNS per-rule schedule override (sns_add_account); minutes, 5-1440.
+        "sns_schedule_minutes": {"type": ["integer", "null"]},
         # SNS bulk-filter update (sns_bulk_add_filter)
         "bulk_target_domain": {"type": ["string", "null"]},
         "bulk_filter_keywords": {
@@ -63,7 +65,7 @@ _ROUTER_JSON_SCHEMA = {
     "required": [
         "intent", "game", "name", "card_number", "rarity", "set_code", "limit", "confidence",
         "watch_query", "watch_price_threshold", "watch_id", "query_url", "research_query", "opportunity_target",
-        "sns_handle", "sns_keyword", "sns_buzz_query", "sns_include_keywords",
+        "sns_handle", "sns_keyword", "sns_buzz_query", "sns_include_keywords", "sns_schedule_minutes",
         "bulk_target_domain", "bulk_filter_keywords",
     ],
     "additionalProperties": False,
@@ -341,6 +343,8 @@ class TelegramNaturalLanguageIntent:
     sns_keyword: str | None = None      # for sns_add_keyword (keyword watch)
     sns_buzz_query: str | None = None   # for sns_buzz (LLM topic digest)
     sns_include_keywords: tuple[str, ...] = ()
+    # SNS per-rule schedule override (sns_add_account; minutes, 5-1440 inclusive)
+    sns_schedule_minutes: int | None = None
     # SNS bulk filter update (sns_bulk_add_filter)
     bulk_target_domain: str | None = None      # e.g. "tcg" / "pokemon"
     bulk_filter_keywords: tuple[str, ...] = ()
@@ -409,9 +413,10 @@ class TelegramNaturalLanguageRouter:
             "  Set research_query to a concise web search query preserving the user's topic.\n"
             "Use opportunity_remove when the user wants to remove/dismiss a target/candidate from the opportunity/hunt list because they are not interested.\n"
             "  Set opportunity_target to the target number from /hunt status (e.g. '2') or the product name/keywords to remove.\n"
-            "Use sns_add_account when the user wants to ADD / track / monitor an X (Twitter) account that starts with @.\n"
+            "Use sns_add_account when the user wants to ADD / track / monitor an X (Twitter) account that starts with @, OR when they want to UPDATE THE SCHEDULE / 排程 / 輪詢頻率 of an existing @ account.\n"
             "  Set sns_handle to the @username (without the @).\n"
             "  If the user wants only tweets mentioning certain words, also set sns_include_keywords to those filter keywords.\n"
+            "  If the user mentions a polling cadence (e.g. '每 720 分鐘', '排程改成 60 分鐘', 'every 30 min', 'schedule to 90 minutes'), also set sns_schedule_minutes to the integer minute value (5-1440).\n"
             "Use sns_add_keyword when the user wants to add an X keyword/topic watch (not an @ account).\n"
             "  Set sns_keyword to the keyword phrase.\n"
             "Use sns_list when the user wants to see the SNS / X / Twitter watch rules (NOT the Mercari watchlist).\n"
@@ -474,6 +479,8 @@ class TelegramNaturalLanguageRouter:
             '- "追蹤 @elonmusk" -> sns_add_account, sns_handle="elonmusk"\n'
             '- "新增 X 監控 @aka_claw" -> sns_add_account, sns_handle="aka_claw"\n'
             '- "幫我把 @tenbai_hakase 加上 [抽選] 篩選" -> sns_add_account, sns_handle="tenbai_hakase", sns_include_keywords=["抽選"]\n'
+            '- "把 @PokeGetInfoMain 的追蹤排程改成每 720 分鐘" -> sns_add_account, sns_handle="PokeGetInfoMain", sns_schedule_minutes=720\n'
+            '- "schedule @elonmusk to 60 minutes" -> sns_add_account, sns_handle="elonmusk", sns_schedule_minutes=60\n'
             '- "刪除追蹤 @elonmusk" -> sns_delete, sns_handle="elonmusk"\n'
             '- "取消追蹤 @aka_claw" -> sns_delete, sns_handle="aka_claw"\n'
             '- "unfollow @elonmusk" -> sns_delete, sns_handle="elonmusk"\n'
@@ -730,14 +737,28 @@ def fallback_route_telegram_natural_language(text: str) -> TelegramNaturalLangua
         )
 
     sns_include_keywords = _extract_sns_include_keywords(content)
+    sns_schedule_minutes = _extract_sns_schedule_minutes(content)
+    # `_SCHEDULE_RE` is the single source of truth: if it matched, the user
+    # expressed schedule intent — even if the captured number was out of range
+    # (so `_extract_sns_schedule_minutes` returned None). We still route to
+    # sns_add_account so the user gets feedback instead of a silent miss.
+    has_schedule_hint = _SCHEDULE_RE.search(content) is not None
 
-    # sns_add_account: track/monitor with @handle, including filter updates
-    if handle_match and (any(kw in lowered for kw in _WATCH_ADD_KEYWORDS) or sns_include_keywords):
+    # sns_add_account: track/monitor with @handle, including filter / schedule updates.
+    # A schedule-only phrasing (e.g. "把 @X 的排程改成每 60 分鐘") might omit the
+    # 追蹤/監控 verbs, so accept schedule as a trigger too.
+    if handle_match and (
+        any(kw in lowered for kw in _WATCH_ADD_KEYWORDS)
+        or sns_include_keywords
+        or has_schedule_hint
+    ):
+        confidence = 0.85 if sns_include_keywords or sns_schedule_minutes is not None else 0.8
         return TelegramNaturalLanguageIntent(
             intent="sns_add_account",
             sns_handle=handle_match.group(1),
             sns_include_keywords=sns_include_keywords,
-            confidence=0.85 if sns_include_keywords else 0.8,
+            sns_schedule_minutes=sns_schedule_minutes,
+            confidence=confidence,
         )
 
     # ── Opportunity agent controls (must run before Mercari watch removal) ────
@@ -958,6 +979,7 @@ def _normalize_intent(payload: dict[str, object]) -> TelegramNaturalLanguageInte
     sns_keyword = _normalize_text_field(payload.get("sns_keyword"))
     sns_buzz_query = _normalize_text_field(payload.get("sns_buzz_query"))
     sns_include_keywords = _normalize_sns_include_keywords(payload.get("sns_include_keywords"))
+    sns_schedule_minutes = _normalize_schedule_minutes(payload.get("sns_schedule_minutes"))
     bulk_target_domain = _normalize_bulk_target_domain(payload.get("bulk_target_domain"))
     bulk_filter_keywords = _normalize_sns_include_keywords(payload.get("bulk_filter_keywords"))
 
@@ -988,6 +1010,7 @@ def _normalize_intent(payload: dict[str, object]) -> TelegramNaturalLanguageInte
         sns_keyword=sns_keyword,
         sns_buzz_query=sns_buzz_query,
         sns_include_keywords=sns_include_keywords,
+        sns_schedule_minutes=sns_schedule_minutes,
         bulk_target_domain=bulk_target_domain,
         bulk_filter_keywords=bulk_filter_keywords,
     )
@@ -1028,6 +1051,40 @@ def _normalize_sns_include_keywords(value: object) -> tuple[str, ...]:
     if isinstance(value, list):
         return _normalize_keyword_values([item for item in value if isinstance(item, str)])
     return ()
+
+
+# One regex captures BOTH the schedule context word and the duration token,
+# so we don't keep a separate hint-keyword list. Context vocab is intentionally
+# short — edge synonyms (輪詢/頻率/間隔/cadence/polling rate/每隔/…) are deferred
+# to the LLM router, which already has prompt examples for the schedule case.
+# The 4-word anchor (排程/schedule/每/every) covers the overwhelming majority of
+# natural phrasings; if it misses, the user can still use `/snsadd @X schedule:N`.
+_SCHEDULE_RE = re.compile(
+    # `\d+` (not `\d{1,4}`) so out-of-range numbers like "99999 分鐘" still match
+    # the schedule *intent*; `_normalize_schedule_minutes` then rejects the value
+    # while `_SCHEDULE_RE.search` evidence routes to sns_add_account with feedback.
+    r"(?:排程|schedule|每|every)\s*\D{0,20}?(\d+)\s*(?:分鐘|min(?:ute)?s?\b)",
+    re.IGNORECASE,
+)
+
+
+def _extract_sns_schedule_minutes(text: str) -> int | None:
+    """Pull a per-rule minute value out of phrases like '每 720 分鐘' /
+    'schedule to 60 mins'. Returns None when there's no schedule context or
+    the value is outside [5, 1440]. Out-of-range still returns None but the
+    caller can use ``_SCHEDULE_RE.search()`` separately to detect the user's
+    intent and route to sns_add_account anyway so the user gets feedback.
+    """
+    if not text:
+        return None
+    match = _SCHEDULE_RE.search(text)
+    if match is None:
+        return None
+    try:
+        value = int(match.group(1))
+    except ValueError:
+        return None
+    return value if 5 <= value <= 1440 else None
 
 
 def _extract_sns_include_keywords(text: str) -> tuple[str, ...]:
@@ -1289,6 +1346,26 @@ def _normalize_price_threshold(value: object) -> int | None:
         except ValueError:
             return None
     return None
+
+
+def _normalize_schedule_minutes(value: object) -> int | None:
+    """Coerce a schedule-minutes value to int in [5, 1440]; reject otherwise.
+
+    Matches the same bounds enforced by `extract_schedule_minutes` in sns_monitor
+    so the slash form and NL form behave identically.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        v = int(value)
+    elif isinstance(value, str):
+        try:
+            v = int(value.strip().replace(",", "").replace("，", ""))
+        except ValueError:
+            return None
+    else:
+        return None
+    return v if 5 <= v <= 1440 else None
 
 
 def _infer_game(text: str) -> str | None:
