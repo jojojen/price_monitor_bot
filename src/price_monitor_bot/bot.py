@@ -1564,18 +1564,27 @@ class TelegramCommandProcessor:
                 )
             handle = intent.sns_handle
             include_keywords = tuple(intent.sns_include_keywords)
+            schedule_minutes = intent.sns_schedule_minutes
             logger.info(
-                "Telegram NL routed intent=sns_add_account handle=%s include_keywords=%s",
+                "Telegram NL routed intent=sns_add_account handle=%s include_keywords=%s schedule_minutes=%s",
                 handle,
                 include_keywords,
+                schedule_minutes,
             )
             cid = str(chat_id)
             filter_suffix = f" {json.dumps(list(include_keywords), ensure_ascii=False)}" if include_keywords else ""
-            ack_suffix = f" 並加上篩選 {', '.join(include_keywords)}" if include_keywords else ""
+            schedule_suffix = f" schedule:{schedule_minutes}" if schedule_minutes else ""
+            remainder = f"@{handle}{filter_suffix}{schedule_suffix}"
+            ack_extras: list[str] = []
+            if include_keywords:
+                ack_extras.append(f"並加上篩選 {', '.join(include_keywords)}")
+            if schedule_minutes:
+                ack_extras.append(f"排程 {schedule_minutes} 分鐘")
+            ack_suffix = ("，" + "、".join(ack_extras)) if ack_extras else ""
             return TelegramTextReplyPlan(
-                ack=f"已理解：相當於 /snsadd @{handle}{filter_suffix}，正在新增 X 追蹤{ack_suffix}…",
+                ack=f"已理解：相當於 /snsadd {remainder}，正在新增 X 追蹤{ack_suffix}…",
                 reply=None,
-                reply_factory=lambda h=handle, c=cid, s=filter_suffix: self._handle_sns_add(f"@{h}{s}", c),
+                reply_factory=lambda r=remainder, c=cid: self._handle_sns_add(r, c),
             )
         if intent.intent == "sns_add_keyword":
             if not intent.sns_keyword:
