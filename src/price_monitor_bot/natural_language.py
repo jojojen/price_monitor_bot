@@ -201,6 +201,16 @@ _FILTER_CLEAR_VERB_KEYWORDS = (
     "去掉", "移除掉", "全部移除",
     "clear", "wipe", "remove all",
 )
+# Verbs that mean "remove ONE specific keyword" from filters in bulk. Distinct
+# from clear-all (sns_clear_filter) — these always take an explicit keyword.
+# Symmetric with `_BULK_ADD_VERB_KEYWORDS`. Anything beyond this short list is
+# left to the LLM router to recognise via the prompt examples.
+_BULK_REMOVE_VERB_KEYWORDS = (
+    "移除", "拿掉", "去掉", "清掉", "刪掉", "不要", "remove", "drop",
+)
+# Schedule signal: reuses existing `_SCHEDULE_RE` (defined below) which
+# already covers 排程/schedule/每/every + N + 分鐘. No separate hint list
+# needed — the LLM prompt handles synonyms like 頻率/輪詢/追蹤頻率.
 _SNS_BULK_TARGET_RE = re.compile(
     r"(?P<target>tcg|pokemon|寶可夢|宝可梦|ポケモン|"
     r"yugioh|遊戲王|遊戯王|"
@@ -395,7 +405,7 @@ class TelegramNaturalLanguageRouter:
         return (
             "You route Telegram messages for a trading-card price assistant and must return only JSON.\n"
             "Allowed intents: lookup_card, trend_board, add_watch, list_watches, remove_watch, update_watch_price, reputation_snapshot, "
-            "web_research, opportunity_remove, sns_add_account, sns_add_keyword, sns_list, sns_delete, sns_buzz, sns_bulk_add_filter, sns_clear_filter, "
+            "web_research, opportunity_remove, sns_add_account, sns_add_keyword, sns_list, sns_delete, sns_buzz, sns_bulk_add_filter, sns_bulk_remove_filter, sns_bulk_update_schedule, sns_clear_filter, "
             "help, status, tools, scan_help, unknown.\n"
             + tool_spec_block +
             "Use lookup_card when the user wants the price, value, or card lookup of one specific card.\n"
@@ -427,6 +437,21 @@ class TelegramNaturalLanguageRouter:
             "  Set sns_handle to the @username (without the @).\n"
             "Use sns_buzz when the user wants a Reddit/X topic digest, hot discussion, summary, 'what's buzzing about X'.\n"
             "  Set sns_buzz_query to the topic keyword.\n"
+            "Use sns_bulk_remove_filter when the user wants to REMOVE specific keywords from filters on EVERY account matching a TCG domain in bulk.\n"
+            "  Signals: a 'select all accounts in a domain' phrasing (a plural quantifier like '每個/所有/全部' OR an explicit 'domain 有/含/包含 <X>' clause) "
+            "+ a domain word (tcg/pokemon/yugioh/ws/union_arena) "
+            "+ a filter hint (filter/篩選/過濾/關鍵字) "
+            "+ a REMOVE verb (移除/拿掉/去掉/清掉/刪掉/不要/remove/drop) "
+            "+ at least one keyword (in 「」/quotes, or sitting next to the filter hint).\n"
+            "  Set bulk_target_domain to one of: tcg, pokemon, yugioh, ws, union_arena.\n"
+            "  Set bulk_filter_keywords to the list of keywords to remove (e.g. [\"720分鐘\"]).\n"
+            "Use sns_bulk_update_schedule when the user wants to change polling schedule on EVERY account matching a TCG domain in bulk.\n"
+            "  Signals: a 'select all accounts in a domain' phrasing (a plural quantifier OR 'domain 有 <X>') "
+            "+ a domain word "
+            "+ a schedule hint (頻率/排程/輪詢/追蹤頻率/polling/schedule/每 N 分鐘) "
+            "+ an integer minute value (5..1440).\n"
+            "  Set bulk_target_domain to one of: tcg, pokemon, yugioh, ws, union_arena.\n"
+            "  Set sns_schedule_minutes to the integer minute value.\n"
             "Use sns_bulk_add_filter when the user wants to update filters on EVERY account matching a TCG domain in bulk "
             "(signals: plural quantifier like '每個/所有/全部', a domain word like 'tcg/pokemon/寶可夢/遊戲王/ws/union arena', "
             "an action like '加上/加入/改成', and a filter/keyword hint word).\n"
@@ -445,6 +470,8 @@ class TelegramNaturalLanguageRouter:
             "- Removing a target/candidate from /hunt status or the opportunity list → opportunity_remove, NOT remove_watch.\n"
             "- If a message asks about price direction (rising / falling / 漲 / 跌 / 在跌 / 在漲 / 暴跌 / 暴漲 / dropping / soaring) and does NOT explicitly request a ranking, top-N, or leaderboard, it is web_research, not trend_board.\n"
             "- A message about adding filter to a SINGLE @handle → sns_add_account. A message about adding filter to EVERY account in a domain (no @handle, plural quantifier present like 每個/所有/全部) → sns_bulk_add_filter.\n"
+            "- A bulk-selecting phrase (每個/所有/全部 OR 'domain 有 <X>') + filter hint + REMOVE verb + a keyword → sns_bulk_remove_filter. NEVER route to sns_bulk_add_filter when a REMOVE verb is present — even if a keyword-like number (e.g. '720分鐘') appears, that's the keyword the user wants OUT, not added.\n"
+            "- A bulk-selecting phrase + schedule hint (頻率/排程/輪詢) + integer minutes → sns_bulk_update_schedule. When BOTH filter-keyword signals AND schedule signals appear in the same message, prefer sns_bulk_update_schedule (schedule requires an integer parameter; '改成 N 分鐘' for a domain is unambiguously schedule).\n"
             "- '拿掉/清除/清空 @X 的 filter/篩選/關鍵字' → sns_clear_filter (clears include_keywords only). '取消追蹤/停止追蹤/刪除追蹤/unfollow @X' → sns_delete (removes the whole rule).\n"
             "- If the message could plausibly match more than one of the listed intents, return confidence below 0.5 instead of picking confidently. Honest uncertainty beats a confident wrong guess.\n"
             f'Game must be one of "{supported_game_hint()}" or null.\n'
@@ -495,6 +522,10 @@ class TelegramNaturalLanguageRouter:
             '- "把每個跟 tcg 相關的 sns 追蹤帳號 filter 都加上「抽選」" -> sns_bulk_add_filter, bulk_target_domain="tcg", bulk_filter_keywords=["抽選"]\n'
             '- "幫所有 pokemon 帳號加上 抽選 filter" -> sns_bulk_add_filter, bulk_target_domain="pokemon", bulk_filter_keywords=["抽選"]\n'
             '- "所有遊戲王帳號的篩選都改成包含 新弾" -> sns_bulk_add_filter, bulk_target_domain="yugioh", bulk_filter_keywords=["新弾"]\n'
+            '- "把 sns 監控規則裡 domain 有 tcg 的帳號 filter 裡的「720分鐘」都移除" -> sns_bulk_remove_filter, bulk_target_domain="tcg", bulk_filter_keywords=["720分鐘"]\n'
+            '- "把所有 pokemon 帳號 filter 裡的 抽選 移除" -> sns_bulk_remove_filter, bulk_target_domain="pokemon", bulk_filter_keywords=["抽選"]\n'
+            '- "把 sns 監控規則裡 domain 有 tcg 的帳號 追蹤頻率都改成每 720 分鐘" -> sns_bulk_update_schedule, bulk_target_domain="tcg", sns_schedule_minutes=720\n'
+            '- "所有 yugioh 帳號排程改成每 60 分鐘" -> sns_bulk_update_schedule, bulk_target_domain="yugioh", sns_schedule_minutes=60\n'
             '- "你會什麼" -> help\n'
             '- "你現在狀態如何" -> status\n'
             '- "列出所有工具" -> tools\n'
@@ -646,9 +677,51 @@ def fallback_route_telegram_natural_language(text: str) -> TelegramNaturalLangua
 
     has_plural = any(kw in content for kw in _BULK_PLURAL_KEYWORDS)
     has_verb = any(kw in content for kw in _BULK_ADD_VERB_KEYWORDS)
+    has_remove_verb = any(kw in content for kw in _BULK_REMOVE_VERB_KEYWORDS)
     has_filter_hint = any(kw in lowered for kw in _BULK_FILTER_HINT_KEYWORDS)
+    has_schedule_hint = _SCHEDULE_RE.search(content) is not None
     target_match = _SNS_BULK_TARGET_RE.search(content)
 
+    # NOTE: the three bulk fallback paths are intentionally conservative —
+    # they only catch the most explicit forms (plural quantifier + bracketed
+    # keyword / explicit minute integer). More natural phrasings like
+    # "domain 有 tcg 的帳號 ... 都 X" are routed by the LLM (see prompt
+    # examples in `_build_prompt`). Keeping fallback narrow avoids brittle
+    # regex+particle-stripping for forms the LLM already handles.
+
+    # 1) sns_bulk_update_schedule — checked first so it wins when both filter and
+    #    schedule signals appear (the integer parameter is the disambiguator).
+    if has_plural and has_schedule_hint and target_match:
+        minutes = _extract_sns_schedule_minutes(content)
+        bulk_target = _normalize_bulk_target_domain(target_match.group("target"))
+        if bulk_target and minutes is not None:
+            return TelegramNaturalLanguageIntent(
+                intent="sns_bulk_update_schedule",
+                bulk_target_domain=bulk_target,
+                sns_schedule_minutes=minutes,
+                confidence=0.9,
+            )
+
+    # 2) sns_bulk_remove_filter — remove verb + filter hint + plural + a
+    #    bracketed keyword (「」/quotes/[]). Runs BEFORE sns_bulk_add_filter
+    #    so a REMOVE verb wins over the ADD path even when both verbs are
+    #    plausible. Unbracketed keywords are LLM-only.
+    if has_plural and has_remove_verb and has_filter_hint and target_match:
+        bracket_match = _SNS_BULK_KEYWORD_BRACKETED_RE.search(content)
+        if bracket_match:
+            bulk_target = _normalize_bulk_target_domain(target_match.group("target"))
+            bulk_keywords = _normalize_keyword_values(
+                _split_keyword_phrase(bracket_match.group(1))
+            )
+            if bulk_target and bulk_keywords:
+                return TelegramNaturalLanguageIntent(
+                    intent="sns_bulk_remove_filter",
+                    bulk_target_domain=bulk_target,
+                    bulk_filter_keywords=bulk_keywords,
+                    confidence=0.9,
+                )
+
+    # 3) sns_bulk_add_filter — existing logic, unchanged.
     if has_plural and has_verb and has_filter_hint and target_match:
         bulk_target = _normalize_bulk_target_domain(target_match.group("target"))
         bulk_keywords: tuple[str, ...] = ()
@@ -952,7 +1025,8 @@ _ALLOWED_INTENTS = frozenset({
     "add_watch", "list_watches", "remove_watch", "update_watch_price",
     "reputation_snapshot", "web_research", "opportunity_remove",
     "sns_add_account", "sns_add_keyword", "sns_list", "sns_delete", "sns_buzz",
-    "sns_bulk_add_filter", "sns_clear_filter",
+    "sns_bulk_add_filter", "sns_bulk_remove_filter", "sns_bulk_update_schedule",
+    "sns_clear_filter",
     "help", "status", "tools", "scan_help", "unknown",
 })
 
