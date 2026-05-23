@@ -3447,6 +3447,58 @@ def handle_telegram_callback_query(
             rerender = True
         else:
             toast = reply[:200]
+    elif prefix == "snsfb" and payload:
+        # Inline-button feedback on a single SNS post (account or keyword watch).
+        # Payload format: "<kind>:<tweet_id>:<rule_id>" where kind ∈ {up,down,bought}.
+        parts = payload.split(":", 2)
+        if len(parts) != 3 or parts[0] not in {"up", "down", "bought"}:
+            toast = "未知回饋"
+        else:
+            kind, tweet_id, rule_id = parts
+            try:
+                from sns_monitor.feedback import record_sns_feedback
+                from sns_monitor.storage import SnsDatabase
+                sns_db_path = (
+                    processor._sns_db.path if processor._sns_db is not None
+                    else None
+                )
+                if sns_db_path is None:
+                    toast = "SNS monitor 未啟用，無法寫入回饋"
+                else:
+                    db = SnsDatabase(sns_db_path)
+                    result = record_sns_feedback(
+                        db=db, tweet_id=tweet_id, rule_id=rule_id,
+                        chat_id=str(chat_id), kind=kind,
+                    )
+            except Exception:
+                logger.exception(
+                    "snsfb feedback failed tweet_id=%s rule_id=%s kind=%s",
+                    tweet_id, rule_id, kind,
+                )
+                toast = "回饋寫入失敗，請看 log"
+            else:
+                if "result" not in locals() or result.get("status") != "ok":
+                    reason = (result.get("reason", "unknown")
+                              if "result" in locals() else "sns_db unavailable")
+                    toast = f"記錄失敗：{reason}"
+                else:
+                    side_effects = list(result.get("side_effects") or ())
+                    if kind == "up":
+                        toast = "✓ 已記錄 👍"
+                    elif kind == "bought":
+                        if "rule_schedule_shortened" in side_effects:
+                            new_minutes = result.get("new_schedule_minutes")
+                            toast = f"✓ 已記錄 💰（rule 加速檢查 → {new_minutes} 分鐘）"
+                        else:
+                            toast = "✓ 已記錄 💰（schedule 已達 floor）"
+                    else:  # down
+                        if "rule_disabled" in side_effects:
+                            toast = "✓ 已標記不感興趣（累計過閾值，rule 自動停用）"
+                        else:
+                            toast = "✓ 已標記不感興趣（24h cooldown）"
+                    new_text = f"{original_text}\n\n{toast}"
+                    new_reply_markup = None
+                    rerender = True
     elif prefix == "oppfb" and payload:
         # Inline-button feedback on an Opportunity recommendation.
         # Payload format: "<kind>:<recommendation_id>" where kind ∈ {up,down,bought}.

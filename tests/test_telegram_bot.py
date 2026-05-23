@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 from market_monitor.models import FairValueEstimate, MarketOffer, TrackedItem
 from tcg_tracker.catalog import TcgCardSpec
 from tcg_tracker.hot_cards import HotCardBoard, HotCardEntry, HotCardReference
@@ -1599,6 +1601,142 @@ def test_callback_query_snsdel_deletes_rule_and_edits_message() -> None:
     assert edited["reply_markup"] is None  # keyboard cleared
     assert len(client.answered_callbacks) == 1
     assert "已刪除" in client.answered_callbacks[0]["text"]
+
+
+def _setup_snsfb_processor(tmp_path):
+    """Build a processor whose _sns_db is a real SnsDatabase pointing at a
+    tmp file, seeded with one AccountWatch rule. Returns (processor, db, rule_id).
+
+    The sns_monitor package is only available in aka_no_claw's combined venv
+    (where the whole stack runs). When running price_monitor_bot's own venv
+    standalone the import fails — skip the test in that case rather than
+    fail."""
+    sns_monitor = pytest.importorskip("sns_monitor")
+    from sns_monitor.models import AccountWatch
+    from sns_monitor.storage import SnsDatabase
+    db = SnsDatabase(tmp_path / "snsfb_test.sqlite3")
+    db.bootstrap()
+    rule = AccountWatch(
+        rule_id="r1234567890",
+        screen_name="snsuser",
+        user_id=None,
+        label="snsuser",
+        include_keywords=(),
+        domains=(),
+        enabled=True,
+        schedule_minutes=60,
+        chat_id="123",
+    )
+    db.save_watch_rule(rule)
+    proc = TelegramCommandProcessor(
+        allowed_chat_ids=frozenset({"123"}),
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        sns_db=db,
+    )
+    return proc, db, rule.rule_id
+
+
+def test_callback_query_snsfb_up_writes_db_and_clears_keyboard(tmp_path) -> None:
+    import sqlite3
+    processor, db, rule_id = _setup_snsfb_processor(tmp_path)
+    client = FakeTelegramClient()
+
+    handle_telegram_callback_query(
+        client=client,
+        processor=processor,
+        callback_query={
+            "id": "cbq-snsfb-up",
+            "data": f"snsfb:up:tw-111:{rule_id}",
+            "message": {
+                "message_id": 5,
+                "chat": {"id": "123"},
+                "text": "🐦 X 帳號通知 — @snsuser",
+            },
+        },
+    )
+
+    assert client.answered_callbacks[0]["text"] == "✓ 已記錄 👍"
+    edited = client.edited_messages[0]
+    assert "✓ 已記錄 👍" in edited["text"]
+    assert edited["reply_markup"] is None  # keyboard cleared
+    # Feedback row persisted
+    with sqlite3.connect(db.path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM sns_post_feedback WHERE tweet_id = ?", ("tw-111",)
+        ).fetchone()
+    assert row is not None and row["feedback_kind"] == "up"
+
+
+def test_callback_query_snsfb_down_shows_cooldown_toast(tmp_path) -> None:
+    processor, db, rule_id = _setup_snsfb_processor(tmp_path)
+    client = FakeTelegramClient()
+
+    handle_telegram_callback_query(
+        client=client,
+        processor=processor,
+        callback_query={
+            "id": "cbq-snsfb-down",
+            "data": f"snsfb:down:tw-222:{rule_id}",
+            "message": {
+                "message_id": 5,
+                "chat": {"id": "123"},
+                "text": "🐦 X 帳號通知 — @snsuser",
+            },
+        },
+    )
+
+    assert "24h cooldown" in client.answered_callbacks[0]["text"]
+    refreshed = db.get_watch_rule(rule_id)
+    assert refreshed.cooldown_until is not None
+    assert refreshed.enabled is True  # not yet disabled
+
+
+def test_callback_query_snsfb_bought_shortens_schedule(tmp_path) -> None:
+    processor, db, rule_id = _setup_snsfb_processor(tmp_path)
+    client = FakeTelegramClient()
+
+    handle_telegram_callback_query(
+        client=client,
+        processor=processor,
+        callback_query={
+            "id": "cbq-snsfb-bought",
+            "data": f"snsfb:bought:tw-333:{rule_id}",
+            "message": {
+                "message_id": 5,
+                "chat": {"id": "123"},
+                "text": "🐦 X 帳號通知 — @snsuser",
+            },
+        },
+    )
+
+    toast = client.answered_callbacks[0]["text"]
+    assert "💰" in toast
+    assert "加速檢查" in toast
+    # 60 → 30
+    assert db.get_watch_rule(rule_id).schedule_minutes == 30
+
+
+def test_callback_query_snsfb_invalid_kind_rejected(tmp_path) -> None:
+    processor, _db, rule_id = _setup_snsfb_processor(tmp_path)
+    client = FakeTelegramClient()
+
+    handle_telegram_callback_query(
+        client=client,
+        processor=processor,
+        callback_query={
+            "id": "cbq-snsfb-bad",
+            "data": f"snsfb:nope:tw-444:{rule_id}",
+            "message": {
+                "message_id": 5,
+                "chat": {"id": "123"},
+                "text": "🐦 X 帳號通知 — @snsuser",
+            },
+        },
+    )
+    assert client.answered_callbacks[0]["text"] == "未知回饋"
 
 
 def test_callback_query_snsdel_idempotent_when_rule_already_gone() -> None:
