@@ -23,7 +23,11 @@ from hashlib import sha1
 
 from market_monitor.http import HttpClient
 from market_monitor.mercari_search import MERCARI_CONDITION_LABELS
-from market_monitor.storage import MercariWatch, MonitorDatabase
+from market_monitor.storage import (
+    MarketplaceWatch,
+    MonitorDatabase,
+    build_marketplace_watch_id,
+)
 from tcg_tracker.catalog import normalize_game_key, supported_game_hint
 from tcg_tracker.hot_cards import HotCardBoard, TcgHotCardService
 from tcg_tracker.image_lookup import (
@@ -70,6 +74,60 @@ WEB_RESEARCH_COMMANDS = {"/search", "/research", "/web"}
 WATCH_COMMANDS = {"/watch"}
 WATCHLIST_COMMANDS = {"/watchlist", "/watches"}
 UNWATCH_COMMANDS = {"/unwatch", "/stopwatch"}
+
+# Display name + emoji per marketplace source (kept here so the UI layer
+# doesn't need to import from market_monitor). Adding a new source = one line.
+_MARKETPLACE_SOURCE_DISPLAY: dict[str, tuple[str, str]] = {
+    "mercari": ("Mercari", "🛒"),
+    "rakuma": ("Rakuma", "🟣"),
+}
+
+# The default set of markets a new /watch covers when the user doesn't pin
+# the subset. Future markets get added here so existing users automatically
+# pick them up.
+DEFAULT_MARKETS: tuple[str, ...] = ("mercari", "rakuma")
+# Aliases users may type for each canonical market id.
+_MARKET_ALIASES: dict[str, str] = {
+    "mercari": "mercari", "メルカリ": "mercari",
+    "rakuma": "rakuma", "ラクマ": "rakuma", "フリル": "rakuma", "fril": "rakuma",
+}
+
+
+def _marketplace_source_display(source: str) -> tuple[str, str]:
+    return _MARKETPLACE_SOURCE_DISPLAY.get(source, (source.capitalize(), "📦"))
+
+
+def _condition_ids_from_options(source_options: dict[str, object]) -> tuple[int, ...]:
+    """Extract Mercari condition_ids from a per-market options dict."""
+    raw = source_options.get("condition_ids") if source_options else None
+    if isinstance(raw, (list, tuple)):
+        out: list[int] = []
+        for value in raw:
+            try:
+                out.append(int(value))
+            except (TypeError, ValueError):
+                continue
+        if out:
+            return tuple(out)
+    return (1, 2, 3)
+
+
+def _normalize_markets(values: object) -> tuple[str, ...]:
+    """Canonicalise a list/tuple of market names. Unknown names are dropped;
+    duplicates collapsed; order preserved. Empty input returns ()."""
+    if not isinstance(values, (list, tuple)):
+        return ()
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        if not isinstance(raw, str):
+            continue
+        normal = _MARKET_ALIASES.get(raw.strip().lower())
+        if normal is None or normal in seen:
+            continue
+        seen.add(normal)
+        out.append(normal)
+    return tuple(out)
 SET_PRICE_COMMANDS = {"/setprice", "/updatewatch"}
 SNS_ADD_COMMANDS = {"/snsadd", "/sns_add"}
 SNS_LIST_COMMANDS = {"/snslist", "/sns_list"}
@@ -1132,32 +1190,71 @@ class TelegramCommandProcessor:
             logger.exception("Telegram web research failed query=%s", trim_for_log(query, limit=240))
             return f"網路搜尋摘要失敗：{exc}"
 
-    def _handle_watch(self, raw: str, chat_id: str) -> str:
+    def _handle_watch(
+        self, raw: str, chat_id: str, *, markets: tuple[str, ...] | None = None,
+    ) -> str:
         if self._watch_db is None:
             return "追蹤功能尚未啟用（watch_db 未設定）。"
         try:
-            query, threshold = parse_watch_command(raw)
+            query, threshold, parsed_markets = parse_watch_command(raw)
         except ValueError as exc:
-            return f"{exc}\n格式範例：/watch 想いが重なる場所で 初音ミク SSP on 300000"
-        watch_id = sha1(f"{chat_id}|{query}".encode()).hexdigest()[:16]
-        watch = MercariWatch(
+            return (
+                f"{exc}\n"
+                f"格式範例：/watch 想いが重なる場所で 初音ミク SSP on 300000\n"
+                f"指定平台：/watch アビスアイ box on 8000 markets:rakuma\n"
+                f"指定多平台：/watch ピカチュウ on 5000 markets:mercari,rakuma"
+            )
+        # Resolution order: NL-provided markets → command suffix → DEFAULT_MARKETS.
+        chosen = markets or parsed_markets or DEFAULT_MARKETS
+        chosen = _normalize_markets(chosen) or DEFAULT_MARKETS
+        return self._add_marketplace_watch_row(
+            chat_id=chat_id, query=query, threshold=threshold, markets=chosen,
+        )
+
+    def _add_marketplace_watch_row(
+        self,
+        *,
+        chat_id: str,
+        query: str,
+        threshold: int,
+        markets: tuple[str, ...],
+    ) -> str:
+        watch_id = build_marketplace_watch_id(chat_id=chat_id, query=query)
+        market_options: dict[str, dict[str, object]] = {}
+        for market in markets:
+            if market == "mercari":
+                market_options[market] = {"condition_ids": [1, 2, 3]}
+            else:
+                market_options[market] = {}
+        watch = MarketplaceWatch(
             watch_id=watch_id,
             query=query,
             price_threshold_jpy=threshold,
+            markets=markets,
             enabled=True,
             chat_id=chat_id,
             last_checked_at=None,
             created_at="",
             updated_at="",
+            market_options=market_options,
         )
-        self._watch_db.add_mercari_watch(watch)
-        logger.info("Watch added watch_id=%s query=%s threshold=%d chat_id=%s", watch_id, query, threshold, chat_id)
+        if self._watch_db is not None:
+            self._watch_db.add_marketplace_watch(watch)
+        logger.info(
+            "Watch added watch_id=%s query=%s threshold=%d markets=%s chat_id=%s",
+            watch_id, query, threshold, list(markets), chat_id,
+        )
+        market_chips = ", ".join(
+            f"{_marketplace_source_display(m)[1]} {_marketplace_source_display(m)[0]}"
+            for m in markets
+        )
         return (
-            f"已新增追蹤\n"
+            f"✅ 已新增追蹤\n"
             f"ID: {watch_id}\n"
             f"關鍵字：{query}\n"
             f"價格上限：¥{threshold:,}\n"
-            f"將每分鐘在 Mercari 搜尋，發現新商品時通知你。"
+            f"監控平台：{market_chips}\n"
+            f"將每分鐘在以上平台搜尋，發現新商品時通知你。"
         )
 
     def _handle_watchlist(self) -> str:
@@ -1167,32 +1264,45 @@ class TelegramCommandProcessor:
     def render_watchlist_view(
         self, *, page: int = 0, mode: str = LIST_VIEW_MODE_READ
     ) -> tuple[str, dict[str, object] | None, int]:
-        """Render the paginated Mercari watch view. Returns (text, reply_markup, page)."""
+        """Render the paginated multi-source marketplace watch view.
+        Returns (text, reply_markup, page)."""
         if self._watch_db is None:
             return "追蹤功能尚未啟用（watch_db 未設定）。", None, 0
-        watches = list(self._watch_db.list_mercari_watchlist())
+        watches = list(self._watch_db.list_marketplace_watchlist())
         watches.sort(key=lambda w: (not w.enabled, w.watch_id))
 
         items: list[_ListRow] = []
         for w in watches:
             status = "✓ 啟用" if w.enabled else "✗ 停用"
             checked = _format_local_time(w.last_checked_at) if w.last_checked_at else "尚未檢查"
-            condition_summary = _summarize_condition_ids_short(w.condition_ids)
+            market_chips = " ".join(
+                f"{_marketplace_source_display(m)[1]}{_marketplace_source_display(m)[0]}"
+                for m in w.markets
+            ) or "(無)"
+            extra_lines: list[str] = []
+            extra_buttons = ()
+            if "mercari" in w.markets:
+                # Condition picker is Mercari-only — surface its current state
+                # and the picker button.
+                condition_ids = _condition_ids_from_options(w.options_for("mercari"))
+                extra_lines.append(f"  Mercari 狀態：{_summarize_condition_ids_short(condition_ids)}")
+                extra_buttons = (
+                    {"text": "🎛 Mercari 狀態", "callback_data": f"cond:{w.watch_id}:open"},
+                )
             text_block = (
-                f"[{w.watch_id}] {status}\n"
+                f"[{w.watch_id[:12]}] {status}\n"
                 f"  關鍵字：{w.query}\n"
                 f"  上限：¥{w.price_threshold_jpy:,}\n"
-                f"  狀態：{condition_summary}\n"
-                f"  最後檢查：{checked}"
+                f"  平台：{market_chips}\n"
+                + ("\n".join(extra_lines) + "\n" if extra_lines else "")
+                + f"  最後檢查：{checked}"
             )
             short = f"[{w.watch_id[:8]}] {w.query[:18]}"
             items.append(_ListRow(
                 id=w.watch_id,
                 text=text_block,
                 short_label=short,
-                extra_buttons=(
-                    {"text": "🎛 設定狀態", "callback_data": f"cond:{w.watch_id}:open"},
-                ),
+                extra_buttons=extra_buttons,
             ))
 
         return _build_list_view(
@@ -1200,17 +1310,27 @@ class TelegramCommandProcessor:
             items=items,
             page=page,
             mode=mode,
-            list_title="📋 Mercari 追蹤",
-            empty_message="目前沒有任何追蹤項目。\n使用 /watch 關鍵字 on 價格 來新增。",
+            list_title="📋 Marketplace 追蹤（多站）",
+            empty_message=(
+                "目前沒有任何追蹤項目。\n"
+                "使用 /watch 關鍵字 on 價格 新增追蹤（預設監控 Mercari + Rakuma）。\n"
+                "指定平台：/watch 關鍵字 on 價格 markets:rakuma"
+            ),
         )
 
     def delete_mercari_watch_by_id(self, watch_id: str) -> bool:
+        """Backward-compat alias — the row deleter map still calls this name.
+        Internally delegates to ``delete_marketplace_watch`` so it works for
+        any source (Mercari / Rakuma / future)."""
+        return self.delete_marketplace_watch_by_id(watch_id)
+
+    def delete_marketplace_watch_by_id(self, watch_id: str) -> bool:
         if self._watch_db is None:
             return False
         try:
-            return bool(self._watch_db.delete_mercari_watch(watch_id))
+            return bool(self._watch_db.delete_marketplace_watch(watch_id))
         except Exception:
-            logger.exception("Mercari watch delete failed watch_id=%s", watch_id)
+            logger.exception("Marketplace watch delete failed watch_id=%s", watch_id)
             return False
 
     def _handle_unwatch(self, raw: str) -> str:
@@ -1219,7 +1339,7 @@ class TelegramCommandProcessor:
         watch_id = raw.strip()
         if not watch_id:
             return "請提供追蹤 ID。格式：/unwatch <ID>\n可用 /watchlist 查看所有 ID。"
-        deleted = self._watch_db.delete_mercari_watch(watch_id)
+        deleted = self._watch_db.delete_marketplace_watch(watch_id)
         if deleted:
             logger.info("Watch deleted watch_id=%s", watch_id)
             return f"已移除追蹤 [{watch_id}]"
@@ -1232,11 +1352,11 @@ class TelegramCommandProcessor:
             watch_id, new_price = parse_set_price_command(raw)
         except ValueError as exc:
             return f"{exc}\n格式範例：/setprice abc12345 50000"
-        watch = self._watch_db.get_mercari_watch(watch_id)
+        watch = self._watch_db.get_marketplace_watch(watch_id)
         if watch is None:
             return f"找不到追蹤 ID [{watch_id}]，請用 /watchlist 確認。"
         old_price = watch.price_threshold_jpy
-        self._watch_db.update_mercari_watch(watch_id, price_threshold_jpy=new_price)
+        self._watch_db.update_marketplace_watch(watch_id, price_threshold_jpy=new_price)
         logger.info("Watch price updated watch_id=%s old=%d new=%d", watch_id, old_price, new_price)
         return (
             f"已更新追蹤目標價\n"
@@ -1489,14 +1609,18 @@ class TelegramCommandProcessor:
                 )
             q = intent.watch_query
             p = intent.watch_price_threshold
+            markets = _normalize_markets(intent.watch_markets) or DEFAULT_MARKETS
+            market_chips = ", ".join(_marketplace_source_display(m)[0] for m in markets)
             logger.info(
-                "Telegram natural-language routed intent=add_watch watch_query=%s watch_price_threshold=%d confidence=%s",
-                q, p, intent.confidence,
+                "Telegram natural-language routed intent=add_watch markets=%s watch_query=%s watch_price_threshold=%d confidence=%s",
+                list(markets), q, p, intent.confidence,
             )
             return TelegramTextReplyPlan(
-                ack=f"已理解查詢內容，相當於 /watch {q} on {p}，開始設定。",
+                ack=f"已理解，相當於 /watch {q} on {p}（平台：{market_chips}），開始設定。",
                 reply=None,
-                reply_factory=lambda q=q, p=p, cid=chat_id: self._handle_watch(f"{q} on {p}", str(cid)),
+                reply_factory=lambda q=q, p=p, mk=markets, cid=chat_id: self._handle_watch(
+                    f"{q} on {p}", str(cid), markets=mk,
+                ),
             )
         if intent.intent == "list_watches":
             logger.info("Telegram natural-language routed intent=list_watches confidence=%s", intent.confidence)
@@ -2434,18 +2558,35 @@ def _format_local_time(ts: str) -> str:
         return ts[:16].replace("T", " ")
 
 
-def parse_watch_command(raw: str) -> tuple[str, int]:
-    """Parse '/watch <query> on <price>' → (query, price_threshold_jpy).
+_MARKETS_SUFFIX_RE = re.compile(
+    r"\bmarkets?\s*[:=]\s*([A-Za-z_,\s、，ーぁ-んァ-ヶー一-龥]+)\s*$",
+    re.IGNORECASE,
+)
 
-    Accepts both bracket notation from the docs:
-      /watch [商品名] on [300000]
-    and plain:
-      /watch 商品名 on 300000
+
+def parse_watch_command(raw: str) -> tuple[str, int, tuple[str, ...] | None]:
+    """Parse '/watch <query> on <price> [markets:<m1>,<m2>]' →
+    (query, price_threshold_jpy, markets_or_None).
+
+    ``markets`` is a tuple of canonical market names (or None if the user
+    didn't specify any — caller applies the default). The suffix must come
+    AFTER the price clause:
+
+      /watch 想いが重なる場所で on 300000
+      /watch アビスアイ box on 8000 markets:rakuma
+      /watch ピカチュウ on 5000 markets:mercari,rakuma
     """
     body = raw.strip().strip("[]")
-    # Remove surrounding brackets from whole body if present
+    markets: tuple[str, ...] | None = None
+    markets_match = _MARKETS_SUFFIX_RE.search(body)
+    if markets_match is not None:
+        market_tokens = re.split(r"[,\s、，]+", markets_match.group(1).strip())
+        normalized = _normalize_markets(market_tokens)
+        if normalized:
+            markets = normalized
+        body = body[: markets_match.start()].rstrip()
+
     lower = body.lower()
-    # Find last occurrence of " on " to split
     sep = " on "
     idx = lower.rfind(sep)
     if idx == -1:
@@ -2460,7 +2601,7 @@ def parse_watch_command(raw: str) -> tuple[str, int]:
         raise ValueError(f"價格格式錯誤：'{price_part}'，請填入整數日幣金額。")
     if threshold <= 0:
         raise ValueError("價格上限必須大於 0。")
-    return query_part, threshold
+    return query_part, threshold, markets
 
 
 def parse_set_price_command(raw: str) -> tuple[str, int]:
@@ -3066,13 +3207,19 @@ def _handle_condition_callback(
     watch_db = getattr(processor, "_watch_db", None)
     if watch_db is None or not watch_id:
         return "追蹤功能未啟用", None, None
-    watch = watch_db.get_mercari_watch(watch_id)
+    watch = watch_db.get_marketplace_watch(watch_id)
     if watch is None:
         return "找不到該追蹤", None, None
+    if "mercari" not in watch.markets:
+        # Condition picker only applies to Mercari (the only marketplace with
+        # a condition enum). Rakuma/etc. watches surface no button.
+        return "此追蹤未含 Mercari 平台，無狀態條件可設", None, None
+
+    current_condition_ids = _condition_ids_from_options(watch.options_for("mercari"))
 
     if action == "open":
         text, kb = _build_condition_picker_view(
-            watch_id=watch_id, query=watch.query, condition_ids=watch.condition_ids
+            watch_id=watch_id, query=watch.query, condition_ids=current_condition_ids,
         )
         return None, text, kb
 
@@ -3086,27 +3233,33 @@ def _handle_condition_callback(
         cid = int(extra)
         if cid not in MERCARI_CONDITION_LABELS:
             return "未知狀態", None, None
-        current = set(watch.condition_ids)
+        current = set(current_condition_ids)
         if cid in current:
             if len(current) == 1:
-                # Re-render the picker with the same state — visual feedback
-                # only.
+                # Re-render the picker with the same state — visual feedback only.
                 text, kb = _build_condition_picker_view(
-                    watch_id=watch_id,
-                    query=watch.query,
-                    condition_ids=watch.condition_ids,
+                    watch_id=watch_id, query=watch.query, condition_ids=current_condition_ids,
                 )
                 return "至少要保留一個狀態", text, kb
             current.remove(cid)
         else:
             current.add(cid)
         new_ids = tuple(sorted(current))
-        watch_db.update_mercari_watch(watch_id, condition_ids=new_ids)
+        merged_options = {
+            market: dict(opts) for market, opts in watch.market_options.items()
+        }
+        mercari_opts = dict(merged_options.get("mercari") or {})
+        mercari_opts["condition_ids"] = list(new_ids)
+        merged_options["mercari"] = mercari_opts
+        watch_db.update_marketplace_watch(watch_id, market_options=merged_options)
         # Re-fetch (defensive) and re-render picker with the new state.
-        watch = watch_db.get_mercari_watch(watch_id)
-        condition_ids = watch.condition_ids if watch is not None else new_ids
+        watch = watch_db.get_marketplace_watch(watch_id)
+        next_condition_ids = (
+            _condition_ids_from_options(watch.options_for("mercari"))
+            if watch is not None else new_ids
+        )
         text, kb = _build_condition_picker_view(
-            watch_id=watch_id, query=(watch.query if watch else ""), condition_ids=condition_ids
+            watch_id=watch_id, query=(watch.query if watch else ""), condition_ids=next_condition_ids,
         )
         return None, text, kb
 
@@ -3220,7 +3373,7 @@ def _list_item_deleter(processor: TelegramCommandProcessor, list_kind: str):
     if list_kind == "sl":
         return processor.delete_sns_rule_by_id, "SNS 規則"
     if list_kind == "wl":
-        return processor.delete_mercari_watch_by_id, "Mercari 追蹤"
+        return processor.delete_marketplace_watch_by_id, "Marketplace 追蹤"
     if list_kind == "hl":
         return processor.delete_huntlist_item_by_id, "Opportunity 候選"
     return None, None

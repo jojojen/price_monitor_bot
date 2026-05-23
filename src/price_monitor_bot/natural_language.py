@@ -33,6 +33,16 @@ _ROUTER_JSON_SCHEMA = {
         "watch_query": {"type": ["string", "null"]},
         "watch_price_threshold": {"type": ["integer", "null"]},
         "watch_id": {"type": ["string", "null"]},
+        # Marketplaces to target for add_watch. Tuple/list of canonical market
+        # ids (e.g. ["mercari", "rakuma"]). None means "use the caller's default
+        # (currently all configured markets)".
+        "watch_markets": {
+            "anyOf": [
+                {"type": "array", "items": {"type": "string"}},
+                {"type": "string"},
+                {"type": "null"},
+            ]
+        },
         # reputation snapshot field
         "query_url": {"type": ["string", "null"]},
         # web research field
@@ -64,7 +74,7 @@ _ROUTER_JSON_SCHEMA = {
     },
     "required": [
         "intent", "game", "name", "card_number", "rarity", "set_code", "limit", "confidence",
-        "watch_query", "watch_price_threshold", "watch_id", "query_url", "research_query", "opportunity_target",
+        "watch_query", "watch_price_threshold", "watch_id", "watch_markets", "query_url", "research_query", "opportunity_target",
         "sns_handle", "sns_keyword", "sns_buzz_query", "sns_include_keywords", "sns_schedule_minutes",
         "bulk_target_domain", "bulk_filter_keywords",
     ],
@@ -342,6 +352,10 @@ class TelegramNaturalLanguageIntent:
     watch_query: str | None = None
     watch_price_threshold: int | None = None
     watch_id: str | None = None
+    # Marketplaces this watch should target. Tuple of canonical market ids
+    # (e.g. ("mercari", "rakuma")). Empty tuple means "use the caller's
+    # default set of configured markets".
+    watch_markets: tuple[str, ...] = ()
     # reputation snapshot field
     query_url: str | None = None
     # web research field
@@ -410,8 +424,10 @@ class TelegramNaturalLanguageRouter:
             + tool_spec_block +
             "Use lookup_card when the user wants the price, value, or card lookup of one specific card.\n"
             "Use trend_board ONLY when the user explicitly asks for a leaderboard / ranking / top-N list of currently hot cards. trend_board returns a static ranking; it does NOT analyse price direction or market sentiment.\n"
-            "Use add_watch when the user wants to track/monitor a MERCARI product and be notified below a price threshold.\n"
+            "Use add_watch when the user wants to track/monitor a MARKETPLACE listing and be notified below a price threshold.\n"
             "  Set watch_query to the product name/keywords, watch_price_threshold to the integer JPY limit.\n"
+            "  Set watch_markets to the list of marketplaces to monitor. Use 'mercari' for メルカリ / Mercari and 'rakuma' for ラクマ / フリル / fril / Rakuma.\n"
+            "  If the user names specific platforms, include only those. If they don't name any platform (just '追蹤'/'監控'/'watch'), set watch_markets to null so the caller applies the default set (currently both Mercari and Rakuma).\n"
             "Use list_watches when the user wants to see the MERCARI watchlist / tracked items (no @ handle, no SNS context).\n"
             "Use remove_watch when the user wants to stop tracking a MERCARI watch by hex ID (e.g. abc12345). Set watch_id.\n"
             "Use update_watch_price when the user wants to change the price threshold of an existing Mercari watch. Set watch_id and watch_price_threshold.\n"
@@ -492,6 +508,10 @@ class TelegramNaturalLanguageRouter:
             '- "查 Union Arena UAPR/EVA-1-71 綾波レイ" -> lookup_card, name="綾波レイ", card_number="UAPR/EVA-1-71"\n'
             '- "pokemon 熱門前5" -> trend_board\n'
             '- "追蹤 初音ミク SSP 5万以下" -> add_watch, watch_query="初音ミク SSP", watch_price_threshold=50000\n'
+            '- "在 rakuma 監控 アビスアイ box ≤ 8000" -> add_watch, watch_query="アビスアイ box", watch_price_threshold=8000, watch_markets=["rakuma"]\n'
+            '- "ラクマ 追蹤 ピカチュウex SAR 10000 以下" -> add_watch, watch_query="ピカチュウex SAR", watch_price_threshold=10000, watch_markets=["rakuma"]\n'
+            '- "綾波レイ ユニオンアリーナ プロモカード 4500以下 mercari + rakuma 都看" -> add_watch, watch_query="綾波レイ ユニオンアリーナ プロモカード", watch_price_threshold=4500, watch_markets=["mercari", "rakuma"]\n'
+            '- "追蹤 ピカチュウ ex 5萬以下"（未指定平台） -> add_watch, watch_query="ピカチュウ ex", watch_price_threshold=50000, watch_markets=null\n'
             '- "看我的追蹤清單" -> list_watches\n'
             '- "取消追蹤 abc12345" -> remove_watch, watch_id="abc12345"\n'
             '- "把 abc12345 改成 4萬" -> update_watch_price, watch_id="abc12345", watch_price_threshold=40000\n'
@@ -873,14 +893,28 @@ def fallback_route_telegram_natural_language(text: str) -> TelegramNaturalLangua
         return TelegramNaturalLanguageIntent(intent="list_watches", confidence=0.75)
 
     # add_watch: "追蹤 初音ミク SSP 5萬以下" / "提醒我 xxx 低於 50000"
+    # Detect explicit market mentions; otherwise leave watch_markets empty so
+    # the bot.py caller applies its default set. The LLM router handles
+    # richer phrasings (multi-market, "both", etc.) via prompt examples.
     if any(kw in lowered for kw in _WATCH_ADD_KEYWORDS):
         threshold = _parse_price_threshold(content)
         query = _extract_watch_query(content)
         if query or threshold:
+            has_rakuma = any(kw in lowered for kw in ("rakuma", "ラクマ", "フリル", "fril"))
+            has_mercari = any(kw in lowered for kw in ("mercari", "メルカリ"))
+            if has_rakuma and has_mercari:
+                watch_markets: tuple[str, ...] = ("mercari", "rakuma")
+            elif has_rakuma:
+                watch_markets = ("rakuma",)
+            elif has_mercari:
+                watch_markets = ("mercari",)
+            else:
+                watch_markets = ()
             return TelegramNaturalLanguageIntent(
                 intent="add_watch",
                 watch_query=query,
                 watch_price_threshold=threshold,
+                watch_markets=watch_markets,
                 confidence=0.55 if (query and threshold) else 0.35,
             )
 
@@ -1046,6 +1080,7 @@ def _normalize_intent(payload: dict[str, object]) -> TelegramNaturalLanguageInte
     watch_query = _normalize_text_field(payload.get("watch_query"))
     watch_price_threshold = _normalize_price_threshold(payload.get("watch_price_threshold"))
     watch_id = _normalize_text_field(payload.get("watch_id"))
+    watch_markets = _normalize_watch_markets(payload.get("watch_markets"))
     query_url = _normalize_text_field(payload.get("query_url"))
     research_query = _normalize_text_field(payload.get("research_query"))
     opportunity_target = _normalize_text_field(payload.get("opportunity_target"))
@@ -1077,6 +1112,7 @@ def _normalize_intent(payload: dict[str, object]) -> TelegramNaturalLanguageInte
         watch_query=watch_query,
         watch_price_threshold=watch_price_threshold,
         watch_id=watch_id,
+        watch_markets=watch_markets,
         query_url=query_url,
         research_query=research_query,
         opportunity_target=opportunity_target,
@@ -1097,6 +1133,41 @@ _BULK_DOMAIN_ALIASES = {
     "ws": "ws", "weiss schwarz": "ws", "weiss": "ws", "ヴァイス": "ws",
     "union_arena": "union_arena", "union arena": "union_arena", "ua": "union_arena", "ユニオンアリーナ": "union_arena",
 }
+
+
+_MARKETPLACE_SOURCE_ALIASES: dict[str, str] = {
+    "mercari": "mercari",
+    "メルカリ": "mercari",
+    "rakuma": "rakuma",
+    "ラクマ": "rakuma",
+    "フリル": "rakuma",
+    "fril": "rakuma",
+}
+
+
+def _normalize_watch_markets(value: object) -> tuple[str, ...]:
+    """Normalise ``watch_markets`` to a tuple of known marketplace keys.
+
+    Accepts an array of strings (LLM-friendly), a single string (split on
+    comma / spaces / 、/ ，), or None. Unknown names are dropped; duplicates
+    collapsed; order preserved. Empty result means "use caller default"."""
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        tokens = re.split(r"[,\s、，]+", value.strip())
+    elif isinstance(value, (list, tuple)):
+        tokens = [str(v) for v in value if isinstance(v, (str, int))]
+    else:
+        return ()
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in tokens:
+        normal = _MARKETPLACE_SOURCE_ALIASES.get(raw.strip().lower())
+        if normal is None or normal in seen:
+            continue
+        seen.add(normal)
+        out.append(normal)
+    return tuple(out)
 
 
 def _normalize_bulk_target_domain(value: object) -> str | None:

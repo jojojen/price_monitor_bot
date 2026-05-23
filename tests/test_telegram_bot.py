@@ -1844,8 +1844,22 @@ def test_snslist_view_empty_shows_friendly_text_and_no_keyboard() -> None:
 # ── Paginated /watchlist view ─────────────────────────────────────────────────
 
 class _FakeMercariWatch:
-    def __init__(self, watch_id: str, query: str, *, price: int = 5000, enabled: bool = True, condition_ids: tuple[int, ...] = (1, 2, 3)) -> None:
+    """Lightweight stand-in for MarketplaceWatch (v2 markets-array shape).
+    Attribute name kept for legacy tests; new tests should construct a real
+    MarketplaceWatch directly."""
+
+    def __init__(
+        self,
+        watch_id: str,
+        query: str,
+        *,
+        price: int = 5000,
+        enabled: bool = True,
+        condition_ids: tuple[int, ...] = (1, 2, 3),
+        markets: tuple[str, ...] = ("mercari",),
+    ) -> None:
         self.watch_id = watch_id
+        self.markets = markets
         self.query = query
         self.price_threshold_jpy = price
         self.enabled = enabled
@@ -1853,7 +1867,14 @@ class _FakeMercariWatch:
         self.last_checked_at = None
         self.created_at = "2026-01-01"
         self.updated_at = "2026-01-01"
-        self.condition_ids = condition_ids
+        self.market_options: dict[str, dict] = {}
+        for m in markets:
+            self.market_options[m] = (
+                {"condition_ids": list(condition_ids)} if m == "mercari" else {}
+            )
+
+    def options_for(self, market: str) -> dict:
+        return dict(self.market_options.get(market) or {})
 
 
 class _FakeWatchDatabase:
@@ -1861,10 +1882,12 @@ class _FakeWatchDatabase:
         self._watches = list(watches)
         self.deleted: list[str] = []
 
-    def list_mercari_watchlist(self):
-        return list(self._watches)
+    def list_marketplace_watchlist(self, *, market: str | None = None):
+        if market is None:
+            return list(self._watches)
+        return [w for w in self._watches if market in w.markets]
 
-    def delete_mercari_watch(self, watch_id: str) -> bool:
+    def delete_marketplace_watch(self, watch_id: str) -> bool:
         for idx, w in enumerate(self._watches):
             if w.watch_id == watch_id:
                 self._watches.pop(idx)
@@ -1890,7 +1913,7 @@ def test_watchlist_view_renders_with_per_item_delete_in_edit_mode() -> None:
     processor, _ = _make_watchlist_processor(["pikachu", "charizard", "umbreon"])
 
     text_read, kb_read, _ = processor.render_watchlist_view()
-    assert "📋 Mercari 追蹤" in text_read
+    assert "Marketplace 追蹤" in text_read
     assert "共 3 筆" in text_read
     # Read mode: 1 nav row only
     assert len(kb_read["inline_keyboard"]) == 1
@@ -1915,7 +1938,7 @@ def test_callback_query_del_wl_removes_watch_and_rerenders() -> None:
             "message": {
                 "message_id": 11,
                 "chat": {"id": "123"},
-                "text": "📋 Mercari 追蹤  第 1/2 頁（共 8 筆）\n…",
+                "text": "📋 Marketplace 追蹤  第 1/2 頁（共 8 筆）\n…",
             },
         },
     )
@@ -1950,21 +1973,25 @@ def _setup_watchlist_callback(client_cls=FakeTelegramClient):
             self._w = _FakeMercariWatch("wid0000", "alpha")
             self.update_calls: list[dict] = []
 
-        def list_mercari_watchlist(self):
-            return [self._w]
+        def list_marketplace_watchlist(self, *, market: str | None = None):
+            if market is None or market in self._w.markets:
+                return [self._w]
+            return []
 
-        def get_mercari_watch(self, watch_id):
+        def get_marketplace_watch(self, watch_id):
             return self._w if watch_id == self._w.watch_id else None
 
-        def delete_mercari_watch(self, watch_id):
+        def delete_marketplace_watch(self, watch_id):
             if watch_id == self._w.watch_id:
                 return True
             return False
 
-        def update_mercari_watch(self, watch_id, *, condition_ids=None, **_kwargs):
-            self.update_calls.append({"watch_id": watch_id, "condition_ids": condition_ids})
-            if condition_ids is not None:
-                self._w.condition_ids = tuple(condition_ids)
+        def update_marketplace_watch(self, watch_id, *, market_options=None, **_kwargs):
+            self.update_calls.append({"watch_id": watch_id, "market_options": market_options})
+            if market_options is not None:
+                self._w.market_options = {
+                    k: dict(v) for k, v in market_options.items()
+                }
             return True
 
     db = _DB()
@@ -1990,7 +2017,7 @@ def test_callback_query_cond_open_renders_picker_with_six_checkboxes() -> None:
             "message": {
                 "message_id": 7,
                 "chat": {"id": "123"},
-                "text": "📋 Mercari 追蹤  第 1/1 頁（共 1 筆）",
+                "text": "📋 Marketplace 追蹤（多站）  第 1/1 頁（共 1 筆）",
             },
         },
     )
@@ -2032,7 +2059,10 @@ def test_callback_query_cond_toggle_adds_new_condition_and_persists() -> None:
         },
     )
 
-    assert db.update_calls == [{"watch_id": "wid0000", "condition_ids": (1, 2, 3, 4)}]
+    assert db.update_calls == [
+        {"watch_id": "wid0000",
+         "market_options": {"mercari": {"condition_ids": [1, 2, 3, 4]}}}
+    ]
     # Re-rendered picker should now show 4 boxes ticked.
     edited = client.edited_messages[0]
     kb = edited["reply_markup"]["inline_keyboard"]
@@ -2042,7 +2072,7 @@ def test_callback_query_cond_toggle_adds_new_condition_and_persists() -> None:
 def test_callback_query_cond_toggle_refuses_to_empty_all_conditions() -> None:
     processor, db, client = _setup_watchlist_callback()
     # Pre-shrink to only ID 3 so the next toggle would clear all.
-    processor._watch_db._w.condition_ids = (3,)
+    processor._watch_db._w.market_options = {"mercari": {"condition_ids": [3]}}
 
     handle_telegram_callback_query(
         client=client,
@@ -2081,7 +2111,7 @@ def test_callback_query_cond_done_returns_to_watchlist_edit_mode() -> None:
     )
 
     edited = client.edited_messages[0]
-    assert "📋 Mercari 追蹤" in edited["text"]
+    assert "📋 Marketplace 追蹤（多站）" in edited["text"]
     # Re-rendered in edit mode → first row has delete + condition buttons.
     first_row = edited["reply_markup"]["inline_keyboard"][0]
     assert first_row[0]["callback_data"].startswith("del:wl:")
