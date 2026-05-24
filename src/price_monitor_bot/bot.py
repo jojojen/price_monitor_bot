@@ -732,6 +732,7 @@ class TelegramCommandProcessor:
         opportunity_target_pinner: OpportunityTargetPinner | None = None,
         opportunity_target_unpinner: OpportunityTargetUnpinner | None = None,
         knowledge_handler: Callable[[str, str], str] | None = None,
+        collab_backfiller: "object | None" = None,
     ) -> None:
         self._lookup_renderer = lookup_renderer
         self._board_loader = board_loader
@@ -752,6 +753,7 @@ class TelegramCommandProcessor:
         self._opportunity_target_pinner = opportunity_target_pinner
         self._opportunity_target_unpinner = opportunity_target_unpinner
         self._knowledge_handler = knowledge_handler
+        self._collab_backfiller = collab_backfiller
         self._pending_photo_clarifications: dict[str, PendingTelegramPhotoClarification] = {}
         self._pending_text_clarifications: dict[str, PendingTelegramTextClarification] = {}
         self._pending_sns_bulk_updates: dict[str, PendingTelegramSnsBulkUpdate] = {}
@@ -3537,7 +3539,11 @@ def handle_telegram_callback_query(
                 from openclaw_adapter.opportunity_feedback import (
                     record_opportunity_feedback,
                 )
-                result = record_opportunity_feedback(recommendation_id=rec_id, kind=kind)
+                result = record_opportunity_feedback(
+                    recommendation_id=rec_id,
+                    kind=kind,
+                    collab_backfiller=self._collab_backfiller,
+                )
             except Exception:
                 logger.exception("oppfb feedback failed rec_id=%s kind=%s", rec_id, kind)
                 toast = "回饋寫入失敗，請看 log"
