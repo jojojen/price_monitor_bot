@@ -132,6 +132,17 @@ def _current_jst_year() -> int:
     return datetime.now(jst).year
 
 
+def _build_jst_iso(
+    *, year: int | None, month: int, day: int,
+    hour: int | None, minute: int | None,
+) -> str:
+    """Build an ISO8601 string in JST from parsed date/time components."""
+    y = year or _current_jst_year()
+    if hour is not None and minute is not None:
+        return f"{y:04d}-{month:02d}-{day:02d}T{hour:02d}:{minute:02d}:00+09:00"
+    return f"{y:04d}-{month:02d}-{day:02d}"
+
+
 # ── HTML fetch helper ────────────────────────────────────────────────────────
 
 def fetch_soup(
