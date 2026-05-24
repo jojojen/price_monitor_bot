@@ -33,6 +33,7 @@ class HttpClient:
         params: dict[str, str | list[str]] | None = None,
         encoding: str | None = "utf-8",
         headers: dict[str, str] | None = None,
+        timeout_seconds: int | None = None,
     ) -> str:
         target = url
         if params:
@@ -52,9 +53,10 @@ class HttpClient:
             target,
             headers=request_headers,
         )
-        logger.debug("HTTP GET target=%s timeout_seconds=%s", target, self.timeout_seconds)
+        effective_timeout = timeout_seconds if timeout_seconds is not None else self.timeout_seconds
+        logger.debug("HTTP GET target=%s timeout_seconds=%s", target, effective_timeout)
         try:
-            with urlopen(request, timeout=self.timeout_seconds, context=self.ssl_context) as response:
+            with urlopen(request, timeout=effective_timeout, context=self.ssl_context) as response:
                 payload = response.read()
                 selected_encoding = encoding or response.headers.get_content_charset() or "utf-8"
                 text = payload.decode(selected_encoding, errors="replace")
@@ -74,7 +76,7 @@ class HttpClient:
             else:
                 logger.warning("HTTP GET timed out target=%s error=%s; trying curl fallback", target, exc)
 
-            curl_text = self._get_text_with_curl(target=target, headers=request_headers, encoding=encoding)
+            curl_text = self._get_text_with_curl(target=target, headers=request_headers, encoding=encoding, timeout=effective_timeout)
             if curl_text is not None:
                 return curl_text
             raise
@@ -85,6 +87,7 @@ class HttpClient:
         target: str,
         headers: dict[str, str],
         encoding: str | None,
+        timeout: int | None = None,
     ) -> str | None:
         curl_path = shutil.which("curl.exe") or shutil.which("curl")
         if curl_path is None:
@@ -97,12 +100,13 @@ class HttpClient:
             command.extend(["-H", f"{key}: {value}"])
         command.append(target)
 
+        effective_timeout = timeout if timeout is not None else self.timeout_seconds
         try:
             completed = subprocess.run(
                 command,
                 capture_output=True,
                 check=True,
-                timeout=self.timeout_seconds,
+                timeout=effective_timeout,
             )
         except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
             logger.warning("curl fallback failed target=%s error=%s", target, exc)

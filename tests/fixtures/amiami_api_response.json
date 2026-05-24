@@ -1,0 +1,37 @@
+{
+  "RspCode": "000",
+  "RspMsg": "OK",
+  "items": [
+    {
+      "gcode": "CARD-TCG-UA-CSM-001",
+      "gname": "UNION ARENA エクストラブースター チェンソーマン 1BOX",
+      "thumb_url": "https://img.amiami.com/images/product/main/226/CARD-TCG-UA-CSM-001.jpg",
+      "min_price": 4180,
+      "list_price": 4180,
+      "instock_flg": 0,
+      "preorder_discount_flg": 1,
+      "s_st_list_newitem_available": 1
+    },
+    {
+      "gcode": "CARD-TCG-PK-SV-002",
+      "gname": "ポケモンカードゲーム スカーレット＆バイオレット 拡張パック",
+      "thumb_url": "https://img.amiami.com/images/product/main/226/CARD-TCG-PK-SV-002.jpg",
+      "min_price": 6050,
+      "list_price": 6050,
+      "instock_flg": 0,
+      "preorder_discount_flg": 1,
+      "s_st_list_newitem_available": 1
+    },
+    {
+      "gcode": "FIGURE-NONTCG-001",
+      "gname": "フィギュア 非TCG限定",
+      "thumb_url": "https://img.amiami.com/images/product/main/226/FIGURE-001.jpg",
+      "min_price": 8800,
+      "list_price": 8800,
+      "instock_flg": 1,
+      "preorder_discount_flg": 0,
+      "s_st_list_newitem_available": 1
+    }
+  ],
+  "total_results": 3
+}

@@ -160,7 +160,13 @@ def fetch_soup(
 
 
 class HttpClientProtocol(Protocol):
-    def get_text(self, url: str, *, timeout_seconds: int = 20) -> str: ...
+    def get_text(
+        self,
+        url: str,
+        *,
+        timeout_seconds: int = 20,
+        headers: "dict[str, str] | None" = None,
+    ) -> str: ...
 
 
 # ── URL normalisation helper ─────────────────────────────────────────────────
