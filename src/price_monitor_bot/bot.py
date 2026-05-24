@@ -133,6 +133,7 @@ SNS_ADD_COMMANDS = {"/snsadd", "/sns_add"}
 SNS_LIST_COMMANDS = {"/snslist", "/sns_list"}
 SNS_DELETE_COMMANDS = {"/snsdelete", "/sns_delete"}
 SNS_BUZZ_COMMANDS = {"/snsbuzz", "/sns_buzz"}
+KNOWLEDGE_COMMANDS = {"/knowledge", "/kb"}
 HUNT_COMMANDS = {"/hunt", "/opportunity"}
 HEAVY_COMMANDS = PRICE_LOOKUP_COMMANDS | TREND_BOARD_COMMANDS | REPUTATION_SNAPSHOT_COMMANDS | WEB_RESEARCH_COMMANDS
 
@@ -730,6 +731,7 @@ class TelegramCommandProcessor:
         opportunity_alias_updater: OpportunityAliasUpdater | None = None,
         opportunity_target_pinner: OpportunityTargetPinner | None = None,
         opportunity_target_unpinner: OpportunityTargetUnpinner | None = None,
+        knowledge_handler: Callable[[str, str], str] | None = None,
     ) -> None:
         self._lookup_renderer = lookup_renderer
         self._board_loader = board_loader
@@ -749,6 +751,7 @@ class TelegramCommandProcessor:
         self._opportunity_alias_updater = opportunity_alias_updater
         self._opportunity_target_pinner = opportunity_target_pinner
         self._opportunity_target_unpinner = opportunity_target_unpinner
+        self._knowledge_handler = knowledge_handler
         self._pending_photo_clarifications: dict[str, PendingTelegramPhotoClarification] = {}
         self._pending_text_clarifications: dict[str, PendingTelegramTextClarification] = {}
         self._pending_sns_bulk_updates: dict[str, PendingTelegramSnsBulkUpdate] = {}
@@ -1075,6 +1078,11 @@ class TelegramCommandProcessor:
                 ack="收到，正在抓取 X 熱門討論並交給 LLM 整理…",
                 reply=None,
                 reply_factory=lambda remainder=remainder: self._handle_sns_buzz(remainder),
+            )
+        if command in KNOWLEDGE_COMMANDS:
+            return TelegramTextReplyPlan(
+                ack=None,
+                reply=self._handle_knowledge(remainder, str(chat_id)),
             )
         if not content.startswith("/"):
             intent = self._route_natural_language(content)
@@ -2229,6 +2237,23 @@ class TelegramCommandProcessor:
             logger.exception("SNS buzz failed query=%s", query)
             return f"熱門整理失敗：{exc}"
 
+    def _handle_knowledge(self, raw: str, chat_id: str) -> str:
+        """Dispatch /knowledge subcommands to the registered handler.
+
+        The actual handler lives in aka_no_claw (it owns ``KnowledgeDatabase``).
+        This method only does presence checking and forwards the remainder —
+        the handler parses the action / entity / summary itself.
+        """
+        if self._knowledge_handler is None:
+            return (
+                "知識庫指令尚未啟用（需在 aka_no_claw 端註冊 knowledge_handler）。"
+            )
+        try:
+            return self._knowledge_handler(raw, chat_id)
+        except Exception as exc:
+            logger.exception("knowledge handler failed raw=%r", raw)
+            return f"知識庫指令失敗：{exc}"
+
     def _build_sns_bulk_add_filter_plan(
         self,
         *,
@@ -3112,6 +3137,7 @@ def run_telegram_polling(
     opportunity_alias_updater: OpportunityAliasUpdater | None = None,
     opportunity_target_pinner: OpportunityTargetPinner | None = None,
     opportunity_target_unpinner: OpportunityTargetUnpinner | None = None,
+    knowledge_handler: Callable[[str, str], str] | None = None,
     poll_timeout: int = 20,
     notify_startup: bool = False,
     drop_pending_updates: bool = True,
@@ -3152,6 +3178,7 @@ def run_telegram_polling(
         opportunity_alias_updater=opportunity_alias_updater,
         opportunity_target_pinner=opportunity_target_pinner,
         opportunity_target_unpinner=opportunity_target_unpinner,
+        knowledge_handler=knowledge_handler,
     )
     resolved_photo_renderer = photo_renderer or default_photo_renderer()
 
