@@ -122,6 +122,26 @@ class TcgCardSpec:
                 deduped.append(value)
         return tuple(deduped)
 
+    @classmethod
+    def from_tracked_item(cls, item: TrackedItem) -> "TcgCardSpec":
+        """Reconstruct a `TcgCardSpec` from a stored `TrackedItem`.
+        Used by callback paths that only carry an item_id and need the spec
+        for downstream services (feedback, hot-card resolution, etc.)."""
+        attributes = dict(item.attributes or {})
+        game = attributes.get("game") or "pokemon"
+        item_kind = attributes.get("item_kind") or "card"
+        return cls(
+            game=game,
+            title=item.title,
+            item_kind=item_kind,
+            card_number=attributes.get("card_number") or None,
+            rarity=attributes.get("rarity") or None,
+            set_code=attributes.get("set_code") or None,
+            set_name=attributes.get("set_name") or None,
+            aliases=tuple(item.aliases or ()),
+            item_id=item.item_id,
+        )
+
     def to_tracked_item(self) -> TrackedItem:
         attributes = {
             "game": self.game,

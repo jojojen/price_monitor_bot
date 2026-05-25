@@ -173,6 +173,21 @@ def _section_reference_offer(offers: list[MarketOffer]) -> MarketOffer | None:
     return None
 
 
+def build_lookup_feedback_keyboard(result: TcgLookupResult) -> dict[str, object] | None:
+    """Inline keyboard for the price-feedback flow. Returns None if no item_id
+    is available (shouldn't happen in practice). callback_data is
+    ``fbprc:<item_id>`` — must be <=64 bytes per Telegram spec; tcg-* item_ids
+    are ~20 chars so plenty of headroom."""
+    item_id = getattr(result.item, "item_id", None)
+    if not item_id:
+        return None
+    return {
+        "inline_keyboard": [[
+            {"text": "❌ 價格不合理", "callback_data": f"fbprc:{item_id}"},
+        ]],
+    }
+
+
 def format_lookup_result_telegram(result: TcgLookupResult) -> str:
     spec = result.spec
     label = f"[{spec.game}]"

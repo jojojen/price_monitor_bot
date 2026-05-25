@@ -2845,3 +2845,168 @@ def test_sns_bulk_add_filter_callback_with_no_pending_shows_expired_toast(tmp_pa
     assert client.answered_callbacks[0]["text"] == "操作已過期，請重新輸入"
     # The message gets edited with the expired marker, but no DB write.
     assert "已過期" in client.edited_messages[0]["text"]
+
+
+# ── Price-feedback loop UI (Phase 1) ────────────────────────────────────────
+
+
+class _FakeFeedbackService:
+    def __init__(self, summary: str = "fake summary") -> None:
+        self.calls: list[dict] = []
+        self.summary = summary
+
+    def submit(self, *, item, spec, chat_id, original_fair_value_jpy, claimed_url):
+        self.calls.append({
+            "item_id": item.item_id, "game": spec.game, "kind": spec.item_kind,
+            "chat_id": chat_id, "fair_value": original_fair_value_jpy,
+            "url": claimed_url,
+        })
+        from collections import namedtuple
+        Out = namedtuple("Out", ["summary_for_user"])
+        return Out(summary_for_user=self.summary)
+
+
+def test_fbprc_callback_stores_pending_and_sends_force_reply(tmp_path: Path) -> None:
+    """Tap '不合理' button → bot stores pending feedback state and sends a
+    ForceReply prompt with the [fbprc:item_id] tag embedded."""
+    from market_monitor.storage import MonitorDatabase
+
+    watch_db = MonitorDatabase(tmp_path / "fbui.sqlite3")
+    watch_db.bootstrap()
+    item = TrackedItem(
+        item_id="tcg-abcdef0123456789",
+        item_type="tcg_sealed_box",
+        category="tcg",
+        title="MEGA アビスアイ",
+        attributes={"game": "pokemon", "item_kind": "sealed_box"},
+    )
+    watch_db.upsert_item(item)
+
+    processor = TelegramCommandProcessor(
+        allowed_chat_ids=frozenset({"123"}),
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        watch_db=watch_db,
+        feedback_service=_FakeFeedbackService(),
+    )
+    client = FakeTelegramClient()
+
+    handle_telegram_callback_query(
+        client=client,
+        processor=processor,
+        callback_query={
+            "id": "cbq-fbprc",
+            "data": f"fbprc:{item.item_id}",
+            "message": {
+                "message_id": 99,
+                "chat": {"id": "123"},
+                "text": "lookup result here",
+            },
+        },
+    )
+
+    # ForceReply message was sent
+    assert any(f"[fbprc:{item.item_id}]" in msg for msg in client.sent_messages)
+    # Pending state stored
+    pending = processor.get_pending_price_feedback("123")
+    assert pending is not None
+    assert pending.item_id == item.item_id
+
+
+def test_fbprc_url_reply_calls_feedback_service(tmp_path: Path) -> None:
+    """User pastes a URL as reply to the ForceReply prompt → handler matches
+    the [fbprc:item_id] tag, consumes pending state, and routes to the
+    feedback_service."""
+    from market_monitor.storage import MonitorDatabase
+
+    watch_db = MonitorDatabase(tmp_path / "fbui2.sqlite3")
+    watch_db.bootstrap()
+    item = TrackedItem(
+        item_id="tcg-abcdef0123456789",
+        item_type="tcg_sealed_box",
+        category="tcg",
+        title="MEGA アビスアイ",
+        attributes={"game": "pokemon", "item_kind": "sealed_box"},
+    )
+    watch_db.upsert_item(item)
+
+    fake_service = _FakeFeedbackService(summary="✅ 已記錄\n網站: yuyu-tei.jp")
+    processor = TelegramCommandProcessor(
+        allowed_chat_ids=frozenset({"123"}),
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        watch_db=watch_db,
+        feedback_service=fake_service,
+    )
+    # Simulate the pending state that the callback would have set
+    from price_monitor_bot.bot import PendingTelegramPriceFeedback
+    processor.set_pending_price_feedback(PendingTelegramPriceFeedback(
+        chat_id="123", item_id=item.item_id, original_fair_value_jpy=16800,
+    ))
+
+    client = FakeTelegramClient()
+    handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda q: "noop",
+        message={
+            "chat": {"id": "123"},
+            "text": "https://yuyu-tei.jp/sealed/abc",
+            "reply_to_message": {
+                "text": f"請貼上 URL [fbprc:{item.item_id}]",
+            },
+        },
+    )
+
+    assert len(fake_service.calls) == 1
+    call = fake_service.calls[0]
+    assert call["item_id"] == item.item_id
+    assert call["url"] == "https://yuyu-tei.jp/sealed/abc"
+    assert call["fair_value"] == 16800
+    # Pending state consumed
+    assert processor.get_pending_price_feedback("123") is None
+    # Bot replied with the service's summary
+    assert any("已記錄" in m for m in client.sent_messages)
+
+
+def test_fbprc_url_reply_rejects_non_url(tmp_path: Path) -> None:
+    from market_monitor.storage import MonitorDatabase
+    from price_monitor_bot.bot import PendingTelegramPriceFeedback
+
+    watch_db = MonitorDatabase(tmp_path / "fbui3.sqlite3")
+    watch_db.bootstrap()
+    item = TrackedItem(
+        item_id="tcg-xy",
+        item_type="tcg_sealed_box", category="tcg", title="X",
+        attributes={"game": "pokemon", "item_kind": "sealed_box"},
+    )
+    watch_db.upsert_item(item)
+
+    fake_service = _FakeFeedbackService()
+    processor = TelegramCommandProcessor(
+        allowed_chat_ids=frozenset({"123"}),
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        watch_db=watch_db,
+        feedback_service=fake_service,
+    )
+    processor.set_pending_price_feedback(
+        PendingTelegramPriceFeedback(chat_id="123", item_id=item.item_id, original_fair_value_jpy=None)
+    )
+
+    client = FakeTelegramClient()
+    handle_telegram_message(
+        client=client, processor=processor,
+        photo_renderer=lambda q: "noop",
+        message={
+            "chat": {"id": "123"},
+            "text": "not a url at all",
+            "reply_to_message": {"text": f"請貼上 URL [fbprc:{item.item_id}]"},
+        },
+    )
+
+    assert fake_service.calls == []  # service NOT called
+    assert any("不是合法 URL" in m for m in client.sent_messages)

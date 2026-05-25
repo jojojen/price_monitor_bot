@@ -38,7 +38,7 @@ from tcg_tracker.image_lookup import (
 )
 
 from .commands import lookup_card
-from .formatters import format_jpy, format_lookup_result_telegram
+from .formatters import build_lookup_feedback_keyboard, format_jpy, format_lookup_result_telegram
 from .logging_utils import mask_identifier, trim_for_log
 from .natural_language import (
     TelegramNaturalLanguageIntent,
@@ -47,7 +47,7 @@ from .natural_language import (
     _recover_lookup_fields,
 )
 
-LookupRenderer = Callable[["TelegramLookupQuery"], str]
+LookupRenderer = Callable[["TelegramLookupQuery"], "str | tuple[str, dict[str, object] | None]"]
 # Photo renderer can return either a bare reply string (existing behaviour)
 # or a PhotoLookupReply when the renderer also wants to install a pending
 # clarification state — used by the unresolved/rejected_sanity path.
@@ -173,6 +173,7 @@ class _ListRow:
 
 _CONDITION_PICKER_TITLE = "🎛 設定狀態"
 _WPRC_TAG_RE = re.compile(r"\[wprc:([a-f0-9]{40})\]")
+_FBPRC_TAG_RE = re.compile(r"\[fbprc:([a-zA-Z0-9\-]{1,80})\]")
 
 
 def _render_watch_edit_view(
@@ -370,16 +371,26 @@ class TelegramReputationDelivery:
 class TelegramTextReplyPlan:
     ack: str | None
     reply: str | None
-    reply_factory: Callable[[], str] | None = None
+    reply_factory: "Callable[[], str | tuple[str, dict[str, object] | None]] | None" = None
     reputation_delivery_factory: "Callable[[], TelegramReputationDelivery] | None" = None
     reply_markup: dict[str, object] | None = None  # optional inline keyboard for list views
 
     def execute(self) -> str | None:
+        text, _ = self._execute_unpacked()
+        return text
+
+    def _execute_unpacked(self) -> tuple[str | None, dict[str, object] | None]:
+        """Return (text, reply_markup_from_factory). Factory may return either
+        a bare string (legacy) or a tuple (text, markup-override). Callers
+        merge the override with self.reply_markup at send time."""
         if self.reply is not None:
-            return self.reply
+            return self.reply, None
         if self.reply_factory is not None:
-            return self.reply_factory()
-        return None
+            result = self.reply_factory()
+            if isinstance(result, tuple):
+                return result[0], result[1]
+            return result, None
+        return None, None
 
 
 @dataclass(frozen=True, slots=True)
@@ -406,10 +417,12 @@ class PhotoLookupReply:
     confidently identify the card and is falling back to user clarification).
     Plain `str` returns are still supported for back-compat — `_handle_photo_message`
     wraps them automatically.
-    """
+    `reply_markup` carries the optional inline keyboard for the bot to attach
+    (e.g. the price-feedback ❌ button on successful lookups)."""
     text: str
     pending_clarification: "PendingTelegramPhotoClarification | None" = None
     ack: str | None = None
+    reply_markup: dict[str, object] | None = None
 
 
 @dataclass(slots=True)
@@ -446,6 +459,23 @@ class PendingTelegramTextClarification:
 
     def is_expired(self) -> bool:
         return (time.monotonic() - self.created_at) > TEXT_CLARIFICATION_TTL_SECONDS
+
+
+PRICE_FEEDBACK_TTL_SECONDS = 10 * 60
+
+
+@dataclass(slots=True)
+class PendingTelegramPriceFeedback:
+    """User clicked '不合理' on a lookup result; we sent a ForceReply asking
+    for a reference URL. This row is consumed when the user replies with the
+    URL. Mirrors PendingTelegramTextClarification pattern."""
+    chat_id: str
+    item_id: str
+    original_fair_value_jpy: int | None
+    created_at: float = field(default_factory=time.monotonic)
+
+    def is_expired(self) -> bool:
+        return (time.monotonic() - self.created_at) > PRICE_FEEDBACK_TTL_SECONDS
 
 
 @dataclass(slots=True)
@@ -792,6 +822,7 @@ class TelegramCommandProcessor:
         opportunity_target_unpinner: OpportunityTargetUnpinner | None = None,
         knowledge_handler: Callable[[str, str], str] | None = None,
         collab_backfiller: "object | None" = None,
+        feedback_service: "object | None" = None,
     ) -> None:
         self._lookup_renderer = lookup_renderer
         self._board_loader = board_loader
@@ -813,9 +844,11 @@ class TelegramCommandProcessor:
         self._opportunity_target_unpinner = opportunity_target_unpinner
         self._knowledge_handler = knowledge_handler
         self._collab_backfiller = collab_backfiller
+        self._feedback_service = feedback_service
         self._pending_photo_clarifications: dict[str, PendingTelegramPhotoClarification] = {}
         self._pending_text_clarifications: dict[str, PendingTelegramTextClarification] = {}
         self._pending_sns_bulk_updates: dict[str, PendingTelegramSnsBulkUpdate] = {}
+        self._pending_price_feedbacks: dict[str, PendingTelegramPriceFeedback] = {}
 
     def is_allowed_chat(self, chat_id: str | int) -> bool:
         if not self._allowed_chat_ids:
@@ -864,6 +897,25 @@ class TelegramCommandProcessor:
 
     def clear_pending_text_clarification(self, chat_id: str | int) -> None:
         self._pending_text_clarifications.pop(str(chat_id), None)
+
+    def get_pending_price_feedback(self, chat_id: str | int) -> PendingTelegramPriceFeedback | None:
+        key = str(chat_id)
+        pending = self._pending_price_feedbacks.get(key)
+        if pending is None:
+            return None
+        if not pending.is_expired():
+            return pending
+        self._pending_price_feedbacks.pop(key, None)
+        return None
+
+    def set_pending_price_feedback(self, pending: PendingTelegramPriceFeedback) -> None:
+        self._pending_price_feedbacks[pending.chat_id] = pending
+
+    def pop_pending_price_feedback(self, chat_id: str | int) -> PendingTelegramPriceFeedback | None:
+        return self._pending_price_feedbacks.pop(str(chat_id), None)
+
+    def clear_pending_price_feedback(self, chat_id: str | int) -> None:
+        self._pending_price_feedbacks.pop(str(chat_id), None)
 
     def get_pending_sns_bulk_update(self, chat_id: str | int) -> PendingTelegramSnsBulkUpdate | None:
         key = str(chat_id)
@@ -3014,7 +3066,7 @@ def default_lookup_renderer(db_path: str | Path | None = None) -> LookupRenderer
                 for o in result.offers[:10]
             ],
         )
-        return format_lookup_result_telegram(result)
+        return format_lookup_result_telegram(result), build_lookup_feedback_keyboard(result)
 
     return render
 
@@ -3051,7 +3103,7 @@ def default_photo_renderer(
             game_hint=query.game_hint,
             title_hint=query.title_hint,
             item_kind_hint=query.item_kind_hint,
-            persist=False,
+            persist=True,
         )
         logger.info(
             "Telegram image scan result chat_id=%s file_id=%s status=%s game=%s title=%s card_number=%s rarity=%s set_code=%s extracted_lines=%s raw_text=%s",
@@ -3083,7 +3135,11 @@ def default_photo_renderer(
                 outcome=outcome,
                 research_renderer=research_renderer,
             )
-        return format_photo_lookup_result(outcome)
+        text = format_photo_lookup_result(outcome)
+        keyboard: dict[str, object] | None = None
+        if outcome.lookup_result is not None:
+            keyboard = build_lookup_feedback_keyboard(outcome.lookup_result)
+        return PhotoLookupReply(text=text, reply_markup=keyboard)
 
     return render
 
@@ -3209,6 +3265,7 @@ def run_telegram_polling(
     opportunity_target_pinner: OpportunityTargetPinner | None = None,
     opportunity_target_unpinner: OpportunityTargetUnpinner | None = None,
     knowledge_handler: Callable[[str, str], str] | None = None,
+    feedback_service: "object | None" = None,
     poll_timeout: int = 20,
     notify_startup: bool = False,
     drop_pending_updates: bool = True,
@@ -3250,6 +3307,7 @@ def run_telegram_polling(
         opportunity_target_pinner=opportunity_target_pinner,
         opportunity_target_unpinner=opportunity_target_unpinner,
         knowledge_handler=knowledge_handler,
+        feedback_service=feedback_service,
     )
     resolved_photo_renderer = photo_renderer or default_photo_renderer()
 
@@ -3806,6 +3864,40 @@ def handle_telegram_callback_query(
             else:
                 toast = "找不到該追蹤"
 
+    elif prefix == "fbprc" and payload:
+        # Price-feedback callback: store pending state + send ForceReply asking for URL.
+        feedback_service = getattr(processor, "_feedback_service", None)
+        watch_db = getattr(processor, "_watch_db", None)
+        if feedback_service is None or watch_db is None:
+            toast = "回饋功能未啟用"
+        else:
+            item = watch_db.find_item(payload)
+            if item is None:
+                toast = "找不到該品項，可能已過期"
+            else:
+                fair_value = watch_db.latest_fair_value_for(payload)
+                processor.set_pending_price_feedback(
+                    PendingTelegramPriceFeedback(
+                        chat_id=str(chat_id),
+                        item_id=payload,
+                        original_fair_value_jpy=fair_value,
+                    )
+                )
+                fr_text = (
+                    "請貼上你覺得合理價格的參考 URL（必須是公開可讀的網頁）：\n"
+                    f"[fbprc:{payload}]"
+                )
+                try:
+                    client.send_message(
+                        chat_id=chat_id,
+                        text=fr_text,
+                        reply_markup={"force_reply": True, "selective": True},
+                    )
+                    toast = "好的，等你貼 URL"
+                except Exception:
+                    logger.exception("fbprc: ForceReply send failed item_id=%s", payload)
+                    toast = "發送失敗"
+
     elif prefix == "wback":
         # Return from watch edit view to watchlist edit mode
         text, kb, _ = processor.render_watchlist_view(mode=LIST_VIEW_MODE_EDIT)
@@ -3878,11 +3970,53 @@ def handle_telegram_message(
     photo_items = message.get("photo")
     has_photo = isinstance(photo_items, list) and bool(photo_items)
 
-    # ForceReply price update — check before intake ack so it doesn't misfire NLP
+    # ForceReply price-feedback URL — check before intake ack so it doesn't misfire NLP
     if text_value and not has_photo:
         reply_to = message.get("reply_to_message")
         if isinstance(reply_to, dict):
             rt_text = reply_to.get("text") or ""
+            fbprc_m = _FBPRC_TAG_RE.search(rt_text) if isinstance(rt_text, str) else None
+            if fbprc_m:
+                pending = processor.pop_pending_price_feedback(chat_id)
+                url = text_value.strip()
+                if not (url.startswith("http://") or url.startswith("https://")):
+                    client.send_message(chat_id=chat_id, text="⚠️ 這看起來不是合法 URL，回饋已取消。")
+                    return ("⚠️ 不是合法 URL",)
+                if pending is None:
+                    client.send_message(chat_id=chat_id, text="⚠️ 該回饋對話已過期，請重新點擊「不合理」。")
+                    return ("⚠️ 過期",)
+                feedback_service = getattr(processor, "_feedback_service", None)
+                watch_db = getattr(processor, "_watch_db", None)
+                if feedback_service is None or watch_db is None:
+                    client.send_message(chat_id=chat_id, text="⚠️ 回饋服務未啟用。")
+                    return ("⚠️ 未啟用",)
+                item = watch_db.find_item(pending.item_id)
+                if item is None:
+                    client.send_message(chat_id=chat_id, text="⚠️ 找不到對應品項。")
+                    return ("⚠️ 品項遺失",)
+                # Build TcgCardSpec from TrackedItem
+                try:
+                    from tcg_tracker.catalog import TcgCardSpec as _TcgCardSpec
+                    spec = _TcgCardSpec.from_tracked_item(item)
+                except Exception as exc:
+                    logger.exception("fbprc consumer: failed to build spec from item_id=%s: %s", pending.item_id, exc)
+                    client.send_message(chat_id=chat_id, text="⚠️ 解析品項失敗。")
+                    return ("⚠️ 解析失敗",)
+                try:
+                    outcome = feedback_service.submit(
+                        item=item,
+                        spec=spec,
+                        chat_id=chat_id,
+                        original_fair_value_jpy=pending.original_fair_value_jpy,
+                        claimed_url=url,
+                    )
+                except Exception:
+                    logger.exception("Feedback service failed for chat_id=%s url=%s", chat_id, url)
+                    client.send_message(chat_id=chat_id, text="⚠️ 抓取／分析時出現錯誤，已記錄。")
+                    return ("⚠️ 內部錯誤",)
+                client.send_message(chat_id=chat_id, text=outcome.summary_for_user)
+                return (outcome.summary_for_user,)
+
             wprc_m = _WPRC_TAG_RE.search(rt_text) if isinstance(rt_text, str) else None
             if wprc_m:
                 watch_id = wprc_m.group(1)
@@ -3990,14 +4124,17 @@ def _send_text_reply_plan(
         _send_reputation_delivery(client=client, chat_id=chat_id, delivery=delivery)
         sent.append(delivery.summary_text)
         return sent
-    reply = plan.execute()
+    reply, factory_markup = plan._execute_unpacked()
     if reply:
         logger.debug(
             "Telegram reply sending chat_id=%s text=%s",
             mask_identifier(chat_id),
             trim_for_log(reply, limit=320),
         )
-        client.send_message(chat_id=chat_id, text=reply, reply_markup=plan.reply_markup)
+        # Factory-provided markup (from e.g. lookup feedback keyboard) takes
+        # precedence over plan-level reply_markup; falls back to it when None.
+        markup = factory_markup if factory_markup is not None else plan.reply_markup
+        client.send_message(chat_id=chat_id, text=reply, reply_markup=markup)
         sent.append(reply)
     return sent
 
@@ -4098,7 +4235,9 @@ def _handle_photo_message(
                     # path uses, so direct-lookup fallbacks get one-tap selection too.
                     kb = _build_clarification_keyboard("popt", reply.pending_clarification.options)
                 else:
-                    kb = None
+                    # No clarification — pass through whatever keyboard the
+                    # renderer attached (e.g. the price-feedback ❌ button).
+                    kb = reply.reply_markup
                 return reply.text, reply.ack or build_processing_ack(has_photo=True), kb
             finally:
                 if not installed_pending:
@@ -4152,7 +4291,7 @@ def _execute_pending_photo_lookup(
     pending: PendingTelegramPhotoClarification,
     option: TelegramPhotoIntentOption,
     photo_renderer: PhotoLookupRenderer,
-) -> str:
+) -> "str | tuple[str, dict[str, object] | None]":
     query = TelegramPhotoQuery(
         chat_id=pending.chat_id,
         image_path=pending.image_path,
@@ -4165,6 +4304,10 @@ def _execute_pending_photo_lookup(
     try:
         raw_reply = photo_renderer(query)
         reply = _coerce_photo_lookup_reply(raw_reply)
+        # When the renderer attached a feedback keyboard, return a tuple so
+        # the reply_factory plumbing in TelegramTextReplyPlan picks it up.
+        if reply.reply_markup is not None:
+            return reply.text, reply.reply_markup
         return reply.text
     finally:
         try:

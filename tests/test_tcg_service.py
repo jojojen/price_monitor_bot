@@ -261,6 +261,45 @@ def test_lookup_fans_out_reference_clients_in_parallel(tmp_path) -> None:
     assert {offer.source for offer in result.offers} == {"a", "b", "c"}
 
 
+def test_lookup_notes_include_learned_reference_sites(tmp_path) -> None:
+    """Pre-populated domain_trust rows (with real votes) must surface as a
+    '📚 社群指名可參考來源' line in the lookup notes."""
+    service = TcgPriceService(
+        db_path=tmp_path / "monitor.sqlite3",
+        reference_clients=(
+            StubLookupClient(
+                [
+                    MarketOffer(
+                        source="yuyutei", listing_id="abc",
+                        url="https://example.com/abc", title="リザードンex",
+                        price_jpy=59800, price_kind="ask",
+                        captured_at=datetime.now(timezone.utc),
+                        source_category="specialty_store",
+                        attributes={"card_number": "349/190", "rarity": "SAR", "version_code": "sv4a"},
+                    )
+                ]
+            ),
+        ),
+    )
+
+    # Inject two real votes for distinct domains, both in the same game/kind
+    service.database.bump_domain_trust(
+        game="pokemon", item_kind="card", domain="yuyu-tei.jp", success=True,
+    )
+    service.database.bump_domain_trust(
+        game="pokemon", item_kind="card", domain="cardrush.jp", success=True,
+    )
+
+    result = service.lookup(
+        TcgCardSpec(game="pokemon", title="リザードンex", card_number="349/190", rarity="SAR", set_code="sv4a"),
+        persist=False,
+    )
+    learned_note = next((n for n in result.notes if "社群指名可參考來源" in n), None)
+    assert learned_note is not None, f"missing learned-sites hint in notes: {result.notes}"
+    assert "yuyu-tei.jp" in learned_note
+    assert "cardrush.jp" in learned_note
+
+
 def test_sealed_box_lookup_drops_starter_sets_and_low_priced_listings(tmp_path) -> None:
     """Regression for MEGA アビスアイ: the bot used to return ¥1,930 by
     treating cardrush single cards / starter sets as sealed boxes. The

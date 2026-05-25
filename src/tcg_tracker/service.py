@@ -11,7 +11,7 @@ from typing import Protocol
 
 from market_monitor.http import HttpClient
 from market_monitor.normalize import normalize_card_number, normalize_text
-from market_monitor.models import FairValueEstimate, MarketOffer, TrackedItem, WatchRule
+from market_monitor.models import DomainTrust, FairValueEstimate, MarketOffer, TrackedItem, WatchRule
 from market_monitor.pricing import FairValueCalculator
 from market_monitor.storage import MonitorDatabase
 
@@ -58,6 +58,7 @@ class TcgPriceService:
 
         self.database = MonitorDatabase(resolved_db_path)
         self.database.bootstrap()
+        self._seed_domain_trust_from_config_if_present()
         primary_client = yuyutei_client or YuyuteiClient(
             HttpClient(user_agent=yuyutei_user_agent)
         )
@@ -101,7 +102,10 @@ class TcgPriceService:
             if self._can_calculate_fair_value(spec, fair_value_offers)
             else None
         )
-        notes = self._build_lookup_notes(spec, offers, fair_value)
+        learned_sites = self.database.list_learned_reference_sites(
+            game=spec.game, item_kind=spec.item_kind, limit=5,
+        )
+        notes = self._build_lookup_notes(spec, offers, fair_value, learned_sites)
         logger.info(
             "TCG service lookup finished item_id=%s offers=%s sources=%s fair_value=%s notes=%s",
             item.item_id,
@@ -220,6 +224,36 @@ class TcgPriceService:
             and offer.price_jpy >= floor
         ]
 
+    def _seed_domain_trust_from_config_if_present(self) -> None:
+        """Idempotent one-shot seed of `domain_trust` rows from
+        `config/reference_sources.json`. Silently no-op if the file is
+        missing — tests / standalone usage don't carry the config."""
+        import json
+        # Search up to 4 levels above CWD for config/reference_sources.json,
+        # then fall back to the package's own working tree.
+        candidates: list[Path] = []
+        cwd = Path.cwd()
+        for level in range(4):
+            candidates.append(cwd.parents[level] / "config" / "reference_sources.json" if level < len(cwd.parents) else cwd / "config" / "reference_sources.json")
+        candidates.append(Path(__file__).resolve().parents[2] / "config" / "reference_sources.json")
+        for path in candidates:
+            try:
+                if not path.is_file():
+                    continue
+            except OSError:
+                continue
+            try:
+                with path.open("r", encoding="utf-8") as f:
+                    entries = json.load(f)
+            except (OSError, json.JSONDecodeError) as exc:
+                logger.warning("Failed to read %s for domain_trust seeding: %s", path, exc)
+                return
+            if not isinstance(entries, list):
+                return
+            count = self.database.seed_domain_trust_from_reference_sources(entries)
+            logger.info("Seeded domain_trust from %s (entries considered=%d)", path, count)
+            return
+
     def seed_watchlist(
         self,
         specs: list[TcgCardSpec] | tuple[TcgCardSpec, ...],
@@ -282,6 +316,7 @@ class TcgPriceService:
         spec: TcgCardSpec,
         offers: tuple[MarketOffer, ...],
         fair_value: FairValueEstimate | None,
+        learned_sites: "list[DomainTrust] | tuple[DomainTrust, ...]" = (),
     ) -> tuple[str, ...]:
         notes: list[str] = []
         variant_count = len(TcgPriceService._variant_keys(offers))
@@ -290,9 +325,11 @@ class TcgPriceService:
             notes.append("No matching offers were found on the current reference sources.")
             if spec.item_kind == "sealed_box":
                 notes.append("Try adding the product line, such as booster pack or high-class pack, to narrow the box search.")
+                _append_learned_sites_note(notes, learned_sites)
                 return tuple(notes)
             if not any((spec.card_number, spec.rarity, spec.set_code, spec.set_name)):
                 notes.append("Try adding card number, rarity, or set code to narrow the search.")
+            _append_learned_sites_note(notes, learned_sites)
             return tuple(notes)
 
         if fair_value is None and variant_count > 1:
@@ -301,6 +338,7 @@ class TcgPriceService:
             )
             notes.append("Add card number, rarity, or set code to narrow the result.")
 
+        _append_learned_sites_note(notes, learned_sites)
         return tuple(notes)
 
     @staticmethod
@@ -363,6 +401,23 @@ def _offer_summary(offer: MarketOffer) -> dict[str, object]:
         "set_code": offer.attributes.get("version_code", "") or offer.attributes.get("set_code", ""),
         "score": offer.score,
     }
+
+
+def _append_learned_sites_note(
+    notes: list[str],
+    learned_sites: list[DomainTrust] | tuple[DomainTrust, ...],
+) -> None:
+    """Append the '📚 社群指名可參考來源' line if there are learned sites
+    with real votes. Seeded rows (vote_count == 0) are filtered out at the
+    storage layer (`list_learned_reference_sites` defaults min_votes=1) so
+    this only fires once real feedback exists."""
+    if not learned_sites:
+        return
+    fragments = [
+        f"{s.domain}(信:{s.bayes_accuracy_score:.2f}×{s.vote_count})"
+        for s in learned_sites
+    ]
+    notes.append("📚 社群指名可參考來源：" + "、".join(fragments))
 
 
 def _sealed_box_cluster_key(title: str) -> str:

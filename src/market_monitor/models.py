@@ -55,3 +55,63 @@ class WatchRule:
     discount_threshold_pct: float = 15.0
     enabled: bool = True
     schedule_minutes: int = 30
+
+
+FeedbackConfidence = Literal["high", "medium", "low"]
+FeedbackStatus = Literal[
+    "analyzed",
+    "fetch_failed",
+    "extraction_failed",
+    "low_consistency",
+    "low_consensus",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class PriceFeedbackEvent:
+    feedback_id: str
+    chat_id: str | None
+    item_id: str
+    game: str
+    item_kind: str
+    original_fair_value_jpy: int | None
+    claimed_url: str
+    claimed_domain: str
+    url_hash: str
+    extracted_price_jpy_pass1: int | None
+    extracted_price_jpy_pass2: int | None
+    consistency_pct: float | None
+    consensus_pct: float | None
+    extraction_confidence: FeedbackConfidence
+    raw_html_gzipped: bytes | None
+    llm_notes_json: str
+    status: FeedbackStatus
+    created_at: datetime = field(default_factory=utc_now)
+    updated_at: datetime = field(default_factory=utc_now)
+
+
+@dataclass(frozen=True, slots=True)
+class DomainTrust:
+    domain_id: str
+    game: str
+    item_kind: str
+    domain: str
+    vote_count: int
+    consensus_success_count: int
+    consensus_fail_count: int
+    bayes_accuracy_score: float
+    suspended: bool = False
+    first_seen_at: datetime = field(default_factory=utc_now)
+    last_extraction_at: datetime = field(default_factory=utc_now)
+
+
+@dataclass(frozen=True, slots=True)
+class ExtractionExample:
+    example_id: str
+    game: str
+    item_kind: str
+    domain: str
+    title: str
+    price_jpy: int
+    captured_from_feedback_id: str
+    captured_at: datetime = field(default_factory=utc_now)

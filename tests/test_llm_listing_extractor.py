@@ -229,3 +229,73 @@ def test_html_to_text_collapses_whitespace():
     assert "\n\n\n" not in result
     assert "Line A" in result
     assert "Line B" in result
+
+
+# ── Single-product price extraction (feedback loop) ─────────────────────────
+
+
+def test_single_product_few_shot_prompt_includes_examples():
+    """Verify _build_single_product_system_prompt embeds verified-price block
+    when examples are present. This is the 'self-evolving' anchor."""
+    from datetime import datetime, timezone
+
+    from market_monitor.llm_listing_extractor import _build_single_product_system_prompt
+    from market_monitor.models import ExtractionExample
+
+    examples = (
+        ExtractionExample(
+            example_id="ex1", game="pokemon", item_kind="sealed_box",
+            domain="yuyu-tei.jp", title="MEGA アビスアイ 拡張パックBOX",
+            price_jpy=16800, captured_from_feedback_id="fb1",
+            captured_at=datetime.now(timezone.utc),
+        ),
+    )
+    prompt = _build_single_product_system_prompt(
+        game="pokemon", item_kind="sealed_box", few_shot_examples=examples,
+    )
+    assert "Recent verified prices for pokemon/sealed_box" in prompt
+    assert "yuyu-tei.jp" in prompt
+    assert "16,800" in prompt
+
+
+def test_single_product_no_few_shot_when_examples_empty():
+    """Backwards-compat: no examples → no extra block in prompt."""
+    from market_monitor.llm_listing_extractor import _build_single_product_system_prompt
+
+    prompt = _build_single_product_system_prompt(
+        game="pokemon", item_kind="sealed_box", few_shot_examples=(),
+    )
+    assert "Recent verified prices" not in prompt
+
+
+def test_extract_price_for_feedback_returns_price_and_title():
+    """Mocks an Ollama JSON response and verifies parsing."""
+    import json
+
+    response_payload = {"message": {"content": json.dumps({"price_jpy": 12500, "title": "Booster Box"})}}
+    extractor = LlmListingExtractor()
+    with patch("urllib.request.urlopen", return_value=_mock_urlopen(json.dumps(response_payload).encode())):
+        out = extractor.extract_price_for_feedback(
+            "<html>some product page</html>",
+            base_url="https://example.com/x",
+            item_title_hint="MEGA アビスアイ",
+            game="pokemon", item_kind="sealed_box",
+        )
+    assert out.price_jpy == 12500
+    assert out.title == "Booster Box"
+    assert out.error is None
+
+
+def test_extract_price_for_feedback_handles_null_price():
+    """When LLM can't find a price it returns null — caller should see None."""
+    import json
+
+    response_payload = {"message": {"content": json.dumps({"price_jpy": None, "title": "Mystery"})}}
+    extractor = LlmListingExtractor()
+    with patch("urllib.request.urlopen", return_value=_mock_urlopen(json.dumps(response_payload).encode())):
+        out = extractor.extract_price_for_feedback(
+            "<html>?</html>",
+            base_url="https://example.com/x",
+        )
+    assert out.price_jpy is None
+    assert out.title == "Mystery"

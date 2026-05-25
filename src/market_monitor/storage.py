@@ -10,7 +10,16 @@ from hashlib import sha1
 from pathlib import Path
 from typing import Any, Iterator
 
-from .models import FairValueEstimate, MarketOffer, TrackedItem, WatchRule, utc_now
+from .models import (
+    DomainTrust,
+    ExtractionExample,
+    FairValueEstimate,
+    MarketOffer,
+    PriceFeedbackEvent,
+    TrackedItem,
+    WatchRule,
+    utc_now,
+)
 
 SCHEMA_BASE = """
 PRAGMA foreign_keys = ON;
@@ -72,6 +81,68 @@ CREATE TABLE IF NOT EXISTS price_snapshots (
     computed_at TEXT NOT NULL,
     FOREIGN KEY (item_id) REFERENCES tracked_items(item_id) ON DELETE CASCADE
 );
+
+-- Self-evolving price-feedback loop (Phase 1).
+-- All three tables are append/upsert friendly; bootstrap is idempotent.
+
+CREATE TABLE IF NOT EXISTS price_feedback_events (
+    feedback_id TEXT PRIMARY KEY,
+    chat_id TEXT,
+    item_id TEXT NOT NULL,
+    game TEXT NOT NULL,
+    item_kind TEXT NOT NULL,
+    original_fair_value_jpy INTEGER,
+    claimed_url TEXT NOT NULL,
+    claimed_domain TEXT NOT NULL,
+    url_hash TEXT NOT NULL,
+    extracted_price_jpy_pass1 INTEGER,
+    extracted_price_jpy_pass2 INTEGER,
+    consistency_pct REAL,
+    consensus_pct REAL,
+    extraction_confidence TEXT NOT NULL,
+    raw_html_gzipped BLOB,
+    llm_notes_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'analyzed',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (item_id) REFERENCES tracked_items(item_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_feedback_chat_url_hash
+    ON price_feedback_events(chat_id, url_hash);
+
+CREATE TABLE IF NOT EXISTS domain_trust (
+    domain_id TEXT PRIMARY KEY,
+    game TEXT NOT NULL,
+    item_kind TEXT NOT NULL,
+    domain TEXT NOT NULL,
+    vote_count INTEGER NOT NULL DEFAULT 0,
+    consensus_success_count INTEGER NOT NULL DEFAULT 0,
+    consensus_fail_count INTEGER NOT NULL DEFAULT 0,
+    bayes_accuracy_score REAL NOT NULL DEFAULT 0.5,
+    suspended INTEGER NOT NULL DEFAULT 0,
+    first_seen_at TEXT NOT NULL,
+    last_extraction_at TEXT NOT NULL,
+    UNIQUE(game, item_kind, domain)
+);
+
+CREATE INDEX IF NOT EXISTS idx_domain_trust_game_kind
+    ON domain_trust(game, item_kind);
+
+CREATE TABLE IF NOT EXISTS extraction_examples (
+    example_id TEXT PRIMARY KEY,
+    game TEXT NOT NULL,
+    item_kind TEXT NOT NULL,
+    domain TEXT NOT NULL,
+    title TEXT NOT NULL,
+    price_jpy INTEGER NOT NULL,
+    captured_from_feedback_id TEXT NOT NULL,
+    captured_at TEXT NOT NULL,
+    FOREIGN KEY (captured_from_feedback_id) REFERENCES price_feedback_events(feedback_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_extraction_examples_game_kind
+    ON extraction_examples(game, item_kind, captured_at DESC);
 """
 
 # Multi-source marketplace tables (Mercari / Rakuma / future Yuyutei et al.).
@@ -782,6 +853,316 @@ class MonitorDatabase:
             ).fetchall()
         return [_row_to_marketplace_hit(row) for row in rows]
 
+    # ── Price-feedback loop helpers (Phase 1) ────────────────────────────────
+
+    _DOMAIN_TRUST_PRIOR_BELIEF = 5
+
+    def find_item(self, item_id: str) -> TrackedItem | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM tracked_items WHERE item_id = ?", (item_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            alias_rows = connection.execute(
+                "SELECT alias FROM item_aliases WHERE item_id = ?", (item_id,)
+            ).fetchall()
+        try:
+            attributes = json.loads(row["attributes_json"] or "{}")
+            if not isinstance(attributes, dict):
+                attributes = {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            attributes = {}
+        return TrackedItem(
+            item_id=row["item_id"],
+            item_type=row["item_type"],
+            category=row["category"],
+            title=row["title"],
+            aliases=tuple(r["alias"] for r in alias_rows),
+            attributes=attributes,
+        )
+
+    def latest_fair_value_for(self, item_id: str) -> int | None:
+        row = self.latest_snapshot(item_id)
+        if row is None:
+            return None
+        try:
+            return int(row["fair_value_jpy"])
+        except (TypeError, ValueError, IndexError, KeyError):
+            return None
+
+    def find_feedback_by_url_hash(
+        self, *, chat_id: str | None, url_hash: str
+    ) -> sqlite3.Row | None:
+        with self.connect() as connection:
+            return connection.execute(
+                "SELECT * FROM price_feedback_events WHERE chat_id IS ? AND url_hash = ? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (chat_id, url_hash),
+            ).fetchone()
+
+    def save_price_feedback(self, event: PriceFeedbackEvent) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO price_feedback_events (
+                    feedback_id, chat_id, item_id, game, item_kind,
+                    original_fair_value_jpy, claimed_url, claimed_domain, url_hash,
+                    extracted_price_jpy_pass1, extracted_price_jpy_pass2,
+                    consistency_pct, consensus_pct, extraction_confidence,
+                    raw_html_gzipped, llm_notes_json, status,
+                    created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event.feedback_id,
+                    event.chat_id,
+                    event.item_id,
+                    event.game,
+                    event.item_kind,
+                    event.original_fair_value_jpy,
+                    event.claimed_url,
+                    event.claimed_domain,
+                    event.url_hash,
+                    event.extracted_price_jpy_pass1,
+                    event.extracted_price_jpy_pass2,
+                    event.consistency_pct,
+                    event.consensus_pct,
+                    event.extraction_confidence,
+                    event.raw_html_gzipped,
+                    event.llm_notes_json,
+                    event.status,
+                    event.created_at.isoformat()
+                        if isinstance(event.created_at, datetime)
+                        else event.created_at,
+                    event.updated_at.isoformat()
+                        if isinstance(event.updated_at, datetime)
+                        else event.updated_at,
+                ),
+            )
+
+    def seed_domain_trust_from_reference_sources(
+        self,
+        entries: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+        *,
+        item_kinds: tuple[str, ...] = ("card", "sealed_box"),
+        default_score: float = 0.5,
+    ) -> int:
+        """One-shot idempotent seed of `domain_trust` from a parsed
+        `reference_sources.json` payload. Each entry × game × item_kind →
+        one INSERT OR IGNORE row using `trust_score` (if present) as the
+        initial bayes_accuracy_score. Entries with `price_weight == 0`
+        (metadata-only sources) are skipped — they're not price references.
+
+        Returns the count of entries considered (idempotency-friendly: rows
+        already present are silently ignored)."""
+        from urllib.parse import urlparse
+        seeded = 0
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                weight = float(entry.get("price_weight", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                weight = 0.0
+            if weight <= 0:
+                continue
+            url = str(entry.get("url") or "").strip()
+            if not url:
+                continue
+            try:
+                domain = urlparse(url).netloc
+            except Exception:
+                continue
+            if not domain:
+                continue
+            try:
+                score = float(entry.get("trust_score") or default_score)
+            except (TypeError, ValueError):
+                score = default_score
+            games = entry.get("games") or ()
+            if not isinstance(games, (list, tuple)):
+                continue
+            for game in games:
+                for item_kind in item_kinds:
+                    self.upsert_domain_trust_seed(
+                        game=str(game),
+                        item_kind=item_kind,
+                        domain=domain,
+                        initial_score=score,
+                    )
+                    seeded += 1
+        return seeded
+
+    def upsert_domain_trust_seed(
+        self,
+        *,
+        game: str,
+        item_kind: str,
+        domain: str,
+        initial_score: float = 0.5,
+    ) -> None:
+        """Seed a domain_trust row from external config (e.g. reference_sources.json).
+        Idempotent: existing rows are left untouched (vote counts shouldn't reset)."""
+        domain_id = self._domain_id(game=game, item_kind=item_kind, domain=domain)
+        now = utc_now().isoformat()
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO domain_trust (
+                    domain_id, game, item_kind, domain,
+                    vote_count, consensus_success_count, consensus_fail_count,
+                    bayes_accuracy_score, suspended,
+                    first_seen_at, last_extraction_at
+                )
+                VALUES (?, ?, ?, ?, 0, 0, 0, ?, 0, ?, ?)
+                """,
+                (domain_id, game, item_kind, domain, float(initial_score), now, now),
+            )
+
+    def bump_domain_trust(
+        self,
+        *,
+        game: str,
+        item_kind: str,
+        domain: str,
+        success: bool,
+    ) -> DomainTrust:
+        """Atomically increment counters for (game, item_kind, domain) and
+        recompute bayes_accuracy_score. Creates the row if it doesn't exist.
+        Returns the updated trust record."""
+        domain_id = self._domain_id(game=game, item_kind=item_kind, domain=domain)
+        now = utc_now().isoformat()
+        prior = self._DOMAIN_TRUST_PRIOR_BELIEF
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO domain_trust (
+                    domain_id, game, item_kind, domain,
+                    vote_count, consensus_success_count, consensus_fail_count,
+                    bayes_accuracy_score, suspended,
+                    first_seen_at, last_extraction_at
+                )
+                VALUES (?, ?, ?, ?, 0, 0, 0, 0.5, 0, ?, ?)
+                ON CONFLICT(domain_id) DO NOTHING
+                """,
+                (domain_id, game, item_kind, domain, now, now),
+            )
+            success_inc = 1 if success else 0
+            fail_inc = 0 if success else 1
+            connection.execute(
+                """
+                UPDATE domain_trust
+                SET vote_count = vote_count + 1,
+                    consensus_success_count = consensus_success_count + ?,
+                    consensus_fail_count = consensus_fail_count + ?,
+                    last_extraction_at = ?
+                WHERE domain_id = ?
+                """,
+                (success_inc, fail_inc, now, domain_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM domain_trust WHERE domain_id = ?", (domain_id,)
+            ).fetchone()
+            successes = int(row["consensus_success_count"])
+            fails = int(row["consensus_fail_count"])
+            bayes = (successes * 1.0 + prior * 0.5) / (successes + fails + prior)
+            connection.execute(
+                "UPDATE domain_trust SET bayes_accuracy_score = ? WHERE domain_id = ?",
+                (bayes, domain_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM domain_trust WHERE domain_id = ?", (domain_id,)
+            ).fetchone()
+        return _row_to_domain_trust(row)
+
+    def list_learned_reference_sites(
+        self,
+        *,
+        game: str,
+        item_kind: str,
+        limit: int = 5,
+        min_score: float = 0.5,
+        min_votes: int = 1,
+    ) -> list[DomainTrust]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM domain_trust
+                WHERE game = ? AND item_kind = ?
+                  AND suspended = 0
+                  AND bayes_accuracy_score >= ?
+                  AND vote_count >= ?
+                ORDER BY bayes_accuracy_score DESC, vote_count DESC, last_extraction_at DESC
+                LIMIT ?
+                """,
+                (game, item_kind, float(min_score), int(min_votes), int(limit)),
+            ).fetchall()
+        return [_row_to_domain_trust(row) for row in rows]
+
+    def save_extraction_example(self, example: ExtractionExample) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO extraction_examples (
+                    example_id, game, item_kind, domain, title, price_jpy,
+                    captured_from_feedback_id, captured_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    example.example_id,
+                    example.game,
+                    example.item_kind,
+                    example.domain,
+                    example.title,
+                    example.price_jpy,
+                    example.captured_from_feedback_id,
+                    example.captured_at.isoformat()
+                        if isinstance(example.captured_at, datetime)
+                        else example.captured_at,
+                ),
+            )
+
+    def recent_extraction_examples(
+        self, *, game: str, item_kind: str, limit: int = 3
+    ) -> list[ExtractionExample]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM extraction_examples
+                WHERE game = ? AND item_kind = ?
+                ORDER BY captured_at DESC
+                LIMIT ?
+                """,
+                (game, item_kind, int(limit)),
+            ).fetchall()
+        return [_row_to_extraction_example(row) for row in rows]
+
+    # ── Hash helpers for the price-feedback tables ───────────────────────────
+
+    @staticmethod
+    def _feedback_id(
+        *, item_id: str, chat_id: str | None, url_hash: str, created_at: str
+    ) -> str:
+        payload = "|".join([item_id, chat_id or "", url_hash, created_at])
+        return sha1(payload.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _domain_id(*, game: str, item_kind: str, domain: str) -> str:
+        payload = "|".join([game, item_kind, domain.lower().strip()])
+        return sha1(payload.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _example_id(feedback_id: str) -> str:
+        return sha1(("example|" + feedback_id).encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _url_hash(url: str) -> str:
+        normalized = url.strip().lower().rstrip("/")
+        return sha1(normalized.encode("utf-8")).hexdigest()
+
     @staticmethod
     def _offer_id(item_id: str, offer: MarketOffer) -> str:
         payload = "|".join(
@@ -873,4 +1254,40 @@ def _row_to_marketplace_hit(row: sqlite3.Row) -> MarketplaceHit:
         notified=bool(row["notified"]),
         stock_count=int(stock_raw) if stock_raw is not None else None,
         listing_kind=listing_kind,
+    )
+
+
+def _parse_dt(value: str) -> datetime:
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return utc_now()
+
+
+def _row_to_domain_trust(row: sqlite3.Row) -> DomainTrust:
+    return DomainTrust(
+        domain_id=row["domain_id"],
+        game=row["game"],
+        item_kind=row["item_kind"],
+        domain=row["domain"],
+        vote_count=int(row["vote_count"]),
+        consensus_success_count=int(row["consensus_success_count"]),
+        consensus_fail_count=int(row["consensus_fail_count"]),
+        bayes_accuracy_score=float(row["bayes_accuracy_score"]),
+        suspended=bool(row["suspended"]),
+        first_seen_at=_parse_dt(row["first_seen_at"]),
+        last_extraction_at=_parse_dt(row["last_extraction_at"]),
+    )
+
+
+def _row_to_extraction_example(row: sqlite3.Row) -> ExtractionExample:
+    return ExtractionExample(
+        example_id=row["example_id"],
+        game=row["game"],
+        item_kind=row["item_kind"],
+        domain=row["domain"],
+        title=row["title"],
+        price_jpy=int(row["price_jpy"]),
+        captured_from_feedback_id=row["captured_from_feedback_id"],
+        captured_at=_parse_dt(row["captured_at"]),
     )

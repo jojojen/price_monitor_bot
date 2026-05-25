@@ -399,3 +399,161 @@ def test_v1_to_v2_remaps_hits_watch_id(tmp_path: Path) -> None:
     assert len(hits) == 1
     assert hits[0].source == "mercari"
     assert hits[0].source_item_id == "m1"
+
+
+# ── Price-feedback loop tables (Phase 1) ────────────────────────────────────
+
+
+def _make_item(item_id: str = "tcg-fb-1") -> TrackedItem:
+    return TrackedItem(
+        item_id=item_id,
+        item_type="tcg_sealed_box",
+        category="tcg",
+        title="MEGA アビスアイ",
+        attributes={"game": "pokemon", "item_kind": "sealed_box"},
+    )
+
+
+def test_save_and_find_feedback_event(tmp_path: Path) -> None:
+    from market_monitor.models import PriceFeedbackEvent, utc_now
+    db = MonitorDatabase(tmp_path / "fb.sqlite3")
+    db.bootstrap()
+    item = _make_item()
+    db.upsert_item(item)
+    now = utc_now()
+    event = PriceFeedbackEvent(
+        feedback_id="fbk-001",
+        chat_id="12345",
+        item_id=item.item_id,
+        game="pokemon",
+        item_kind="sealed_box",
+        original_fair_value_jpy=16800,
+        claimed_url="https://yuyu-tei.jp/sealed/abc",
+        claimed_domain="yuyu-tei.jp",
+        url_hash="abc123",
+        extracted_price_jpy_pass1=16500,
+        extracted_price_jpy_pass2=17100,
+        consistency_pct=3.6,
+        consensus_pct=0.0,
+        extraction_confidence="high",
+        raw_html_gzipped=b"\x1f\x8b\x08\x00fakegzip",
+        llm_notes_json='{"pass1": {"price_jpy": 16500}}',
+        status="analyzed",
+        created_at=now, updated_at=now,
+    )
+    db.save_price_feedback(event)
+    found = db.find_feedback_by_url_hash(chat_id="12345", url_hash="abc123")
+    assert found is not None
+    assert found["feedback_id"] == "fbk-001"
+    assert found["extraction_confidence"] == "high"
+
+
+def test_bump_domain_trust_creates_then_updates(tmp_path: Path) -> None:
+    db = MonitorDatabase(tmp_path / "fb.sqlite3")
+    db.bootstrap()
+
+    # First bump: creates row, succeeds
+    t1 = db.bump_domain_trust(
+        game="pokemon", item_kind="sealed_box", domain="yuyu-tei.jp", success=True,
+    )
+    assert t1.vote_count == 1
+    assert t1.consensus_success_count == 1
+    assert t1.consensus_fail_count == 0
+    # Bayes with prior_belief=5: (1*1 + 5*0.5) / (1+0+5) = 3.5/6 = 0.583
+    assert abs(t1.bayes_accuracy_score - (3.5 / 6.0)) < 0.001
+
+    # Three more successes
+    for _ in range(3):
+        db.bump_domain_trust(
+            game="pokemon", item_kind="sealed_box", domain="yuyu-tei.jp", success=True,
+        )
+    # One failure
+    t2 = db.bump_domain_trust(
+        game="pokemon", item_kind="sealed_box", domain="yuyu-tei.jp", success=False,
+    )
+    # 4 succ, 1 fail, prior 5 → (4 + 2.5) / (4 + 1 + 5) = 6.5/10 = 0.65
+    assert t2.vote_count == 5
+    assert t2.consensus_success_count == 4
+    assert t2.consensus_fail_count == 1
+    assert abs(t2.bayes_accuracy_score - 0.65) < 0.001
+
+
+def test_list_learned_reference_sites_filters_by_votes_and_score(tmp_path: Path) -> None:
+    db = MonitorDatabase(tmp_path / "fb.sqlite3")
+    db.bootstrap()
+    # one promoted domain (votes >= 1, score >= 0.5)
+    db.bump_domain_trust(
+        game="pokemon", item_kind="sealed_box", domain="good.example", success=True,
+    )
+    # one seeded-only domain (vote_count == 0) — should NOT surface
+    db.upsert_domain_trust_seed(
+        game="pokemon", item_kind="sealed_box", domain="seed-only.example", initial_score=0.9,
+    )
+    rows = db.list_learned_reference_sites(
+        game="pokemon", item_kind="sealed_box", limit=10,
+    )
+    domains = [r.domain for r in rows]
+    assert "good.example" in domains
+    assert "seed-only.example" not in domains  # zero votes filter
+
+
+def test_extraction_examples_returns_most_recent_first(tmp_path: Path) -> None:
+    from market_monitor.models import ExtractionExample, utc_now
+    from datetime import timedelta
+    db = MonitorDatabase(tmp_path / "fb.sqlite3")
+    db.bootstrap()
+    item = _make_item()
+    db.upsert_item(item)
+    # Need feedback rows for FK
+    base = utc_now()
+    for idx, (price, age_s) in enumerate(((1000, 300), (2000, 200), (3000, 100))):
+        ts = base - timedelta(seconds=age_s)
+        # Quick-and-dirty feedback row so the FK is satisfied
+        from market_monitor.models import PriceFeedbackEvent
+        db.save_price_feedback(PriceFeedbackEvent(
+            feedback_id=f"fbk-{idx}", chat_id=None,
+            item_id=item.item_id, game="pokemon", item_kind="sealed_box",
+            original_fair_value_jpy=None, claimed_url="https://x", claimed_domain="x",
+            url_hash=f"h{idx}",
+            extracted_price_jpy_pass1=price, extracted_price_jpy_pass2=price,
+            consistency_pct=0.0, consensus_pct=None, extraction_confidence="high",
+            raw_html_gzipped=None, llm_notes_json="{}", status="analyzed",
+            created_at=ts, updated_at=ts,
+        ))
+        db.save_extraction_example(ExtractionExample(
+            example_id=f"ex-{idx}", game="pokemon", item_kind="sealed_box",
+            domain="x", title=f"title-{idx}", price_jpy=price,
+            captured_from_feedback_id=f"fbk-{idx}", captured_at=ts,
+        ))
+    examples = db.recent_extraction_examples(game="pokemon", item_kind="sealed_box", limit=2)
+    assert len(examples) == 2
+    # Most-recent first → price 3000 then 2000
+    assert examples[0].price_jpy == 3000
+    assert examples[1].price_jpy == 2000
+
+
+def test_seed_domain_trust_from_reference_sources_idempotent(tmp_path: Path) -> None:
+    db = MonitorDatabase(tmp_path / "fb.sqlite3")
+    db.bootstrap()
+    entries = [
+        {"id": "yt", "url": "https://yuyu-tei.jp/", "games": ["pokemon"],
+         "trust_score": 0.93, "price_weight": 0.9},
+        {"id": "meta", "url": "https://pokemon-card.com/", "games": ["pokemon"],
+         "trust_score": 1.0, "price_weight": 0.0},  # metadata-only — should skip
+    ]
+    n1 = db.seed_domain_trust_from_reference_sources(entries)
+    n2 = db.seed_domain_trust_from_reference_sources(entries)  # idempotent
+    rows = db.list_learned_reference_sites(
+        game="pokemon", item_kind="sealed_box", min_votes=0, limit=20,
+    )
+    domains = {r.domain for r in rows}
+    assert "yuyu-tei.jp" in domains
+    assert "pokemon-card.com" not in domains
+    # n1 considered both item_kinds for one entry (card + sealed_box) → 2 rows
+    assert n1 == 2
+    assert n2 == 2  # same value (entries considered), but no extra rows created
+    # Confirm card kind also seeded
+    rows_card = db.list_learned_reference_sites(
+        game="pokemon", item_kind="card", min_votes=0, limit=20,
+    )
+    assert "yuyu-tei.jp" in {r.domain for r in rows_card}
