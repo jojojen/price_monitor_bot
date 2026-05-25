@@ -45,6 +45,11 @@ def _build_sealed_box_lookup_terms(spec: TcgCardSpec) -> tuple[str, ...]:
             terms.append(keyword)
             if spec.game == "pokemon":
                 terms.extend(_pokemon_title_variants(keyword))
+                # Japanese Pokemon boxes prefix set names with either "メガ"
+                # (katakana) or "MEGA" (English). Vision LLMs sometimes
+                # return one form and the store indexes the other — fan out
+                # both spellings + the base set-name without any prefix.
+                terms.extend(_pokemon_mega_prefix_variants(keyword))
             terms.extend(_sealed_box_ascii_token_variants(keyword))
 
     if spec.set_code:
@@ -70,6 +75,48 @@ def _build_sealed_box_lookup_terms(spec: TcgCardSpec) -> tuple[str, ...]:
         cleaned = term.strip()
         if cleaned and cleaned not in deduped:
             deduped.append(cleaned)
+    return tuple(deduped)
+
+
+_MEGA_PREFIX_KATAKANA = "メガ"
+_MEGA_PREFIX_ROMAN = "MEGA"
+
+
+def _pokemon_mega_prefix_variants(title: str) -> tuple[str, ...]:
+    """For a Pokemon sealed-box title starting with メガ or MEGA, emit the
+    other spelling plus the bare set name (without the MEGA / メガ prefix).
+    Stores label these boxes inconsistently — fan out so the search clients
+    have a chance of matching.
+
+    Examples:
+      メガアビスアイ      → ("MEGA アビスアイ", "アビスアイ")
+      MEGAアビスアイ      → ("メガアビスアイ", "アビスアイ", "MEGA アビスアイ")
+      MEGA アビスアイ     → ("メガアビスアイ", "アビスアイ", "MEGAアビスアイ")
+      ハイクラスパック    → ()   (no MEGA/メガ prefix — no expansion)
+    """
+    cleaned = (title or "").strip()
+    if not cleaned:
+        return ()
+    variants: list[str] = []
+    # Katakana prefix → Roman equivalents
+    if cleaned.startswith(_MEGA_PREFIX_KATAKANA):
+        remainder = cleaned[len(_MEGA_PREFIX_KATAKANA):].lstrip()
+        if remainder:
+            variants.append(f"{_MEGA_PREFIX_ROMAN} {remainder}")
+            variants.append(f"{_MEGA_PREFIX_ROMAN}{remainder}")
+            variants.append(remainder)
+    # Roman prefix → katakana equivalent + bare set name
+    elif cleaned.upper().startswith(_MEGA_PREFIX_ROMAN):
+        remainder = cleaned[len(_MEGA_PREFIX_ROMAN):].lstrip()
+        if remainder:
+            variants.append(f"{_MEGA_PREFIX_KATAKANA}{remainder}")
+            variants.append(f"{_MEGA_PREFIX_ROMAN} {remainder}")
+            variants.append(remainder)
+    deduped: list[str] = []
+    for v in variants:
+        v = v.strip()
+        if v and v != cleaned and v not in deduped:
+            deduped.append(v)
     return tuple(deduped)
 
 

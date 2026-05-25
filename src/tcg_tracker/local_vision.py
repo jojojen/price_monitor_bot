@@ -370,11 +370,13 @@ class OllamaLocalVisionClient:
             "Valid title shapes for Pokemon sealed boxes include all of these (return EXACTLY what is printed):\n"
             "  - A Japanese product-line phrase: e.g. 強化拡張パック / 拡張パック / ハイクラスパック / プレミアムトレーナーボックス\n"
             "  - A short numeric set token like \"151\" when that is the only big title text on the box front\n"
-            "  - A katakana set name like メガアビスアイ / メガブレイブ / バイオレットex\n"
             "  - A combined phrase like ポケモンカード151 or 強化拡張パック ポケモンカード151\n"
+            "  - A box-front set name. Boxes that print MEGA / SUPER / GIGA in English keep those words in English: prefer \"MEGA アビスアイ\" or \"MEGA ブレイブ\" (with English MEGA + space + katakana set name) over \"メガアビスアイ\" — that matches the printed text on the box and how marketplaces index the product.\n"
+            "  - Katakana-only forms like バイオレットex (when the entire title is katakana on the box front).\n"
             "Do NOT expand a numeric token like \"151\" into a longer guessed product line.\n"
             "Do NOT invent set names from prior knowledge (e.g. never output VSTAR Universe, VSTAR Unlimited, etc., unless those exact words are clearly printed on the box).\n"
             "If only a partial title fragment is clearly visible, return that exact fragment as title instead of inventing missing words.\n"
+            "Preserve the original Roman vs katakana distinction the box uses — do not transliterate MEGA → メガ or vice versa.\n"
             'Use item_kind values "sealed_box" or null.\n'
             'Use game values "pokemon", "ws", or null.\n'
             "aliases should contain only high-confidence alternate names.\n"
