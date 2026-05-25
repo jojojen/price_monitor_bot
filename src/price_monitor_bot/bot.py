@@ -80,16 +80,18 @@ UNWATCH_COMMANDS = {"/unwatch", "/stopwatch"}
 _MARKETPLACE_SOURCE_DISPLAY: dict[str, tuple[str, str]] = {
     "mercari": ("Mercari", "🛒"),
     "rakuma": ("Rakuma", "🟣"),
+    "yuyutei": ("遊々亭", "📚"),
 }
 
 # The default set of markets a new /watch covers when the user doesn't pin
 # the subset. Future markets get added here so existing users automatically
 # pick them up.
-DEFAULT_MARKETS: tuple[str, ...] = ("mercari", "rakuma")
+DEFAULT_MARKETS: tuple[str, ...] = ("mercari", "rakuma", "yuyutei")
 # Aliases users may type for each canonical market id.
 _MARKET_ALIASES: dict[str, str] = {
     "mercari": "mercari", "メルカリ": "mercari",
     "rakuma": "rakuma", "ラクマ": "rakuma", "フリル": "rakuma", "fril": "rakuma",
+    "yuyutei": "yuyutei", "遊々亭": "yuyutei", "yuyu亭": "yuyutei", "yuyu-tei": "yuyutei",
 }
 
 
