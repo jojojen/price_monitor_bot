@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .models import (
+    CardImageFingerprint,
     DomainTrust,
     ExtractionExample,
     FairValueEstimate,
@@ -143,6 +144,33 @@ CREATE TABLE IF NOT EXISTS extraction_examples (
 
 CREATE INDEX IF NOT EXISTS idx_extraction_examples_game_kind
     ON extraction_examples(game, item_kind, captured_at DESC);
+
+-- Layer 1 of the proactive recognition cache: perceptual-hash fingerprints
+-- of known product images. Populated by the trend-driven crawler and by
+-- every successful image lookup. Queried at image-arrival time to short-
+-- circuit the OCR / vision LLM pipeline.
+
+CREATE TABLE IF NOT EXISTS card_image_fingerprints (
+    fingerprint_id      TEXT PRIMARY KEY,
+    game                TEXT NOT NULL,
+    item_kind           TEXT NOT NULL,
+    title               TEXT NOT NULL,
+    card_number         TEXT,
+    rarity              TEXT,
+    set_code            TEXT,
+    source_url          TEXT NOT NULL,
+    image_url           TEXT NOT NULL,
+    perceptual_hash     TEXT NOT NULL,
+    fingerprint_algo    TEXT NOT NULL DEFAULT 'dhash',
+    confidence_source   TEXT NOT NULL DEFAULT 'crawl',
+    captured_at         TEXT NOT NULL,
+    last_seen_at        TEXT NOT NULL,
+    UNIQUE(perceptual_hash, fingerprint_algo)
+);
+CREATE INDEX IF NOT EXISTS idx_card_image_fp_game_kind
+    ON card_image_fingerprints(game, item_kind);
+CREATE INDEX IF NOT EXISTS idx_card_image_fp_algo_hash
+    ON card_image_fingerprints(fingerprint_algo, perceptual_hash);
 """
 
 # Multi-source marketplace tables (Mercari / Rakuma / future Yuyutei et al.).
@@ -1140,6 +1168,71 @@ class MonitorDatabase:
             ).fetchall()
         return [_row_to_extraction_example(row) for row in rows]
 
+    # ── Card image fingerprints (perceptual-hash cache) ──────────────────────
+
+    def upsert_card_image_fingerprint(self, fp: CardImageFingerprint) -> None:
+        """Insert a fingerprint, or refresh `last_seen_at` if an entry with
+        the same `(perceptual_hash, fingerprint_algo)` already exists. We
+        keep the original metadata on duplicates — same image always points
+        at the same product."""
+        with self.connect() as connection:
+            existing = connection.execute(
+                "SELECT fingerprint_id FROM card_image_fingerprints "
+                "WHERE perceptual_hash = ? AND fingerprint_algo = ?",
+                (fp.perceptual_hash, fp.fingerprint_algo),
+            ).fetchone()
+            now = utc_now().isoformat()
+            if existing is not None:
+                connection.execute(
+                    "UPDATE card_image_fingerprints SET last_seen_at = ? WHERE fingerprint_id = ?",
+                    (now, existing["fingerprint_id"]),
+                )
+                return
+            connection.execute(
+                """
+                INSERT INTO card_image_fingerprints (
+                    fingerprint_id, game, item_kind, title, card_number, rarity, set_code,
+                    source_url, image_url, perceptual_hash, fingerprint_algo,
+                    confidence_source, captured_at, last_seen_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    fp.fingerprint_id, fp.game, fp.item_kind, fp.title, fp.card_number,
+                    fp.rarity, fp.set_code, fp.source_url, fp.image_url,
+                    fp.perceptual_hash, fp.fingerprint_algo, fp.confidence_source,
+                    fp.captured_at.isoformat() if isinstance(fp.captured_at, datetime) else fp.captured_at,
+                    fp.last_seen_at.isoformat() if isinstance(fp.last_seen_at, datetime) else fp.last_seen_at,
+                ),
+            )
+
+    def list_card_image_fingerprints(
+        self,
+        *,
+        game: str | None = None,
+        item_kind: str | None = None,
+        fingerprint_algo: str = "dhash",
+    ) -> list[CardImageFingerprint]:
+        clauses = ["fingerprint_algo = ?"]
+        args: list = [fingerprint_algo]
+        if game is not None:
+            clauses.append("game = ?")
+            args.append(game)
+        if item_kind is not None:
+            clauses.append("item_kind = ?")
+            args.append(item_kind)
+        where = " AND ".join(clauses)
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM card_image_fingerprints WHERE {where}",
+                args,
+            ).fetchall()
+        return [_row_to_card_image_fingerprint(row) for row in rows]
+
+    @staticmethod
+    def _fingerprint_id(perceptual_hash: str, algo: str) -> str:
+        return sha1(f"{algo}|{perceptual_hash}".encode("utf-8")).hexdigest()
+
     # ── Hash helpers for the price-feedback tables ───────────────────────────
 
     @staticmethod
@@ -1277,6 +1370,25 @@ def _row_to_domain_trust(row: sqlite3.Row) -> DomainTrust:
         suspended=bool(row["suspended"]),
         first_seen_at=_parse_dt(row["first_seen_at"]),
         last_extraction_at=_parse_dt(row["last_extraction_at"]),
+    )
+
+
+def _row_to_card_image_fingerprint(row: sqlite3.Row) -> CardImageFingerprint:
+    return CardImageFingerprint(
+        fingerprint_id=row["fingerprint_id"],
+        game=row["game"],
+        item_kind=row["item_kind"],
+        title=row["title"],
+        card_number=row["card_number"],
+        rarity=row["rarity"],
+        set_code=row["set_code"],
+        source_url=row["source_url"],
+        image_url=row["image_url"],
+        perceptual_hash=row["perceptual_hash"],
+        fingerprint_algo=row["fingerprint_algo"],
+        confidence_source=row["confidence_source"],
+        captured_at=_parse_dt(row["captured_at"]),
+        last_seen_at=_parse_dt(row["last_seen_at"]),
     )
 
 

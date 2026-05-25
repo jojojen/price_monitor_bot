@@ -115,3 +115,28 @@ class ExtractionExample:
     price_jpy: int
     captured_from_feedback_id: str
     captured_at: datetime = field(default_factory=utc_now)
+
+
+# Layer 1 of the proactive image-recognition cache: perceptual-hash fingerprints
+# of known product images. Populated by:
+#   (a) crawler (Layer 2 — snkrdunk ranking, /trend hot cards) — confidence_source="crawl"
+#   (b) successful image lookups — confidence_source="user_resolved"
+ConfidenceSource = Literal["crawl", "user_resolved", "verified"]
+
+
+@dataclass(frozen=True, slots=True)
+class CardImageFingerprint:
+    fingerprint_id: str
+    game: str
+    item_kind: str
+    title: str
+    card_number: str | None
+    rarity: str | None
+    set_code: str | None
+    source_url: str         # where we found the product (e.g. snkrdunk product page)
+    image_url: str          # direct URL of the image hashed
+    perceptual_hash: str    # hex string; dhash 64-bit = 16 hex chars
+    fingerprint_algo: str = "dhash"
+    confidence_source: ConfidenceSource = "crawl"
+    captured_at: datetime = field(default_factory=utc_now)
+    last_seen_at: datetime = field(default_factory=utc_now)

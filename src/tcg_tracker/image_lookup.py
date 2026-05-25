@@ -278,12 +278,134 @@ class TcgImagePriceService:
                 )
 
         status = "success" if result.offers else "partial"
-        return TcgImageLookupOutcome(
+        outcome = TcgImageLookupOutcome(
             status=status,
             parsed=parsed,
             lookup_result=result,
             warnings=parsed.warnings,
         )
+        # Learn from this resolution: store the user's image hash so future
+        # queries of the same image (e.g. user re-sends, or a similar phone
+        # photo) hit the fast path.
+        self._persist_fingerprint_after_resolve(Path(image_path), outcome)
+        return outcome
+
+    def _try_fingerprint_fast_path(
+        self,
+        image_path: Path,
+        *,
+        game_hint: str | None,
+        item_kind_hint: str | None,
+    ) -> ParsedCardImage | None:
+        """Hash the input image, scan `card_image_fingerprints`, and if we
+        find a sufficiently close match return a fully-resolved ParsedCardImage
+        that skips OCR / vision LLM. Returns None on miss / any error so
+        the slow path keeps working."""
+        try:
+            from .image_fingerprint import (
+                DEFAULT_ALGO, HAMMING_RELAXED, compute_dhash, nearest_fingerprints,
+            )
+            from market_monitor.storage import MonitorDatabase
+        except Exception as exc:
+            logger.debug("Fingerprint fast-path unavailable (imports failed): %s", exc)
+            return None
+
+        target_hash = compute_dhash(image_path=image_path)
+        if not target_hash:
+            return None
+
+        try:
+            db = MonitorDatabase(self._db_path)
+            db.bootstrap()  # idempotent
+            candidates = db.list_card_image_fingerprints(
+                game=game_hint, item_kind=item_kind_hint, fingerprint_algo=DEFAULT_ALGO,
+            )
+            # Fallback to game-wide scan if game-filtered set is empty — covers
+            # the case where caller didn't pass a hint
+            if not candidates:
+                candidates = db.list_card_image_fingerprints(fingerprint_algo=DEFAULT_ALGO)
+        except Exception as exc:
+            logger.warning("Fingerprint DB scan failed; falling through to slow path: %s", exc)
+            return None
+
+        matches = nearest_fingerprints(candidates, target_hash, hamming_max=HAMMING_RELAXED, limit=1)
+        if not matches:
+            return None
+        top = matches[0]
+        rec = top.record
+        warning = (
+            f"Image fingerprint match (algo={DEFAULT_ALGO}, hamming={top.hamming}, "
+            f"confidence={top.confidence}, source={rec.confidence_source})."
+        )
+        logger.info(
+            "Fingerprint fast-path hit image=%s title=%r hamming=%d source=%s",
+            image_path, rec.title, top.hamming, rec.confidence_source,
+        )
+        return ParsedCardImage(
+            status="success",
+            game=rec.game,
+            title=rec.title,
+            aliases=(),
+            card_number=rec.card_number,
+            rarity=rec.rarity,
+            set_code=rec.set_code,
+            item_kind=rec.item_kind,
+            raw_text="",
+            extracted_lines=(),
+            warnings=(warning,),
+            confidence=(0.99 if top.confidence == "strict" else 0.85),
+        )
+
+    def _persist_fingerprint_after_resolve(
+        self,
+        image_path: Path,
+        outcome: "TcgImageLookupOutcome",
+    ) -> None:
+        """After a successful slow-path resolve, store the image hash so
+        the next query of the same image hits the fast path. Confidence
+        source = user_resolved (lower than crawl-verified but real signal)."""
+        if outcome.status != "success" or outcome.lookup_result is None:
+            return
+        spec = outcome.lookup_result.spec
+        if not spec.title:
+            return
+        try:
+            from .image_fingerprint import DEFAULT_ALGO, compute_dhash
+            from market_monitor.models import CardImageFingerprint, utc_now
+            from market_monitor.storage import MonitorDatabase
+        except Exception:
+            return
+        target_hash = compute_dhash(image_path=image_path)
+        if not target_hash:
+            return
+        try:
+            db = MonitorDatabase(self._db_path)
+            db.bootstrap()
+            now = utc_now()
+            fingerprint_id = MonitorDatabase._fingerprint_id(target_hash, DEFAULT_ALGO)
+            fp = CardImageFingerprint(
+                fingerprint_id=fingerprint_id,
+                game=spec.game,
+                item_kind=spec.item_kind,
+                title=spec.title,
+                card_number=spec.card_number,
+                rarity=spec.rarity,
+                set_code=spec.set_code,
+                source_url=f"user_image://{image_path.name}",
+                image_url=f"user_image://{image_path.name}",
+                perceptual_hash=target_hash,
+                fingerprint_algo=DEFAULT_ALGO,
+                confidence_source="user_resolved",
+                captured_at=now,
+                last_seen_at=now,
+            )
+            db.upsert_card_image_fingerprint(fp)
+            logger.info(
+                "Fingerprint persisted hash=%s title=%r source=user_resolved",
+                target_hash, spec.title,
+            )
+        except Exception as exc:
+            logger.warning("Failed to persist fingerprint: %s", exc)
 
     def _should_run_sanity_check(
         self,
@@ -358,6 +480,19 @@ class TcgImagePriceService:
         resolved_game_hint = game_hint or hint_game
         resolved_title_hint = title_hint or hint_title
         path_title_hint = _derive_title_hint_from_path(resolved_path)
+
+        # Fast path: perceptual-hash cache. If we've seen this image (or one
+        # close to it from the trend-driven crawler), skip OCR / vision LLM
+        # entirely and return the cached metadata. Trades ~5ms hashing + a
+        # brute-force scan of card_image_fingerprints for the ~15-25s vision
+        # pipeline.
+        fingerprint_hit = self._try_fingerprint_fast_path(
+            resolved_path,
+            game_hint=resolved_game_hint,
+            item_kind_hint=item_kind_hint,
+        )
+        if fingerprint_hit is not None:
+            return fingerprint_hit
 
         if self._tesseract_path is None and not self._local_vision_clients:
             warning = (

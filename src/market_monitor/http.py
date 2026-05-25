@@ -81,6 +81,76 @@ class HttpClient:
                 return curl_text
             raise
 
+    def get_bytes(
+        self,
+        url: str,
+        *,
+        params: dict[str, str | list[str]] | None = None,
+        headers: dict[str, str] | None = None,
+        timeout_seconds: int | None = None,
+    ) -> bytes:
+        """Binary counterpart to ``get_text``. Uses the same urllib + curl
+        fallback path, but never decodes the payload. Needed for image
+        downloads (perceptual-hash crawler, etc.)."""
+        target = url
+        if params:
+            query = urlencode(params, doseq=True)
+            separator = "&" if "?" in url else "?"
+            target = f"{url}{separator}{query}"
+
+        request_headers = {
+            "User-Agent": self.user_agent,
+            "Accept-Language": "ja-JP,ja;q=0.9",
+            "Cache-Control": "no-cache",
+        }
+        if headers:
+            request_headers.update(headers)
+
+        request = Request(target, headers=request_headers)
+        effective_timeout = timeout_seconds if timeout_seconds is not None else self.timeout_seconds
+        logger.debug("HTTP GET (bytes) target=%s timeout_seconds=%s", target, effective_timeout)
+        try:
+            with urlopen(request, timeout=effective_timeout, context=self.ssl_context) as response:
+                payload = response.read()
+                logger.debug(
+                    "HTTP GET (bytes) completed target=%s status=%s bytes=%s",
+                    target,
+                    getattr(response, "status", "unknown"),
+                    len(payload),
+                )
+                return payload
+        except _TRANSIENT_HTTP_EXCEPTIONS as exc:
+            if isinstance(exc, HTTPError):
+                logger.warning("HTTP GET (bytes) failed target=%s status=%s; trying curl fallback", target, exc.code)
+            else:
+                logger.warning("HTTP GET (bytes) failed target=%s error=%s; trying curl fallback", target, exc)
+            curl_bytes = self._get_bytes_with_curl(target=target, headers=request_headers, timeout=effective_timeout)
+            if curl_bytes is not None:
+                return curl_bytes
+            raise
+
+    def _get_bytes_with_curl(
+        self, *, target: str, headers: dict[str, str], timeout: int | None,
+    ) -> bytes | None:
+        curl_path = shutil.which("curl.exe") or shutil.which("curl")
+        if curl_path is None:
+            return None
+        command = [curl_path, "-L", "-sS", "--compressed", "-f"]
+        if self.ssl_context.verify_mode == ssl.CERT_NONE:
+            command.append("-k")
+        for key, value in headers.items():
+            command.extend(["-H", f"{key}: {value}"])
+        command.append(target)
+        effective_timeout = timeout if timeout is not None else self.timeout_seconds
+        try:
+            completed = subprocess.run(
+                command, capture_output=True, check=True, timeout=effective_timeout,
+            )
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            logger.warning("curl bytes fallback failed target=%s error=%s", target, exc)
+            return None
+        return completed.stdout
+
     def _get_text_with_curl(
         self,
         *,
