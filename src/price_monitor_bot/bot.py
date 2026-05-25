@@ -1283,33 +1283,40 @@ class TelegramCommandProcessor:
         watches = list(self._watch_db.list_marketplace_watchlist())
         watches.sort(key=lambda w: (not w.enabled, w.watch_id))
 
+        _CIRCLED = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
+
         items: list[_ListRow] = []
-        for w in watches:
+        for i, w in enumerate(watches):
+            num = _CIRCLED[i] if i < len(_CIRCLED) else str(i + 1)
             status = "✓ 啟用" if w.enabled else "✗ 停用"
             checked = _format_local_time(w.last_checked_at) if w.last_checked_at else "尚未檢查"
-            market_chips = " ".join(
+            market_chips_full = " ".join(
                 f"{_marketplace_source_display(m)[1]}{_marketplace_source_display(m)[0]}"
                 for m in w.markets
             ) or "(無)"
+            market_emojis = "".join(
+                _marketplace_source_display(m)[1] for m in w.markets
+            ) or "—"
             extra_lines: list[str] = []
             extra_buttons = ()
             if "mercari" in w.markets:
-                # Condition picker is Mercari-only — surface its current state
-                # and the picker button.
                 condition_ids = _condition_ids_from_options(w.options_for("mercari"))
                 extra_lines.append(f"  Mercari 狀態：{_summarize_condition_ids_short(condition_ids)}")
                 extra_buttons = (
                     {"text": "🎛 Mercari 狀態", "callback_data": f"cond:{w.watch_id}:open"},
                 )
-            text_block = (
-                f"[{w.watch_id[:12]}] {status}\n"
-                f"  關鍵字：{w.query}\n"
-                f"  上限：¥{w.price_threshold_jpy:,}\n"
-                f"  平台：{market_chips}\n"
-                + ("\n".join(extra_lines) + "\n" if extra_lines else "")
-                + f"  最後檢查：{checked}"
-            )
-            short = w.query[:24]
+            if mode == LIST_VIEW_MODE_EDIT:
+                # Compact one-liner per item — numbered for button alignment
+                text_block = f"{num} {w.query}  ¥{w.price_threshold_jpy:,}  {market_emojis}  {status}"
+                short = num
+            else:
+                text_block = (
+                    f"{num} {status}  {w.query}\n"
+                    f"  上限：¥{w.price_threshold_jpy:,}  ·  {market_chips_full}\n"
+                    + ("\n".join(extra_lines) + "\n" if extra_lines else "")
+                    + f"  最後檢查：{checked}"
+                )
+                short = num
             items.append(_ListRow(
                 id=w.watch_id,
                 text=text_block,
