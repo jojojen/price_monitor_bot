@@ -1309,7 +1309,7 @@ class TelegramCommandProcessor:
                 + ("\n".join(extra_lines) + "\n" if extra_lines else "")
                 + f"  最後檢查：{checked}"
             )
-            short = f"[{w.watch_id[:8]}] {w.query[:18]}"
+            short = w.query[:24]
             items.append(_ListRow(
                 id=w.watch_id,
                 text=text_block,
