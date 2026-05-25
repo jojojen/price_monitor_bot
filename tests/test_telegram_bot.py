@@ -2057,9 +2057,12 @@ def test_watchlist_view_renders_with_per_item_delete_in_edit_mode() -> None:
     assert len(kb_read["inline_keyboard"]) == 1
 
     text_edit, kb_edit, _ = processor.render_watchlist_view(mode="e")
-    # 3 delete rows + 1 nav row
-    assert len(kb_edit["inline_keyboard"]) == 4
-    delete_data = [row[0]["callback_data"] for row in kb_edit["inline_keyboard"][:3]]
+    # 3 items × (1 label row + 1 action row) + 1 nav row = 7 rows
+    assert len(kb_edit["inline_keyboard"]) == 7
+    # Label rows are at even indices (0, 2, 4); action rows at odd (1, 3, 5)
+    label_data = [kb_edit["inline_keyboard"][i][0]["callback_data"] for i in (0, 2, 4)]
+    assert label_data == ["noop", "noop", "noop"]
+    delete_data = [kb_edit["inline_keyboard"][i][0]["callback_data"] for i in (1, 3, 5)]
     assert delete_data == ["del:wl:wid0000", "del:wl:wid0001", "del:wl:wid0002"]
 
 
@@ -2093,9 +2096,13 @@ def test_callback_query_del_wl_removes_watch_and_rerenders() -> None:
 def test_watchlist_edit_mode_each_row_has_delete_and_condition_buttons() -> None:
     processor, _ = _make_watchlist_processor(["alpha", "beta"])
     _, kb, _ = processor.render_watchlist_view(mode="e")
-    # 2 watches → 2 rows of (delete, condition) + 1 nav row
-    assert len(kb["inline_keyboard"]) == 3
-    first_watch_row = kb["inline_keyboard"][0]
+    # 2 watches × (1 label + 1 action) + 1 nav = 5 rows
+    assert len(kb["inline_keyboard"]) == 5
+    # Row 0 = label for item 0 (noop), Row 1 = action for item 0
+    label_row = kb["inline_keyboard"][0]
+    assert label_row[0]["callback_data"] == "noop"
+    assert "alpha" in label_row[0]["text"]
+    first_watch_row = kb["inline_keyboard"][1]
     assert len(first_watch_row) == 2
     assert first_watch_row[0]["callback_data"] == "del:wl:wid0000"
     assert first_watch_row[1]["callback_data"] == "cond:wid0000:open"
@@ -2250,10 +2257,12 @@ def test_callback_query_cond_done_returns_to_watchlist_edit_mode() -> None:
 
     edited = client.edited_messages[0]
     assert "📋 Marketplace 追蹤（多站）" in edited["text"]
-    # Re-rendered in edit mode → first row has delete + condition buttons.
-    first_row = edited["reply_markup"]["inline_keyboard"][0]
-    assert first_row[0]["callback_data"].startswith("del:wl:")
-    assert first_row[1]["callback_data"].startswith("cond:")
+    # Re-rendered in edit mode → row 0 = label (noop), row 1 = delete + condition.
+    label_row = edited["reply_markup"]["inline_keyboard"][0]
+    assert label_row[0]["callback_data"] == "noop"
+    action_row = edited["reply_markup"]["inline_keyboard"][1]
+    assert action_row[0]["callback_data"].startswith("del:wl:")
+    assert action_row[1]["callback_data"].startswith("cond:")
 
 
 # ── Paginated /hunt view ──────────────────────────────────────────────────────

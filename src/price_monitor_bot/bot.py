@@ -159,12 +159,16 @@ class _ListRow:
     is the truncated label shown on the delete button in edit mode.
     `extra_buttons` is appended next to the delete button on the same row
     (used by /watchlist to add a "🎛 設定狀態" button).
+    `label_button` when set is inserted as a full-width row directly above
+    the action buttons in edit mode, so the delete button appears below the
+    item label rather than across from it.
     """
 
     id: str
     text: str
     short_label: str
     extra_buttons: tuple[dict[str, object], ...] = ()
+    label_button: dict[str, object] | None = None
 
 
 _CONDITION_PICKER_TITLE = "🎛 設定狀態"
@@ -238,11 +242,14 @@ def _build_list_view(
     visible = items[start : start + LIST_VIEW_PAGE_SIZE]
 
     header = f"{list_title}  第 {clamped + 1}/{total_pages} 頁（共 {total} 筆）"
-    text = "\n".join([header, "", *(row.text for row in visible)])
+    body_lines = [row.text for row in visible if row.text]
+    text = "\n".join([header, "", *body_lines] if body_lines else [header])
 
     keyboard: list[list[dict[str, object]]] = []
     if mode == LIST_VIEW_MODE_EDIT:
         for row in visible:
+            if row.label_button is not None:
+                keyboard.append([row.label_button])
             row_buttons: list[dict[str, object]] = [{
                 "text": f"❌ 刪除 {row.short_label}",
                 "callback_data": f"del:{list_kind}:{row.id}",
@@ -1306,22 +1313,26 @@ class TelegramCommandProcessor:
                     {"text": "🎛 Mercari 狀態", "callback_data": f"cond:{w.watch_id}:open"},
                 )
             if mode == LIST_VIEW_MODE_EDIT:
-                # Compact one-liner per item — numbered for button alignment
-                text_block = f"{num} {w.query}  ¥{w.price_threshold_jpy:,}  {market_emojis}  {status}"
-                short = num
+                # Edit mode: text body is empty (label_button carries item info)
+                text_block = ""
+                label_btn: dict[str, object] | None = {
+                    "text": f"📌 {w.query}  ¥{w.price_threshold_jpy:,}  {market_emojis}",
+                    "callback_data": "noop",
+                }
             else:
+                label_btn = None
                 text_block = (
                     f"{num} {status}  {w.query}\n"
                     f"  上限：¥{w.price_threshold_jpy:,}  ·  {market_chips_full}\n"
                     + ("\n".join(extra_lines) + "\n" if extra_lines else "")
                     + f"  最後檢查：{checked}"
                 )
-                short = num
             items.append(_ListRow(
                 id=w.watch_id,
                 text=text_block,
-                short_label=short,
+                short_label="刪除",
                 extra_buttons=extra_buttons,
+                label_button=label_btn,
             ))
 
         return _build_list_view(
@@ -3684,6 +3695,8 @@ def handle_telegram_callback_query(
                             "Sending clarification plan from callback failed chat_id=%s prefix=%s n=%d",
                             mask_identifier(chat_id), prefix, option_n,
                         )
+    elif prefix == "noop":
+        pass  # label buttons — silently acknowledge, no action
     else:
         logger.warning("Unknown callback_query prefix=%r data=%r", prefix, data)
 
