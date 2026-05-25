@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 import logging
 import re
 import socket
@@ -19,6 +19,7 @@ from .catalog import TcgCardSpec
 from .cardrush import CardrushPokemonClient, CardrushYugiohClient
 from .magi import MagiProductClient
 from .mercari_reference import MercariReferenceClient
+from .snkrdunk import SnkrdunkClient
 from .surugaya import SurugayaClient
 from .yuyutei import YuyuteiClient
 
@@ -26,6 +27,12 @@ logger = logging.getLogger(__name__)
 _TRANSIENT_SOURCE_EXCEPTIONS = (TimeoutError, socket.timeout)
 _DEFAULT_USER_AGENT = "OpenClawPriceMonitor/0.1 (+https://local-dev)"
 _DEFAULT_LOG_RAW_RESULT_LIMIT = 20
+
+# Tiered-lookup defaults. Tier 1 = authoritative sources whose result blocks
+# the response. Tier 2 = reference sources queried in parallel; offers
+# arriving after `TIER2_GRACE_SECONDS` past Tier 1 completion are dropped.
+_TIER1_TIMEOUT_SECONDS = 30.0
+_TIER2_GRACE_SECONDS = 8.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,39 +50,78 @@ class OfferLookupClient(Protocol):
 
 
 class TcgPriceService:
+    """TCG price aggregator with a tiered fan-out:
+      Tier 1 (authoritative, blocks the response):
+        snkrdunk + yuyutei — both are fast (regex / structured-data parse),
+        and snkrdunk has emerged as the de-facto sealed-box price index
+      Tier 2 (reference, drops on timeout):
+        cardrush_pokemon, cardrush_yugioh, magi, surugaya, mercari
+        — queried in parallel; offers arriving after the Tier-1-done +
+        `tier2_grace_seconds` deadline are discarded (the thread keeps running
+        until natural completion but its result is ignored)
+
+    Back-compat: passing the legacy `reference_clients=` kwarg routes all
+    given clients into Tier 1 (so existing tests that supply a single stub
+    still block until that stub returns)."""
+
     def __init__(
         self,
         *,
         db_path: str | Path | None = None,
         yuyutei_client: YuyuteiClient | None = None,
         reference_clients: tuple[OfferLookupClient, ...] | list[OfferLookupClient] | None = None,
+        tier1_clients: tuple[OfferLookupClient, ...] | list[OfferLookupClient] | None = None,
+        tier2_clients: tuple[OfferLookupClient, ...] | list[OfferLookupClient] | None = None,
         pricing: FairValueCalculator | None = None,
         yuyutei_user_agent: str = _DEFAULT_USER_AGENT,
         log_raw_result_limit: int = _DEFAULT_LOG_RAW_RESULT_LIMIT,
+        tier1_timeout_seconds: float = _TIER1_TIMEOUT_SECONDS,
+        tier2_grace_seconds: float = _TIER2_GRACE_SECONDS,
     ) -> None:
         resolved_db_path = Path(db_path or "data/monitor.sqlite3")
         self._log_raw_result_limit = log_raw_result_limit
+        self._tier1_timeout = float(tier1_timeout_seconds)
+        self._tier2_grace = float(tier2_grace_seconds)
 
         self.database = MonitorDatabase(resolved_db_path)
         self.database.bootstrap()
         self._seed_domain_trust_from_config_if_present()
+
         primary_client = yuyutei_client or YuyuteiClient(
             HttpClient(user_agent=yuyutei_user_agent)
         )
-        if reference_clients is not None:
-            self.reference_clients = tuple(reference_clients)
+
+        if tier1_clients is not None or tier2_clients is not None:
+            # Explicit tiering wins
+            self.tier1_clients = tuple(tier1_clients or ())
+            self.tier2_clients = tuple(tier2_clients or ())
+        elif reference_clients is not None:
+            # Legacy single-tier mode (tests, custom embeddings)
+            self.tier1_clients = tuple(reference_clients)
+            self.tier2_clients = ()
         elif yuyutei_client is not None:
-            self.reference_clients = (primary_client,)
+            # Single supplied yuyutei → treat as Tier 1, no other sources
+            self.tier1_clients = (primary_client,)
+            self.tier2_clients = ()
         else:
+            # Production default: snkrdunk + yuyutei (Tier 1) + the rest (Tier 2)
             shared_http_client = HttpClient(user_agent=yuyutei_user_agent)
-            self.reference_clients = (
+            self.tier1_clients = (
+                SnkrdunkClient(shared_http_client),
                 primary_client,
+            )
+            self.tier2_clients = (
                 CardrushPokemonClient(shared_http_client),
                 CardrushYugiohClient(shared_http_client),
                 MagiProductClient(shared_http_client),
                 SurugayaClient(shared_http_client),
                 MercariReferenceClient(),
             )
+
+        # Flat back-compat view — used by external code / tests that still
+        # iterate `service.reference_clients`. Order: Tier 1 first.
+        self.reference_clients = self.tier1_clients + self.tier2_clients
+
         self.pricing = pricing or FairValueCalculator()
 
     def lookup(self, spec: TcgCardSpec, *, persist: bool = True) -> TcgLookupResult:
@@ -129,6 +175,18 @@ class TcgPriceService:
         return TcgLookupResult(spec=spec, item=item, offers=offers, fair_value=fair_value, notes=notes)
 
     def _lookup_offers(self, spec: TcgCardSpec) -> list[MarketOffer]:
+        """Tiered fan-out: block on Tier 1 (authoritative), best-effort Tier 2.
+
+        Tier 1 must finish (or transiently fail) before we return. Tier 2
+        fires in parallel; once Tier 1 is done we give Tier 2 `_tier2_grace`
+        more seconds, then drop whatever hasn't returned. The dropped threads
+        keep running (Python can't safely cancel running threads) but we
+        ignore their result, so the user gets a fast reply.
+
+        Back-compat: when `tier2_clients` is empty (legacy callers, custom
+        embeddings, tests) this collapses to the original single-tier
+        ThreadPoolExecutor behavior."""
+
         def _query(client: OfferLookupClient) -> tuple[str, list[MarketOffer] | None, tuple[str, BaseException, float] | None]:
             client_name = type(client).__name__
             start = time.perf_counter()
@@ -151,52 +209,87 @@ class TcgPriceService:
 
         offers: list[MarketOffer] = []
         seen: set[tuple[str, str, str, int]] = set()
-        max_workers = min(6, len(self.reference_clients)) or 1
+        total_clients = len(self.tier1_clients) + len(self.tier2_clients)
+        max_workers = max(1, min(8, total_clients))
         fan_out_start = time.perf_counter()
 
-        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="tcg-src") as pool:
-            futures = [pool.submit(_query, client) for client in self.reference_clients]
-            for future in as_completed(futures):
+        def _ingest(future) -> None:
+            try:
                 client_name, client_offers, err = future.result()
-                if err is not None:
-                    kind, exc, elapsed = err
-                    if kind == "transient":
-                        logger.warning(
-                            "Source client timed out client=%s title=%s elapsed=%.3fs error=%s",
-                            client_name,
-                            spec.title,
-                            elapsed,
-                            exc,
-                        )
-                    else:
-                        logger.error(
-                            "Source client failed client=%s title=%s elapsed=%.3fs",
-                            client_name,
-                            spec.title,
-                            elapsed,
-                            exc_info=exc,
-                        )
+            except Exception as exc:
+                logger.error("Future failed unexpectedly title=%s error=%s", spec.title, exc)
+                return
+            if err is not None:
+                kind, exc, elapsed = err
+                if kind == "transient":
+                    logger.warning(
+                        "Source client timed out client=%s title=%s elapsed=%.3fs error=%s",
+                        client_name, spec.title, elapsed, exc,
+                    )
+                else:
+                    logger.error(
+                        "Source client failed client=%s title=%s elapsed=%.3fs",
+                        client_name, spec.title, elapsed, exc_info=exc,
+                    )
+                return
+            logger.debug(
+                "Source client returned client=%s count=%s offers=%s",
+                client_name, len(client_offers),
+                [_offer_summary(o) for o in client_offers[: self._log_raw_result_limit]],
+            )
+            for offer in client_offers:
+                key = (offer.source, offer.url, offer.price_kind, offer.price_jpy)
+                if key in seen:
                     continue
-                logger.debug(
-                    "Source client returned client=%s count=%s offers=%s",
-                    client_name,
-                    len(client_offers),
-                    [_offer_summary(offer) for offer in client_offers[: self._log_raw_result_limit]],
+                seen.add(key)
+                offers.append(offer)
+
+        # Manual shutdown(wait=False) — the `with` block waits for ALL
+        # running tasks (defeats the tier-2 timeout). We tolerate a brief
+        # thread leak when Tier 2 sources are slow; they finish naturally
+        # within their HTTP timeout (~20s) which is short-lived.
+        pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="tcg-src")
+        try:
+            tier1_futures = [pool.submit(_query, c) for c in self.tier1_clients]
+            tier2_futures = [pool.submit(_query, c) for c in self.tier2_clients]
+
+            # Phase 1: wait for ALL Tier 1 (with overall timeout).
+            tier1_done, tier1_pending = wait(
+                tier1_futures, timeout=self._tier1_timeout
+            )
+            for fut in tier1_done:
+                _ingest(fut)
+            for fut in tier1_pending:
+                logger.warning(
+                    "Tier 1 source missed timeout (%.1fs); dropping result. title=%s",
+                    self._tier1_timeout, spec.title,
                 )
+                # Don't ingest later — abandon the future
+            tier1_elapsed = time.perf_counter() - fan_out_start
 
-                for offer in client_offers:
-                    dedupe_key = (offer.source, offer.url, offer.price_kind, offer.price_jpy)
-                    if dedupe_key in seen:
-                        logger.debug("Deduped duplicate offer source=%s url=%s price_kind=%s", offer.source, offer.url, offer.price_kind)
-                        continue
-                    seen.add(dedupe_key)
-                    offers.append(offer)
+            # Phase 2: best-effort gather for Tier 2 within the grace window.
+            if tier2_futures:
+                tier2_done, tier2_pending = wait(
+                    tier2_futures, timeout=self._tier2_grace
+                )
+                for fut in tier2_done:
+                    _ingest(fut)
+                if tier2_pending:
+                    logger.info(
+                        "Tier 2 grace expired after %.1fs; dropping %d unfinished source(s). title=%s",
+                        self._tier2_grace, len(tier2_pending), spec.title,
+                    )
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
 
+        total_elapsed = time.perf_counter() - fan_out_start
         logger.info(
-            "TCG fan-out complete title=%s total_elapsed=%.3fs sources=%d offers=%d",
+            "TCG tiered fan-out complete title=%s tier1_elapsed=%.3fs total_elapsed=%.3fs tier1=%d tier2=%d offers=%d",
             spec.title,
-            time.perf_counter() - fan_out_start,
-            len(self.reference_clients),
+            tier1_elapsed,
+            total_elapsed,
+            len(self.tier1_clients),
+            len(self.tier2_clients),
             len(offers),
         )
 

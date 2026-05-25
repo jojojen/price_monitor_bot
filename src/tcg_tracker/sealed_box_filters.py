@@ -57,6 +57,15 @@ _SINGLE_CARD_MARKERS: tuple[str, ...] = (
 # Card-number patterns like "349/190", "001/078" — a hard tell for single cards.
 _CARD_NUMBER_RE = re.compile(r"\b\d{2,3}\s*/\s*\d{2,3}\b")
 
+# Positive patterns that need regex flexibility — e.g. snkrdunk titles like
+# "拡張パック「アビスアイ」ボックス" where the literal "拡張パックbox" marker
+# wouldn't match because the set name and Japanese brackets sit in between.
+_BOX_POSITIVE_PATTERNS = (
+    re.compile(r"拡張パック[「『]?[^」』]{0,40}[」』]?\s*(?:ボックス|box)", re.IGNORECASE),
+    re.compile(r"ハイクラスパック[「『]?[^」』]{0,40}[」』]?\s*(?:ボックス|box)", re.IGNORECASE),
+    re.compile(r"ブースター[^」』]{0,40}(?:ボックス|box)", re.IGNORECASE),
+)
+
 
 def looks_like_sealed_box_listing(text: str) -> bool:
     """Return True only if ``text`` reads like a sealed-box product listing.
@@ -74,4 +83,6 @@ def looks_like_sealed_box_listing(text: str) -> bool:
         return False
     if any(marker in padded for marker in _SINGLE_CARD_MARKERS):
         return False
-    return any(marker in padded for marker in _BOX_POSITIVE_MARKERS)
+    if any(marker in padded for marker in _BOX_POSITIVE_MARKERS):
+        return True
+    return any(p.search(text) for p in _BOX_POSITIVE_PATTERNS)

@@ -300,6 +300,52 @@ def test_lookup_notes_include_learned_reference_sites(tmp_path) -> None:
     assert "cardrush.jp" in learned_note
 
 
+def test_tier1_completes_fast_tier2_dropped_on_grace_timeout(tmp_path) -> None:
+    """Tier 1 stubs return immediately; Tier 2 stub sleeps 5s. With a 0.3s
+    grace, total wall-clock should be ~0.3-0.5s and we get Tier 1 offers
+    only — the slow Tier 2 stub gets dropped."""
+    service = TcgPriceService(
+        db_path=tmp_path / "monitor.sqlite3",
+        tier1_clients=(
+            SlowStubClient("snkrdunk", 0.05),
+            SlowStubClient("yuyutei", 0.05),
+        ),
+        tier2_clients=(
+            SlowStubClient("slow-cardrush", 5.0),
+        ),
+        tier2_grace_seconds=0.3,
+    )
+
+    start = time.perf_counter()
+    result = service.lookup(
+        TcgCardSpec(game="pokemon", title="テスト", card_number="001/100", rarity="SR", set_code="sv01"),
+        persist=False,
+    )
+    elapsed = time.perf_counter() - start
+
+    assert elapsed < 1.0, f"tiered fan-out blocked on tier 2; elapsed={elapsed:.3f}s"
+    sources = {offer.source for offer in result.offers}
+    assert "snkrdunk" in sources
+    assert "yuyutei" in sources
+    assert "slow-cardrush" not in sources  # dropped by grace timeout
+
+
+def test_tier2_fast_enough_is_included(tmp_path) -> None:
+    """If Tier 2 finishes within grace window, its offers ARE included."""
+    service = TcgPriceService(
+        db_path=tmp_path / "monitor.sqlite3",
+        tier1_clients=(SlowStubClient("snkrdunk", 0.05),),
+        tier2_clients=(SlowStubClient("fast-cardrush", 0.05),),
+        tier2_grace_seconds=1.0,
+    )
+    result = service.lookup(
+        TcgCardSpec(game="pokemon", title="テスト", card_number="001/100", rarity="SR", set_code="sv01"),
+        persist=False,
+    )
+    sources = {offer.source for offer in result.offers}
+    assert sources == {"snkrdunk", "fast-cardrush"}
+
+
 def test_sealed_box_lookup_drops_starter_sets_and_low_priced_listings(tmp_path) -> None:
     """Regression for MEGA アビスアイ: the bot used to return ¥1,930 by
     treating cardrush single cards / starter sets as sealed boxes. The
