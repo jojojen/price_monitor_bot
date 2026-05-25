@@ -20,7 +20,7 @@ SURUGAYA_BASE_URL = "https://www.suruga-ya.jp"
 SURUGAYA_SEARCH_URL = f"{SURUGAYA_BASE_URL}/search"
 logger = logging.getLogger(__name__)
 
-_SUPPORTED_GAMES = {"union_arena"}
+_SUPPORTED_GAMES = {"union_arena", "ws"}
 _TCG_CODE_RE = re.compile(r"(?P<code>[A-Z0-9]+/[A-Z0-9]+(?:-[A-Z0-9]+)*-\d{1,3})", re.IGNORECASE)
 _RARITY_RE = re.compile(r"\[(?P<rarity>[A-Z0-9*★-]+)\]")
 

@@ -17,7 +17,7 @@ from .search_terms import generic_card_number_variants
 logger = logging.getLogger(__name__)
 
 MercariSearchFn = Callable[..., list[dict[str, object]]]
-_MERCARI_SUPPORTED_GAMES = {"yugioh", "union_arena"}
+_MERCARI_SUPPORTED_GAMES = {"yugioh", "union_arena", "ws"}
 _DEFAULT_PRICE_MAX_JPY = 1_000_000
 _DEFAULT_MAX_RESULTS = 12
 _DEFAULT_TIMEOUT_MS = 30_000
@@ -107,6 +107,8 @@ def _game_context_keyword(game: str) -> str | None:
         return "ユニオンアリーナ"
     if game == "yugioh":
         return "遊戯王"
+    if game == "ws":
+        return "ヴァイスシュヴァルツ"
     return None
 
 
