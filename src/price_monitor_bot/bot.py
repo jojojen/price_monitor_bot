@@ -250,8 +250,9 @@ def _build_list_view(
         for row in visible:
             if row.label_button is not None:
                 keyboard.append([row.label_button])
+            btn_label = f"❌ 刪除 {row.short_label}".strip() if row.short_label else "❌ 刪除"
             row_buttons: list[dict[str, object]] = [{
-                "text": f"❌ 刪除 {row.short_label}",
+                "text": btn_label,
                 "callback_data": f"del:{list_kind}:{row.id}",
             }]
             row_buttons.extend(row.extra_buttons)
@@ -1330,7 +1331,7 @@ class TelegramCommandProcessor:
             items.append(_ListRow(
                 id=w.watch_id,
                 text=text_block,
-                short_label="刪除",
+                short_label="",
                 extra_buttons=extra_buttons,
                 label_button=label_btn,
             ))
