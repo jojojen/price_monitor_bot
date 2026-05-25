@@ -156,10 +156,11 @@ def _score_sealed_box_offer(spec: TcgCardSpec, offer: MarketOffer) -> float:
 
 
 def _offer_looks_like_sealed_box(offer: MarketOffer) -> bool:
-    if offer.attributes.get("product_kind") == "sealed_box":
-        return True
-    combined = normalize_text(" ".join(filter(None, (offer.title, offer.attributes.get("image_alt", "")))))
-    return any(marker in combined for marker in _SEALED_BOX_MARKERS)
+    # Trust only the parser-supplied tag — title/image_alt scans here used to
+    # match a bare "box" substring, which mis-tagged starter sets and
+    # accessory cases. The per-source parser is now the single source of
+    # truth for sealed-box classification (see `sealed_box_filters.py`).
+    return offer.attributes.get("product_kind") == "sealed_box"
 
 
 def _shared_sealed_box_token_score(left: str, right: str) -> float:

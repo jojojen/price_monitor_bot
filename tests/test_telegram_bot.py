@@ -1089,6 +1089,56 @@ def test_format_lookup_result_telegram_supports_sealed_box_products() -> None:
     assert "Source URL: https://magi.example/box151" in text
 
 
+def test_format_lookup_result_telegram_sealed_box_skips_mis_tagged_single_cards() -> None:
+    """Regression for MEGA アビスアイ: cardrush returned single-card pages
+    (¥1,880 / ¥1,930) that were mis-tagged as sealed boxes. The Telegram
+    output must NOT surface those prices as a Fair Value / Best Ask for a
+    sealed-box query."""
+    now = datetime.now(timezone.utc)
+    lookup_result = TcgLookupResult(
+        spec=TcgCardSpec(
+            game="pokemon", title="ポケモンカードゲーム MEGA アビスアイ",
+            item_kind="sealed_box",
+        ),
+        item=TrackedItem(
+            item_id="megaabyss", item_type="tcg_sealed_box", category="tcg",
+            title="ポケモンカードゲーム MEGA アビスアイ",
+        ),
+        offers=(
+            MarketOffer(
+                source="cardrush_pokemon",
+                listing_id="72035",
+                url="https://www.cardrush-pokemon.jp/product/72035",
+                title="MEGA アビスアイ SR 001/078",
+                price_jpy=1880,
+                price_kind="ask",
+                captured_at=now,
+                source_category="specialty_store",
+                # Mis-tagged: parser saw "box" in surrounding text. Should be filtered out.
+                attributes={"product_kind": "sealed_box"},
+            ),
+            MarketOffer(
+                source="cardrush_pokemon",
+                listing_id="72036",
+                url="https://www.cardrush-pokemon.jp/product/72036",
+                title="MEGA アビスアイ SR 002/078",
+                price_jpy=1930,
+                price_kind="ask",
+                captured_at=now,
+                source_category="specialty_store",
+                attributes={"product_kind": "sealed_box"},
+            ),
+        ),
+        fair_value=None,
+    )
+
+    text = format_lookup_result_telegram(lookup_result)
+
+    assert "Fair Value: ￥1,930" not in text
+    assert "Best Ask: ￥1,880" not in text
+    assert "No sealed-box listings were found" in text
+
+
 def test_format_liquidity_board_includes_reference_url() -> None:
     text = format_liquidity_board(_stub_board(), limit=1)
 

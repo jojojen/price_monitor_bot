@@ -207,3 +207,94 @@ def test_lookup_continues_when_one_source_times_out(tmp_path, caplog) -> None:
     assert result.offers[0].source == "cardrush_pokemon"
     assert "Source client timed out" in caplog.text
     assert "Traceback" not in caplog.text
+
+
+def test_sealed_box_lookup_drops_starter_sets_and_low_priced_listings(tmp_path) -> None:
+    """Regression for MEGA アビスアイ: the bot used to return ¥1,930 by
+    treating cardrush single cards / starter sets as sealed boxes. The
+    new pipeline must drop those and surface only the real booster /
+    premium-trainer / hi-class boxes."""
+    now = datetime.now(timezone.utc)
+    sealed_attrs = {"product_kind": "sealed_box"}
+    service = TcgPriceService(
+        db_path=tmp_path / "monitor.sqlite3",
+        reference_clients=(
+            StubLookupClient(
+                [
+                    # Cardrush returns 2 real premium-trainer-boxes (¥7,980 / ¥8,480)
+                    MarketOffer(
+                        source="cardrush_pokemon", listing_id="69744",
+                        url="https://www.cardrush-pokemon.jp/product/69744",
+                        title="プレミアムトレーナーボックス MEGA", price_jpy=8480,
+                        price_kind="ask", captured_at=now,
+                        source_category="specialty_store",
+                        attributes=sealed_attrs, score=42.0,
+                    ),
+                    MarketOffer(
+                        source="cardrush_pokemon", listing_id="71062",
+                        url="https://www.cardrush-pokemon.jp/product/71062",
+                        title="プレミアムトレーナーボックス MEGA", price_jpy=7980,
+                        price_kind="ask", captured_at=now,
+                        source_category="specialty_store",
+                        attributes=sealed_attrs, score=42.0,
+                    ),
+                    # And 2 starter sets that were the source of the bug (not tagged
+                    # as sealed_box anymore by the parser)
+                    MarketOffer(
+                        source="cardrush_pokemon", listing_id="72035",
+                        url="https://www.cardrush-pokemon.jp/product/72035",
+                        title="スターターセット MEGA メガディアンシーex",
+                        price_jpy=1880, price_kind="ask", captured_at=now,
+                        source_category="specialty_store",
+                        attributes={}, score=12.0,
+                    ),
+                ]
+            ),
+            StubLookupClient(
+                [
+                    # Magi has the real expansion boxes (mirrors actual data from
+                    # the bot's 2026-05-25 MEGA アビスアイ lookup).
+                    MarketOffer(
+                        source="magi", listing_id="2915333",
+                        url="https://magi.camp/products/2915333",
+                        title="ハイクラスパック MEGAドリームex 未開封BOX",
+                        price_jpy=16800, price_kind="market", captured_at=now,
+                        source_category="marketplace",
+                        attributes=sealed_attrs, score=52.0,
+                    ),
+                    MarketOffer(
+                        source="magi", listing_id="2781611",
+                        url="https://magi.camp/products/2781611",
+                        title="MEGA 拡張パック メガシンフォニア 未開封BOX",
+                        price_jpy=22593, price_kind="market", captured_at=now,
+                        source_category="marketplace",
+                        attributes=sealed_attrs, score=52.0,
+                    ),
+                    MarketOffer(
+                        source="magi", listing_id="2781610",
+                        url="https://magi.camp/products/2781610",
+                        title="MEGA 拡張パック メガブレイブ 未開封BOX",
+                        price_jpy=26500, price_kind="market", captured_at=now,
+                        source_category="marketplace",
+                        attributes=sealed_attrs, score=52.0,
+                    ),
+                ]
+            ),
+        ),
+    )
+
+    result = service.lookup(
+        TcgCardSpec(
+            game="pokemon", title="ポケモンカードゲーム MEGA アビスアイ",
+            item_kind="sealed_box",
+        ),
+        persist=False,
+    )
+
+    # Starter set is gone; only real sealed boxes remain.
+    sources = {(o.source, o.listing_id) for o in result.offers}
+    assert ("cardrush_pokemon", "72035") not in sources
+    assert all(offer.price_jpy >= 4_000 for offer in result.offers)
+    # Fair value should reflect the real boxes, comfortably above ¥10,000.
+    assert result.fair_value is not None
+    assert result.fair_value.amount_jpy >= 10_000

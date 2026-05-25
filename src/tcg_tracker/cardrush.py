@@ -15,6 +15,7 @@ from .catalog import TcgCardSpec
 from .hot_cards import CARDRUSH_BROWSER_HEADERS, _parse_cardrush_text
 from .matching import minimum_match_score, score_tcg_offer
 from .search_terms import build_lookup_terms
+from .sealed_box_filters import looks_like_sealed_box_listing as _looks_like_sealed_box_listing
 
 CARDRUSH_BASE_URL = "https://www.cardrush-pokemon.jp"
 CARDRUSH_PRODUCT_LIST_URL = f"{CARDRUSH_BASE_URL}/product-list"
@@ -301,9 +302,6 @@ def _offer_summary(offer: MarketOffer) -> dict[str, object]:
     }
 
 
-def _looks_like_sealed_box_listing(text: str) -> bool:
-    lowered = text.lower()
-    return "未開封box" in lowered or "未開封 box" in lowered or "box" in lowered
 
 
 def _derive_yugioh_set_code(card_number: str | None) -> str | None:

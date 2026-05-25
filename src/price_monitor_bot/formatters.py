@@ -137,8 +137,29 @@ def _avg_price(offers: list[MarketOffer]) -> int | None:
     return sum(prices) // len(prices)
 
 
+_SEALED_BOX_PRICE_FLOOR_JPY = 4_000
+
+
+def _sealed_box_offers(offers: list[MarketOffer]) -> list[MarketOffer]:
+    """Keep only offers explicitly tagged as sealed boxes and priced above the
+    floor. Mirrors the filter applied in `TcgPriceService` so the Telegram
+    message never surfaces mis-tagged single-card prices for a sealed-box
+    query."""
+    return [
+        offer
+        for offer in offers
+        if offer.attributes.get("product_kind") == "sealed_box"
+        and offer.price_jpy >= _SEALED_BOX_PRICE_FLOOR_JPY
+    ]
+
+
 def _section_fair_value(result: TcgLookupResult, offers: list[MarketOffer]) -> str | None:
-    fair_value = FairValueCalculator().calculate(result.item.item_id, offers)
+    expected_kind = "sealed_box" if result.spec.item_kind == "sealed_box" else None
+    fair_value = FairValueCalculator().calculate(
+        result.item.item_id,
+        offers,
+        expected_product_kind=expected_kind,
+    )
     if fair_value is None:
         return None
     return f"Fair Value: {format_jpy(fair_value.amount_jpy)} | confidence={fair_value.confidence:.2f}"
@@ -170,15 +191,20 @@ def format_lookup_result_telegram(result: TcgLookupResult) -> str:
         return "\n".join(lines)
 
     if spec.item_kind == "sealed_box":
-        fair_value_text = _section_fair_value(result, list(result.offers))
+        sealed_offers = _sealed_box_offers(list(result.offers))
+        if not sealed_offers:
+            lines.append("No sealed-box listings were found among the active reference sources.")
+            return "\n".join(lines)
+
+        fair_value_text = _section_fair_value(result, sealed_offers)
         if fair_value_text is not None:
             lines.append(fair_value_text)
 
-        avg = _avg_price(list(result.offers))
-        bid = _best_bid(list(result.offers))
-        ask = _best_ask(list(result.offers))
-        market = _best_market(list(result.offers))
-        reference_offer = _section_reference_offer(list(result.offers))
+        avg = _avg_price(sealed_offers)
+        bid = _best_bid(sealed_offers)
+        ask = _best_ask(sealed_offers)
+        market = _best_market(sealed_offers)
+        reference_offer = _section_reference_offer(sealed_offers)
         if avg is not None:
             lines.append(f"Avg Price: {format_jpy(avg)}")
         if bid is not None:
@@ -191,7 +217,7 @@ def format_lookup_result_telegram(result: TcgLookupResult) -> str:
             lines.append(f"Source URL: {reference_offer.url}")
 
         source_summary = ", ".join(
-            f"{source} x{count}" for source, count in sorted(Counter(offer.source for offer in result.offers).items())
+            f"{source} x{count}" for source, count in sorted(Counter(offer.source for offer in sealed_offers).items())
         )
         lines.append("")
         lines.append(f"Sources: {source_summary}")

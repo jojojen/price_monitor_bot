@@ -14,6 +14,7 @@ from .catalog import TcgCardSpec
 from .hot_cards import _parse_magi_text
 from .matching import minimum_match_score, score_tcg_offer
 from .search_terms import build_lookup_terms
+from .sealed_box_filters import looks_like_sealed_box_listing as _looks_like_sealed_box_listing
 
 MAGI_BASE_URL = "https://magi.camp"
 MAGI_PRODUCT_SEARCH_URL = f"{MAGI_BASE_URL}/products/search"
@@ -138,11 +139,6 @@ def _offer_summary(offer: MarketOffer) -> dict[str, object]:
         "rarity": offer.attributes.get("rarity", ""),
         "set_code": offer.attributes.get("version_code", "") or offer.attributes.get("set_code", ""),
     }
-
-
-def _looks_like_sealed_box_listing(text: str) -> bool:
-    lowered = text.lower()
-    return "未開封box" in lowered or "未開封 box" in lowered or "box" in lowered
 
 
 _LOG_LIMIT = 5

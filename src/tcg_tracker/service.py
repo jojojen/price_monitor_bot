@@ -88,7 +88,17 @@ class TcgPriceService:
             persist,
         )
         offers = tuple(self._lookup_offers(spec))
-        fair_value = self.pricing.calculate(item.item_id, offers) if self._can_calculate_fair_value(spec, offers) else None
+        fair_value_offers = self._offers_for_fair_value(spec, offers)
+        expected_kind = "sealed_box" if spec.item_kind == "sealed_box" else None
+        fair_value = (
+            self.pricing.calculate(
+                item.item_id,
+                fair_value_offers,
+                expected_product_kind=expected_kind,
+            )
+            if self._can_calculate_fair_value(spec, fair_value_offers)
+            else None
+        )
         notes = self._build_lookup_notes(spec, offers, fair_value)
         logger.info(
             "TCG service lookup finished item_id=%s offers=%s sources=%s fair_value=%s notes=%s",
@@ -148,8 +158,27 @@ class TcgPriceService:
 
         offers.sort(key=self._offer_sort_key)
         if spec.item_kind == "sealed_box":
-            offers = self._filter_sealed_box_offer_cluster(offers)
+            offers = self._prefilter_sealed_box_offers(offers)
+            # Cluster collapse only makes sense when we have a strong identifier
+            # (set_code) — otherwise the query is fuzzy and the matched offers
+            # are distinct products that should NOT be collapsed into one.
+            if spec.set_code:
+                offers = self._filter_sealed_box_offer_cluster(offers)
         return offers
+
+    @staticmethod
+    def _prefilter_sealed_box_offers(offers: list[MarketOffer]) -> list[MarketOffer]:
+        """Drop anything not explicitly tagged as a sealed box, and anything
+        below the price floor. Runs before clustering so cheap starter sets
+        and accessories can't drown out real booster boxes in the chosen
+        cluster."""
+        floor = TcgPriceService._SEALED_BOX_PRICE_FLOOR_JPY
+        return [
+            offer
+            for offer in offers
+            if offer.attributes.get("product_kind") == "sealed_box"
+            and offer.price_jpy >= floor
+        ]
 
     def seed_watchlist(
         self,
@@ -171,6 +200,32 @@ class TcgPriceService:
                     schedule_minutes=schedule_minutes,
                 )
             )
+
+    # Pokemon TCG sealed boxes (booster/high-class/expansion) reliably retail
+    # at ¥4,000+. Anything cheaper that survived the product_kind filter is
+    # almost certainly a mis-tagged single card — exclude it from the fair
+    # value sample rather than let it drag the median down.
+    _SEALED_BOX_PRICE_FLOOR_JPY = 4_000
+
+    @staticmethod
+    def _offers_for_fair_value(
+        spec: TcgCardSpec, offers: tuple[MarketOffer, ...]
+    ) -> tuple[MarketOffer, ...]:
+        if spec.item_kind != "sealed_box":
+            return offers
+        filtered = tuple(
+            offer
+            for offer in offers
+            if offer.price_jpy >= TcgPriceService._SEALED_BOX_PRICE_FLOOR_JPY
+        )
+        if not filtered:
+            logger.info(
+                "Dropped all offers below sealed-box price floor (%d JPY); "
+                "no fair value will be reported. spec_title=%s",
+                TcgPriceService._SEALED_BOX_PRICE_FLOOR_JPY,
+                spec.title,
+            )
+        return filtered
 
     @staticmethod
     def _can_calculate_fair_value(spec: TcgCardSpec, offers: tuple[MarketOffer, ...]) -> bool:

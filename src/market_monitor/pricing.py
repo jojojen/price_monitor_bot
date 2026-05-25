@@ -35,8 +35,20 @@ def weighted_median(points: Iterable[tuple[int, float]]) -> int:
 
 
 class FairValueCalculator:
-    def calculate(self, item_id: str, offers: Iterable[MarketOffer]) -> FairValueEstimate | None:
+    def calculate(
+        self,
+        item_id: str,
+        offers: Iterable[MarketOffer],
+        *,
+        expected_product_kind: str | None = None,
+    ) -> FairValueEstimate | None:
         offer_list = list(offers)
+        if expected_product_kind is not None:
+            offer_list = [
+                offer
+                for offer in offer_list
+                if (offer.attributes.get("product_kind") or "card") == expected_product_kind
+            ]
         if not offer_list:
             return None
 
