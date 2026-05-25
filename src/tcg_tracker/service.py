@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 import re
 import socket
+import time
 from pathlib import Path
 from typing import Protocol
 
@@ -123,38 +125,76 @@ class TcgPriceService:
         return TcgLookupResult(spec=spec, item=item, offers=offers, fair_value=fair_value, notes=notes)
 
     def _lookup_offers(self, spec: TcgCardSpec) -> list[MarketOffer]:
-        offers: list[MarketOffer] = []
-        seen: set[tuple[str, str, str, int]] = set()
-        for client in self.reference_clients:
+        def _query(client: OfferLookupClient) -> tuple[str, list[MarketOffer] | None, tuple[str, BaseException, float] | None]:
             client_name = type(client).__name__
+            start = time.perf_counter()
             logger.debug("Querying source client=%s title=%s", client_name, spec.title)
             try:
-                client_offers = client.lookup(spec)
+                result = client.lookup(spec)
             except _TRANSIENT_SOURCE_EXCEPTIONS as exc:
-                logger.warning(
-                    "Source client timed out client=%s title=%s error=%s",
-                    client_name,
-                    spec.title,
-                    exc,
-                )
-                continue
-            except Exception:
-                logger.exception("Source client failed client=%s title=%s", client_name, spec.title)
-                continue
-            logger.debug(
-                "Source client returned client=%s count=%s offers=%s",
+                return client_name, None, ("transient", exc, time.perf_counter() - start)
+            except Exception as exc:
+                return client_name, None, ("fatal", exc, time.perf_counter() - start)
+            elapsed = time.perf_counter() - start
+            logger.info(
+                "Source client done client=%s title=%s elapsed=%.3fs count=%d",
                 client_name,
-                len(client_offers),
-                [_offer_summary(offer) for offer in client_offers[: self._log_raw_result_limit]],
+                spec.title,
+                elapsed,
+                len(result),
             )
+            return client_name, result, None
 
-            for offer in client_offers:
-                dedupe_key = (offer.source, offer.url, offer.price_kind, offer.price_jpy)
-                if dedupe_key in seen:
-                    logger.debug("Deduped duplicate offer source=%s url=%s price_kind=%s", offer.source, offer.url, offer.price_kind)
+        offers: list[MarketOffer] = []
+        seen: set[tuple[str, str, str, int]] = set()
+        max_workers = min(6, len(self.reference_clients)) or 1
+        fan_out_start = time.perf_counter()
+
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="tcg-src") as pool:
+            futures = [pool.submit(_query, client) for client in self.reference_clients]
+            for future in as_completed(futures):
+                client_name, client_offers, err = future.result()
+                if err is not None:
+                    kind, exc, elapsed = err
+                    if kind == "transient":
+                        logger.warning(
+                            "Source client timed out client=%s title=%s elapsed=%.3fs error=%s",
+                            client_name,
+                            spec.title,
+                            elapsed,
+                            exc,
+                        )
+                    else:
+                        logger.error(
+                            "Source client failed client=%s title=%s elapsed=%.3fs",
+                            client_name,
+                            spec.title,
+                            elapsed,
+                            exc_info=exc,
+                        )
                     continue
-                seen.add(dedupe_key)
-                offers.append(offer)
+                logger.debug(
+                    "Source client returned client=%s count=%s offers=%s",
+                    client_name,
+                    len(client_offers),
+                    [_offer_summary(offer) for offer in client_offers[: self._log_raw_result_limit]],
+                )
+
+                for offer in client_offers:
+                    dedupe_key = (offer.source, offer.url, offer.price_kind, offer.price_jpy)
+                    if dedupe_key in seen:
+                        logger.debug("Deduped duplicate offer source=%s url=%s price_kind=%s", offer.source, offer.url, offer.price_kind)
+                        continue
+                    seen.add(dedupe_key)
+                    offers.append(offer)
+
+        logger.info(
+            "TCG fan-out complete title=%s total_elapsed=%.3fs sources=%d offers=%d",
+            spec.title,
+            time.perf_counter() - fan_out_start,
+            len(self.reference_clients),
+            len(offers),
+        )
 
         offers.sort(key=self._offer_sort_key)
         if spec.item_kind == "sealed_box":

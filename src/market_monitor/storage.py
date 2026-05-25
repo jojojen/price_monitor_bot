@@ -191,7 +191,7 @@ class MonitorDatabase:
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.path)
+        connection = sqlite3.connect(self.path, check_same_thread=False, timeout=10)
         connection.row_factory = sqlite3.Row
         try:
             yield connection

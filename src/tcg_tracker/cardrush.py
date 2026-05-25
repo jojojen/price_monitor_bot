@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, timezone
 import logging
+import threading
 import time
 from urllib.parse import urljoin, urlparse
 
@@ -27,6 +28,7 @@ logger = logging.getLogger(__name__)
 class CardrushPokemonClient:
     _cooldown_seconds = 600.0
     _disabled_until_monotonic = 0.0
+    _disabled_lock = threading.Lock()
 
     def __init__(self, http_client: HttpClient | None = None) -> None:
         self.http_client = http_client or HttpClient()
@@ -98,15 +100,18 @@ class CardrushPokemonClient:
 
     @classmethod
     def reset_temporary_disable(cls) -> None:
-        cls._disabled_until_monotonic = 0.0
+        with cls._disabled_lock:
+            cls._disabled_until_monotonic = 0.0
 
     @classmethod
     def _temporarily_disable(cls) -> None:
-        cls._disabled_until_monotonic = time.monotonic() + cls._cooldown_seconds
+        with cls._disabled_lock:
+            cls._disabled_until_monotonic = time.monotonic() + cls._cooldown_seconds
 
     @classmethod
     def _is_temporarily_disabled(cls) -> bool:
-        return time.monotonic() < cls._disabled_until_monotonic
+        with cls._disabled_lock:
+            return time.monotonic() < cls._disabled_until_monotonic
 
     def _parse_search_page(self, html: str) -> list[MarketOffer]:
         soup = BeautifulSoup(html, "html.parser")
@@ -159,6 +164,7 @@ class CardrushPokemonClient:
 class CardrushYugiohClient:
     _cooldown_seconds = 600.0
     _disabled_until_monotonic = 0.0
+    _disabled_lock = threading.Lock()
 
     def __init__(self, http_client: HttpClient | None = None) -> None:
         self.http_client = http_client or HttpClient()
@@ -215,15 +221,18 @@ class CardrushYugiohClient:
 
     @classmethod
     def reset_temporary_disable(cls) -> None:
-        cls._disabled_until_monotonic = 0.0
+        with cls._disabled_lock:
+            cls._disabled_until_monotonic = 0.0
 
     @classmethod
     def _temporarily_disable(cls) -> None:
-        cls._disabled_until_monotonic = time.monotonic() + cls._cooldown_seconds
+        with cls._disabled_lock:
+            cls._disabled_until_monotonic = time.monotonic() + cls._cooldown_seconds
 
     @classmethod
     def _is_temporarily_disabled(cls) -> bool:
-        return time.monotonic() < cls._disabled_until_monotonic
+        with cls._disabled_lock:
+            return time.monotonic() < cls._disabled_until_monotonic
 
     def _parse_search_page(self, html: str) -> list[MarketOffer]:
         soup = BeautifulSoup(html, "html.parser")

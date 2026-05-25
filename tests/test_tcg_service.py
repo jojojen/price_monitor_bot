@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 
 from market_monitor.models import MarketOffer
@@ -26,6 +27,28 @@ class StubLookupClient:
 class TimeoutLookupClient:
     def lookup(self, spec: TcgCardSpec) -> list[MarketOffer]:
         raise TimeoutError("read timed out")
+
+
+class SlowStubClient:
+    def __init__(self, source: str, delay_s: float = 0.1) -> None:
+        self.source = source
+        self.delay_s = delay_s
+
+    def lookup(self, spec: TcgCardSpec) -> list[MarketOffer]:
+        time.sleep(self.delay_s)
+        return [
+            MarketOffer(
+                source=self.source,
+                listing_id=f"{self.source}-1",
+                url=f"https://example.com/{self.source}",
+                title="テスト",
+                price_jpy=10000,
+                price_kind="market",
+                captured_at=datetime.now(timezone.utc),
+                source_category="marketplace",
+                attributes={"card_number": "001/100", "rarity": "SR", "version_code": "sv01"},
+            )
+        ]
 
 
 def test_name_only_lookup_is_marked_ambiguous_and_skips_fair_value(tmp_path) -> None:
@@ -207,6 +230,35 @@ def test_lookup_continues_when_one_source_times_out(tmp_path, caplog) -> None:
     assert result.offers[0].source == "cardrush_pokemon"
     assert "Source client timed out" in caplog.text
     assert "Traceback" not in caplog.text
+
+
+def test_lookup_fans_out_reference_clients_in_parallel(tmp_path) -> None:
+    """Three 0.1s stubs must complete in well under 0.3s once the fan-out
+    runs concurrently. If clients ran serially the total would be ~0.3s."""
+    service = TcgPriceService(
+        db_path=tmp_path / "monitor.sqlite3",
+        reference_clients=(
+            SlowStubClient("a", 0.1),
+            SlowStubClient("b", 0.1),
+            SlowStubClient("c", 0.1),
+        ),
+    )
+
+    start = time.perf_counter()
+    result = service.lookup(
+        TcgCardSpec(
+            game="pokemon",
+            title="テスト",
+            card_number="001/100",
+            rarity="SR",
+            set_code="sv01",
+        ),
+        persist=False,
+    )
+    elapsed = time.perf_counter() - start
+
+    assert elapsed < 0.25, f"clients appear to run serially, elapsed={elapsed:.3f}s"
+    assert {offer.source for offer in result.offers} == {"a", "b", "c"}
 
 
 def test_sealed_box_lookup_drops_starter_sets_and_low_priced_listings(tmp_path) -> None:
