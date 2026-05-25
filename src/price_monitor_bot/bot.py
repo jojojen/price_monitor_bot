@@ -172,6 +172,55 @@ class _ListRow:
 
 
 _CONDITION_PICKER_TITLE = "🎛 設定狀態"
+_WPRC_TAG_RE = re.compile(r"\[wprc:([a-f0-9]{40})\]")
+
+
+def _render_watch_edit_view(
+    processor: "TelegramCommandProcessor", watch_id: str
+) -> tuple[str, dict[str, object]] | None:
+    """Build the single-watch detailed edit view (text + inline keyboard)."""
+    watch_db = getattr(processor, "_watch_db", None)
+    if watch_db is None:
+        return None
+    watch = watch_db.get_marketplace_watch(watch_id)
+    if watch is None:
+        return None
+
+    market_chips = " ".join(
+        f"{_marketplace_source_display(m)[1]}{_marketplace_source_display(m)[0]}"
+        for m in watch.markets
+    ) or "(無)"
+
+    lines = [
+        f"✏️  {watch.query}",
+        "",
+        f"💰 上限：¥{watch.price_threshold_jpy:,}",
+        f"🛍 平台：{market_chips}",
+    ]
+    if "mercari" in watch.markets:
+        condition_ids = _condition_ids_from_options(watch.options_for("mercari"))
+        lines.append(f"🎛 Mercari 狀態：{_summarize_condition_ids_short(condition_ids)}")
+
+    keyboard: list[list[dict[str, object]]] = []
+
+    keyboard.append([{"text": "💰 修改上限", "callback_data": f"wprc:{watch_id}"}])
+
+    mkt_row = []
+    for m in DEFAULT_MARKETS:
+        name, emoji = _marketplace_source_display(m)
+        check = "✓" if m in watch.markets else "☐"
+        mkt_row.append({
+            "text": f"{check} {emoji}{name}",
+            "callback_data": f"wmkt:{watch_id}:{m}",
+        })
+    keyboard.append(mkt_row)
+
+    if "mercari" in watch.markets:
+        keyboard.append([{"text": "🎛 Mercari 狀態", "callback_data": f"cond:{watch_id}:open"}])
+
+    keyboard.append([{"text": "← 返回清單", "callback_data": "wback:"}])
+
+    return "\n".join(lines), {"inline_keyboard": keyboard}
 
 
 def _summarize_condition_ids_short(condition_ids: tuple[int, ...]) -> str:
@@ -1306,13 +1355,12 @@ class TelegramCommandProcessor:
                 _marketplace_source_display(m)[1] for m in w.markets
             ) or "—"
             extra_lines: list[str] = []
-            extra_buttons = ()
+            extra_buttons = (
+                {"text": "✏️ 詳細編輯", "callback_data": f"wedit:{w.watch_id}"},
+            )
             if "mercari" in w.markets:
                 condition_ids = _condition_ids_from_options(w.options_for("mercari"))
                 extra_lines.append(f"  Mercari 狀態：{_summarize_condition_ids_short(condition_ids)}")
-                extra_buttons = (
-                    {"text": "🎛 Mercari 狀態", "callback_data": f"cond:{w.watch_id}:open"},
-                )
             if mode == LIST_VIEW_MODE_EDIT:
                 # Edit mode: text body is empty (label_button carries item info)
                 text_block = ""
@@ -3274,9 +3322,11 @@ def _handle_condition_callback(
         return None, text, kb
 
     if action == "done":
-        text, kb, _ = processor.render_watchlist_view(
-            page=_guess_current_page(original_text), mode=LIST_VIEW_MODE_EDIT
-        )
+        result = _render_watch_edit_view(processor, watch_id)
+        if result:
+            text, kb = result
+        else:
+            text, kb, _ = processor.render_watchlist_view(mode=LIST_VIEW_MODE_EDIT)
         return "✓ 已更新狀態條件", text, kb
 
     if action == "t" and extra.isdigit():
@@ -3696,6 +3746,73 @@ def handle_telegram_callback_query(
                             "Sending clarification plan from callback failed chat_id=%s prefix=%s n=%d",
                             mask_identifier(chat_id), prefix, option_n,
                         )
+    elif prefix == "wedit" and payload:
+        # Open single-watch detailed edit view
+        result = _render_watch_edit_view(processor, payload)
+        if result:
+            new_text, new_reply_markup = result
+            rerender = True
+        else:
+            toast = "找不到該追蹤"
+
+    elif prefix == "wmkt" and payload.count(":") == 1:
+        # Toggle a marketplace on/off for a watch
+        watch_id, market = payload.split(":", 1)
+        watch_db = getattr(processor, "_watch_db", None)
+        if watch_db and watch_id:
+            watch = watch_db.get_marketplace_watch(watch_id)
+            if watch:
+                current = set(watch.markets)
+                name, emoji = _marketplace_source_display(market)
+                if market in current:
+                    if len(current) == 1:
+                        toast = "至少要保留一個平台"
+                    else:
+                        current.remove(market)
+                        new_mkt = tuple(m for m in DEFAULT_MARKETS if m in current)
+                        watch_db.update_marketplace_watch(watch_id, markets=new_mkt)
+                        toast = f"已移除 {emoji}{name}"
+                else:
+                    current.add(market)
+                    new_mkt = tuple(m for m in DEFAULT_MARKETS if m in current)
+                    watch_db.update_marketplace_watch(watch_id, markets=new_mkt)
+                    toast = f"已加入 {emoji}{name}"
+                result = _render_watch_edit_view(processor, watch_id)
+                if result:
+                    new_text, new_reply_markup = result
+                    rerender = True
+            else:
+                toast = "找不到該追蹤"
+
+    elif prefix == "wprc" and payload:
+        # Send ForceReply message asking for new price
+        watch_db = getattr(processor, "_watch_db", None)
+        if watch_db:
+            watch = watch_db.get_marketplace_watch(payload)
+            if watch:
+                fr_text = (
+                    f"請輸入「{watch.query}」的新目標上限（日圓整數，例：25000）：\n"
+                    f"[wprc:{payload}]"
+                )
+                try:
+                    client.send_message(
+                        chat_id=chat_id,
+                        text=fr_text,
+                        reply_markup={"force_reply": True, "selective": True},
+                    )
+                except Exception:
+                    logger.exception("wprc: ForceReply send failed watch_id=%s", payload)
+                    toast = "發送失敗"
+            else:
+                toast = "找不到該追蹤"
+
+    elif prefix == "wback":
+        # Return from watch edit view to watchlist edit mode
+        text, kb, _ = processor.render_watchlist_view(mode=LIST_VIEW_MODE_EDIT)
+        new_text = text
+        new_reply_markup = kb
+        rerender = True
+
     elif prefix == "noop":
         pass  # label buttons — silently acknowledge, no action
     else:
@@ -3760,6 +3877,31 @@ def handle_telegram_message(
     text_value = text if isinstance(text, str) else None
     photo_items = message.get("photo")
     has_photo = isinstance(photo_items, list) and bool(photo_items)
+
+    # ForceReply price update — check before intake ack so it doesn't misfire NLP
+    if text_value and not has_photo:
+        reply_to = message.get("reply_to_message")
+        if isinstance(reply_to, dict):
+            rt_text = reply_to.get("text") or ""
+            wprc_m = _WPRC_TAG_RE.search(rt_text) if isinstance(rt_text, str) else None
+            if wprc_m:
+                watch_id = wprc_m.group(1)
+                price_str = text_value.strip().replace(",", "").replace("¥", "").replace("円", "")
+                watch_db = getattr(processor, "_watch_db", None)
+                if price_str.isdigit() and watch_db:
+                    new_price = int(price_str)
+                    watch = watch_db.get_marketplace_watch(watch_id)
+                    if watch:
+                        watch_db.update_marketplace_watch(watch_id, price_threshold_jpy=new_price)
+                        result = _render_watch_edit_view(processor, watch_id)
+                        reply_text = f"✓ 已更新上限 ¥{new_price:,}"
+                        reply_markup = result[1] if result else None
+                        msg_text = f"{reply_text}\n\n{result[0]}" if result else reply_text
+                        client.send_message(chat_id=chat_id, text=msg_text, reply_markup=reply_markup)
+                        return (reply_text,)
+                else:
+                    client.send_message(chat_id=chat_id, text="⚠️ 請輸入純數字，例：25000")
+                    return ("⚠️ 格式錯誤",)
 
     # Immediate intake ack — the downstream pipeline can take a while
     # (vision/OCR/LLM calls), so let the user know we've received their

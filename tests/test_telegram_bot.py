@@ -2105,8 +2105,8 @@ def test_watchlist_edit_mode_each_row_has_delete_and_condition_buttons() -> None
     first_watch_row = kb["inline_keyboard"][1]
     assert len(first_watch_row) == 2
     assert first_watch_row[0]["callback_data"] == "del:wl:wid0000"
-    assert first_watch_row[1]["callback_data"] == "cond:wid0000:open"
-    assert "🎛" in first_watch_row[1]["text"]
+    assert first_watch_row[1]["callback_data"] == "wedit:wid0000"
+    assert "✏️" in first_watch_row[1]["text"]
 
 
 def _setup_watchlist_callback(client_cls=FakeTelegramClient):
@@ -2256,13 +2256,13 @@ def test_callback_query_cond_done_returns_to_watchlist_edit_mode() -> None:
     )
 
     edited = client.edited_messages[0]
-    assert "📋 Marketplace 追蹤（多站）" in edited["text"]
-    # Re-rendered in edit mode → row 0 = label (noop), row 1 = delete + condition.
-    label_row = edited["reply_markup"]["inline_keyboard"][0]
-    assert label_row[0]["callback_data"] == "noop"
-    action_row = edited["reply_markup"]["inline_keyboard"][1]
-    assert action_row[0]["callback_data"].startswith("del:wl:")
-    assert action_row[1]["callback_data"].startswith("cond:")
+    # cond:done now returns to the single-watch edit view, not the watchlist
+    assert "✏️" in edited["text"]
+    assert "💰 上限" in edited["text"]
+    kb_rows = edited["reply_markup"]["inline_keyboard"]
+    # First row is "修改上限", last row is "← 返回清單"
+    assert any("wprc:" in r[0]["callback_data"] for r in kb_rows)
+    assert any("wback:" in r[0]["callback_data"] for r in kb_rows)
 
 
 # ── Paginated /hunt view ──────────────────────────────────────────────────────
