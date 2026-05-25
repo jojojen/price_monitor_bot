@@ -35,10 +35,10 @@ SnapshotFn = Callable[[str, list[str]], None]  # (chat_id, item_urls)
 _SOURCE_DISPLAY: dict[str, tuple[str, str]] = {
     "mercari": ("Mercari", "🛒"),
     "rakuma": ("Rakuma", "🟣"),
+    "yuyutei": ("遊々亭", "📚"),
     # Future:
     # "paypay_fleamarket": ("PayPay フリマ", "💴"),
     # "yahoo_auctions":    ("Yahoo Auctions", "⏰"),
-    # "yuyutei":           ("Yuyutei", "📚"),
 }
 
 
@@ -290,9 +290,11 @@ def default_marketplace_clients() -> dict[str, MarketplaceSearchClient]:
     """The standard set of clients shipped with the bot. Future sources are
     added here so callers don't need to know which clients exist."""
     from market_monitor.rakuma_search import RakumaSearchClient
+    from market_monitor.yuyutei_search import YuyuteiMarketplaceSearchClient
     return {
         "mercari": MercariSearchClient(),
         "rakuma": RakumaSearchClient(),
+        "yuyutei": YuyuteiMarketplaceSearchClient(),
     }
 
 
