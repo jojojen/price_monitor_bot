@@ -2323,13 +2323,23 @@ def _merge_local_vision_candidate(
     if candidate.item_kind == "sealed_box":
         aliases = _dedupe_preserve_order([*parsed.aliases, *candidate.aliases])
         parsed_title_usable = _sealed_box_title_looks_usable(parsed.title)
-        titles_compatible = _local_vision_metadata_is_compatible(parsed, candidate)
-        title = parsed.title
-        if _sealed_box_title_looks_usable(candidate.title):
-            if not parsed_title_usable or titles_compatible:
-                title = candidate.title
-            elif titles_compatible and candidate.title not in aliases:
+        candidate_title_usable = _sealed_box_title_looks_usable(candidate.title)
+        # Sealed-box correctness rule: OCR reads the literal printed text on
+        # the box front, which is ground truth. Local vision LLMs are prone
+        # to hallucinating set names (e.g. "VSTAR UNLIMITED" for a clearly
+        # printed "ポケモンカード 151" box). For sealed boxes there is no
+        # card_number / set_code that could independently corroborate the
+        # vision title, so we cannot trust vision to override OCR — we keep
+        # OCR's title whenever it is usable, and stash the vision suggestion
+        # as an alias for later debugging / future matching.
+        if parsed_title_usable:
+            title = parsed.title
+            if candidate_title_usable and candidate.title and candidate.title not in aliases:
                 aliases.append(candidate.title)
+        elif candidate_title_usable:
+            title = candidate.title
+        else:
+            title = parsed.title  # likely None — caller handles
         if parsed.title and title != parsed.title and parsed.title not in aliases:
             aliases.append(parsed.title)
         warnings = _dedupe_preserve_order(

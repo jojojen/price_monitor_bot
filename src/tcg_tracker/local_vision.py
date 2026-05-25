@@ -367,6 +367,13 @@ class OllamaLocalVisionClient:
             "Ignore chat captions, timestamps, UI chrome, seller overlays, copyright text, pack counts, and stock labels unless they are part of the official product title.\n"
             "For sealed boxes, set item_kind=sealed_box, keep card_number and rarity null, and keep title null instead of guessing.\n"
             "For Japanese Pokemon boxes, preserve the printed Japanese product line exactly as shown on the box front.\n"
+            "Valid title shapes for Pokemon sealed boxes include all of these (return EXACTLY what is printed):\n"
+            "  - A Japanese product-line phrase: e.g. 強化拡張パック / 拡張パック / ハイクラスパック / プレミアムトレーナーボックス\n"
+            "  - A short numeric set token like \"151\" when that is the only big title text on the box front\n"
+            "  - A katakana set name like メガアビスアイ / メガブレイブ / バイオレットex\n"
+            "  - A combined phrase like ポケモンカード151 or 強化拡張パック ポケモンカード151\n"
+            "Do NOT expand a numeric token like \"151\" into a longer guessed product line.\n"
+            "Do NOT invent set names from prior knowledge (e.g. never output VSTAR Universe, VSTAR Unlimited, etc., unless those exact words are clearly printed on the box).\n"
             "If only a partial title fragment is clearly visible, return that exact fragment as title instead of inventing missing words.\n"
             'Use item_kind values "sealed_box" or null.\n'
             'Use game values "pokemon", "ws", or null.\n'
