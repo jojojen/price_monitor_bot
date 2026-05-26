@@ -51,10 +51,13 @@ def _offer(
     product_kind: str | None = None,
     price_kind: str = "ask",
     listing_id: str = "x",
+    is_graded: bool = False,
 ) -> MarketOffer:
     attributes: dict[str, str] = {}
     if product_kind is not None:
         attributes["product_kind"] = product_kind
+    if is_graded:
+        attributes["is_graded"] = "1"
     return MarketOffer(
         source="cardrush_pokemon",
         listing_id=listing_id,
@@ -106,3 +109,56 @@ def test_calculate_treats_missing_product_kind_as_card() -> None:
 
     assert fair_value is not None
     assert fair_value.sample_count == 2
+
+
+def test_calculate_excludes_graded_offers_by_default() -> None:
+    """Default behaviour excludes graded (PSA / BGS / CGC) listings from
+    the fair-value sample — they distort the median upward. Mirrors the
+    UNION ARENA 綾波レイ bug: 3 raw at ~¥4-5k + 1 PSA10 at ¥14k → without
+    exclusion FV becomes ¥7k+; with exclusion FV ≈ raw median."""
+    calculator = FairValueCalculator()
+    offers = [
+        _offer(price=4500, listing_id="raw-a"),
+        _offer(price=5000, listing_id="raw-b"),
+        _offer(price=5200, listing_id="raw-c"),
+        _offer(price=14000, listing_id="psa10", is_graded=True),  # outlier
+    ]
+
+    fair_value = calculator.calculate("item-1", offers)
+
+    assert fair_value is not None
+    # Sample count should be 3 raw (graded excluded)
+    assert fair_value.sample_count == 3
+    # Fair value should be around the raw median (~5000), not pulled toward
+    # the 14000 PSA10 outlier
+    assert 4500 <= fair_value.amount_jpy <= 5500
+
+
+def test_calculate_includes_graded_when_exclude_graded_false() -> None:
+    """Opt-in path for callers that explicitly want graded prices (e.g. a
+    hypothetical /lookup graded command)."""
+    calculator = FairValueCalculator()
+    offers = [
+        _offer(price=5000, listing_id="raw-a"),
+        _offer(price=14000, listing_id="psa10", is_graded=True),
+    ]
+
+    fair_value = calculator.calculate("item-1", offers, exclude_graded=False)
+
+    assert fair_value is not None
+    assert fair_value.sample_count == 2  # both offers counted
+
+
+def test_calculate_returns_none_when_only_graded_offers() -> None:
+    """When every offer is graded and exclude_graded is True (default),
+    return None gracefully rather than synthesising a fair value from 0
+    samples or accidentally including the graded items."""
+    calculator = FairValueCalculator()
+    offers = [
+        _offer(price=14000, listing_id="psa10", is_graded=True),
+        _offer(price=15000, listing_id="psa9", is_graded=True),
+    ]
+
+    fair_value = calculator.calculate("item-1", offers)
+
+    assert fair_value is None

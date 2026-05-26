@@ -11,6 +11,7 @@ from market_monitor.models import MarketOffer
 from market_monitor.normalize import normalize_card_number
 
 from .catalog import TcgCardSpec
+from .grading import looks_like_graded
 from .matching import minimum_match_score, score_tcg_offer
 from .search_terms import generic_card_number_variants
 
@@ -135,6 +136,12 @@ def _offer_from_mercari_item(raw: dict[str, object], *, spec: TcgCardSpec) -> Ma
     thumbnail_url = str(raw.get("thumbnail_url") or "").strip()
     if thumbnail_url:
         attributes["thumbnail_url"] = thumbnail_url
+    if looks_like_graded(title):
+        # Mercari sellers freely use PSA / 鑑定 wording in the title; we flag
+        # so FairValueCalculator can exclude graded listings (huge price
+        # inflation otherwise — a PSA10 listing at ¥14k pulled into the
+        # weighted median of a ~¥5k raw card).
+        attributes["is_graded"] = "1"
 
     return MarketOffer(
         source="mercari",

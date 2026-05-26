@@ -11,6 +11,7 @@ from market_monitor.http import HttpClient
 from market_monitor.models import MarketOffer
 
 from .catalog import TcgCardSpec
+from .grading import looks_like_graded as _looks_like_graded
 from .hot_cards import _parse_magi_text
 from .matching import minimum_match_score, score_tcg_offer
 from .search_terms import build_lookup_terms
@@ -107,6 +108,11 @@ class MagiProductClient:
                 attributes["is_graded"] = "1"
                 if parsed.grade_label:
                     attributes["grade_label"] = parsed.grade_label
+            elif _looks_like_graded(raw_text):
+                # Magi's specialised parser is the primary signal, but the
+                # shared regex helper picks up edge cases (e.g. PSA wording
+                # in the raw_text that the parser missed) — belt-and-braces.
+                attributes["is_graded"] = "1"
 
             offers.append(
                 MarketOffer(

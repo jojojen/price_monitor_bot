@@ -13,6 +13,7 @@ from market_monitor.models import MarketOffer
 from market_monitor.normalize import normalize_card_number
 
 from .catalog import TcgCardSpec
+from .grading import looks_like_graded
 from .matching import minimum_match_score, score_tcg_offer
 from .search_terms import generic_card_number_variants
 
@@ -173,6 +174,8 @@ def _build_offer(
         "set_code": set_code,
         "image_alt": title,
     }
+    if looks_like_graded(title):
+        attributes["is_graded"] = "1"
     return MarketOffer(
         source="surugaya",
         listing_id=listing_id,

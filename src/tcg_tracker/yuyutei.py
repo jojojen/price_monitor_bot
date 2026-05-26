@@ -11,6 +11,7 @@ from market_monitor.http import HttpClient
 from market_monitor.models import MarketOffer
 
 from .catalog import TcgCardSpec
+from .grading import looks_like_graded
 from .matching import minimum_match_score, score_tcg_offer
 from .search_terms import build_lookup_terms
 
@@ -201,6 +202,8 @@ class YuyuteiClient:
             attributes["compare_price_jpy"] = str(compare_price)
         if price_change_direction is not None:
             attributes["price_change_direction"] = price_change_direction
+        if looks_like_graded(title) or looks_like_graded(image_alt):
+            attributes["is_graded"] = "1"
 
         return MarketOffer(
             source="yuyutei",

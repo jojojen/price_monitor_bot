@@ -153,12 +153,26 @@ def _sealed_box_offers(offers: list[MarketOffer]) -> list[MarketOffer]:
     ]
 
 
-def _section_fair_value(result: TcgLookupResult, offers: list[MarketOffer]) -> str | None:
+def _section_fair_value(
+    result: TcgLookupResult,
+    offers: list[MarketOffer],
+    *,
+    is_graded_section: bool = False,
+) -> str | None:
+    """Compute the Fair Value line for one display section.
+
+    `is_graded_section=True` opts out of the default graded-exclusion in
+    FairValueCalculator — when we're rendering the PSA10 / graded section
+    explicitly, those listings ARE the sample and must not be filtered.
+    For all other sections (raw card, sealed box), the default applies:
+    graded offers are dropped so a PSA10 outlier can't inflate the median.
+    """
     expected_kind = "sealed_box" if result.spec.item_kind == "sealed_box" else None
     fair_value = FairValueCalculator().calculate(
         result.item.item_id,
         offers,
         expected_product_kind=expected_kind,
+        exclude_graded=not is_graded_section,
     )
     if fair_value is None:
         return None
@@ -242,14 +256,18 @@ def format_lookup_result_telegram(result: TcgLookupResult) -> str:
     psa10_offers = [offer for offer in result.offers if _offer_section(offer) == _SECTION_PSA10]
     other_graded_offers = [offer for offer in result.offers if _offer_section(offer) == _SECTION_OTHER_GRADED]
 
-    def append_section(label: str, section_offers: list[MarketOffer]) -> None:
+    def append_section(
+        label: str, section_offers: list[MarketOffer], *, is_graded: bool = False
+    ) -> None:
         if not section_offers:
             return
 
         lines.append("")
         lines.append(label)
 
-        fair_value_text = _section_fair_value(result, section_offers)
+        fair_value_text = _section_fair_value(
+            result, section_offers, is_graded_section=is_graded,
+        )
         if fair_value_text is not None:
             lines.append(fair_value_text)
 
@@ -273,8 +291,8 @@ def format_lookup_result_telegram(result: TcgLookupResult) -> str:
             lines.append("n/a")
 
     append_section("Raw", raw_offers)
-    append_section("PSA 10", psa10_offers)
-    append_section("其他鑑定卡", other_graded_offers)
+    append_section("PSA 10", psa10_offers, is_graded=True)
+    append_section("其他鑑定卡", other_graded_offers, is_graded=True)
 
     source_summary = ", ".join(
         f"{source} x{count}" for source, count in sorted(Counter(offer.source for offer in result.offers).items())

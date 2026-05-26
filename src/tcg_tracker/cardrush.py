@@ -13,6 +13,7 @@ from market_monitor.http import HttpClient
 from market_monitor.models import MarketOffer
 
 from .catalog import TcgCardSpec
+from .grading import looks_like_graded
 from .hot_cards import CARDRUSH_BROWSER_HEADERS, _parse_cardrush_text
 from .matching import minimum_match_score, score_tcg_offer
 from .search_terms import build_lookup_terms
@@ -160,6 +161,8 @@ class CardrushPokemonClient:
                 attributes["product_kind"] = "sealed_box"
             if parsed.listing_count is not None:
                 attributes["listing_count"] = str(parsed.listing_count)
+            if looks_like_graded(raw_text) or looks_like_graded(parsed.title):
+                attributes["is_graded"] = "1"
 
             offers.append(
                 MarketOffer(
@@ -305,6 +308,8 @@ class CardrushYugiohClient:
             }
             if parsed.listing_count is not None:
                 attributes["listing_count"] = str(parsed.listing_count)
+            if looks_like_graded(image_alt) or looks_like_graded(parsed.title):
+                attributes["is_graded"] = "1"
 
             offers.append(
                 MarketOffer(

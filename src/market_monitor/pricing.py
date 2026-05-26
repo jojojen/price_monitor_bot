@@ -41,6 +41,7 @@ class FairValueCalculator:
         offers: Iterable[MarketOffer],
         *,
         expected_product_kind: str | None = None,
+        exclude_graded: bool = True,
     ) -> FairValueEstimate | None:
         offer_list = list(offers)
         if expected_product_kind is not None:
@@ -48,6 +49,16 @@ class FairValueCalculator:
                 offer
                 for offer in offer_list
                 if (offer.attributes.get("product_kind") or "card") == expected_product_kind
+            ]
+        if exclude_graded:
+            # Graded (PSA / BGS / CGC / 鑑定済) listings trade at multiples of
+            # the raw-card price; mixing them into the weighted median pulls
+            # fair_value sharply upward and creates phantom "discount"
+            # opportunities. Default behaviour is to exclude them — callers
+            # that specifically want graded prices opt in via exclude_graded=False.
+            offer_list = [
+                offer for offer in offer_list
+                if offer.attributes.get("is_graded") != "1"
             ]
         if not offer_list:
             return None

@@ -24,6 +24,7 @@ from market_monitor.http import HttpClient
 from market_monitor.models import MarketOffer
 
 from .catalog import TcgCardSpec
+from .grading import looks_like_graded
 from .matching import minimum_match_score, score_tcg_offer
 from .search_terms import build_lookup_terms
 from .sealed_box_filters import looks_like_sealed_box_listing
@@ -123,6 +124,17 @@ class SnkrdunkClient:
                 continue
             url = href if href.startswith("http") else f"{SNKRDUNK_BASE_URL}{href}"
             listing_id = url.rsplit("/", 1)[-1]
+            attributes: dict[str, str] = {
+                # Mark product kind via the shared classifier so the
+                # downstream sealed-box prefilter / matching code can
+                # rely on a single source of truth.
+                "product_kind": (
+                    "sealed_box" if looks_like_sealed_box_listing(title) else "card"
+                ),
+                "image_alt": title,
+            }
+            if looks_like_graded(title):
+                attributes["is_graded"] = "1"
             offers.append(
                 MarketOffer(
                     source="snkrdunk",
@@ -133,15 +145,7 @@ class SnkrdunkClient:
                     price_kind="market",
                     captured_at=now,
                     source_category="marketplace",
-                    attributes={
-                        # Mark product kind via the shared classifier so the
-                        # downstream sealed-box prefilter / matching code can
-                        # rely on a single source of truth.
-                        "product_kind": (
-                            "sealed_box" if looks_like_sealed_box_listing(title) else "card"
-                        ),
-                        "image_alt": title,
-                    },
+                    attributes=attributes,
                 )
             )
             if len(offers) >= _MAX_RESULTS:
