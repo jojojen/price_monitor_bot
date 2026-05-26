@@ -3898,6 +3898,38 @@ def handle_telegram_callback_query(
                     logger.exception("fbprc: ForceReply send failed item_id=%s", payload)
                     toast = "發送失敗"
 
+    elif prefix == "fbpos" and payload:
+        # Positive-feedback callback: one-tap thumbs-up, no ForceReply.
+        # Writes a polarity='positive' row directly via feedback_service.
+        feedback_service = getattr(processor, "_feedback_service", None)
+        watch_db = getattr(processor, "_watch_db", None)
+        if feedback_service is None or watch_db is None:
+            toast = "回饋功能未啟用"
+        else:
+            item = watch_db.find_item(payload)
+            if item is None:
+                toast = "找不到該品項，可能已過期"
+            else:
+                fair_value = watch_db.latest_fair_value_for(payload)
+                try:
+                    from tcg_tracker.catalog import TcgCardSpec as _TcgCardSpec
+                    spec = _TcgCardSpec.from_tracked_item(item)
+                except Exception:
+                    logger.exception("fbpos: failed to build spec from item_id=%s", payload)
+                    toast = "解析品項失敗"
+                else:
+                    try:
+                        feedback_service.submit_positive(
+                            item=item,
+                            spec=spec,
+                            chat_id=chat_id,
+                            original_fair_value_jpy=fair_value,
+                        )
+                        toast = "👍 已記錄"
+                    except Exception:
+                        logger.exception("fbpos: submit_positive failed item_id=%s", payload)
+                        toast = "回饋寫入失敗"
+
     elif prefix == "wback":
         # Return from watch edit view to watchlist edit mode
         text, kb, _ = processor.render_watchlist_view(mode=LIST_VIEW_MODE_EDIT)

@@ -448,6 +448,133 @@ def test_save_and_find_feedback_event(tmp_path: Path) -> None:
     assert found["extraction_confidence"] == "high"
 
 
+def test_save_positive_feedback_writes_polarity_column(tmp_path: Path) -> None:
+    """Positive-feedback rows are written through the same save method as
+    negative ones; they distinguish themselves with polarity='positive'
+    plus empty URL/extraction fields."""
+    from market_monitor.models import PriceFeedbackEvent, utc_now
+    db = MonitorDatabase(tmp_path / "fb.sqlite3")
+    db.bootstrap()
+    item = _make_item()
+    db.upsert_item(item)
+    now = utc_now()
+    db.save_price_feedback(PriceFeedbackEvent(
+        feedback_id="fbk-pos-001",
+        chat_id="12345",
+        item_id=item.item_id,
+        game="pokemon",
+        item_kind="sealed_box",
+        original_fair_value_jpy=16800,
+        claimed_url="",
+        claimed_domain="",
+        url_hash="",
+        extracted_price_jpy_pass1=None,
+        extracted_price_jpy_pass2=None,
+        consistency_pct=None,
+        consensus_pct=None,
+        extraction_confidence="high",
+        raw_html_gzipped=None,
+        llm_notes_json="{}",
+        status="positive_ack",
+        polarity="positive",
+        created_at=now,
+        updated_at=now,
+    ))
+    with db.connect() as connection:
+        row = connection.execute(
+            "SELECT polarity, status, claimed_url FROM price_feedback_events WHERE feedback_id=?",
+            ("fbk-pos-001",),
+        ).fetchone()
+    assert row["polarity"] == "positive"
+    assert row["status"] == "positive_ack"
+    assert row["claimed_url"] == ""
+
+
+def test_existing_feedback_event_defaults_to_negative_polarity(tmp_path: Path) -> None:
+    """Existing call-sites that construct PriceFeedbackEvent without setting
+    polarity must continue to work — the field defaults to 'negative' so
+    backward compatibility is preserved."""
+    from market_monitor.models import PriceFeedbackEvent, utc_now
+    db = MonitorDatabase(tmp_path / "fb.sqlite3")
+    db.bootstrap()
+    item = _make_item()
+    db.upsert_item(item)
+    now = utc_now()
+    db.save_price_feedback(PriceFeedbackEvent(
+        feedback_id="fbk-legacy",
+        chat_id="12345",
+        item_id=item.item_id,
+        game="pokemon",
+        item_kind="sealed_box",
+        original_fair_value_jpy=16800,
+        claimed_url="https://example.com/x",
+        claimed_domain="example.com",
+        url_hash="legacyhash",
+        extracted_price_jpy_pass1=16500,
+        extracted_price_jpy_pass2=17100,
+        consistency_pct=3.6,
+        consensus_pct=0.0,
+        extraction_confidence="high",
+        raw_html_gzipped=None,
+        llm_notes_json="{}",
+        status="analyzed",
+        created_at=now,
+        updated_at=now,
+    ))
+    with db.connect() as connection:
+        row = connection.execute(
+            "SELECT polarity FROM price_feedback_events WHERE feedback_id=?",
+            ("fbk-legacy",),
+        ).fetchone()
+    assert row["polarity"] == "negative"
+
+
+def test_migrate_add_feedback_polarity_idempotent_on_legacy_db(tmp_path: Path) -> None:
+    """A DB created before the polarity column shipped must gain the
+    column via _migrate_add_feedback_polarity on next bootstrap. Repeated
+    bootstraps stay no-op."""
+    import sqlite3
+    db_path = tmp_path / "fb.sqlite3"
+    # Pre-create the legacy schema WITHOUT the polarity column
+    legacy = sqlite3.connect(db_path)
+    legacy.execute("""
+        CREATE TABLE price_feedback_events (
+            feedback_id TEXT PRIMARY KEY,
+            chat_id TEXT,
+            item_id TEXT NOT NULL,
+            game TEXT NOT NULL,
+            item_kind TEXT NOT NULL,
+            original_fair_value_jpy INTEGER,
+            claimed_url TEXT NOT NULL,
+            claimed_domain TEXT NOT NULL,
+            url_hash TEXT NOT NULL,
+            extracted_price_jpy_pass1 INTEGER,
+            extracted_price_jpy_pass2 INTEGER,
+            consistency_pct REAL,
+            consensus_pct REAL,
+            extraction_confidence TEXT NOT NULL,
+            raw_html_gzipped BLOB,
+            llm_notes_json TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL DEFAULT 'analyzed',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    legacy.commit()
+    legacy.close()
+
+    db = MonitorDatabase(db_path)
+    db.bootstrap()
+    db.bootstrap()  # second call must remain a no-op
+
+    with db.connect() as connection:
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(price_feedback_events)").fetchall()
+        }
+    assert "polarity" in columns
+
+
 def test_bump_domain_trust_creates_then_updates(tmp_path: Path) -> None:
     db = MonitorDatabase(tmp_path / "fb.sqlite3")
     db.bootstrap()

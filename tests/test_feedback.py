@@ -163,3 +163,73 @@ def test_few_shot_examples_forwarded_to_extractor(tmp_path: Path) -> None:
     assert extractor.last_kwargs is not None
     fewshot = extractor.last_kwargs.get("few_shot_examples") or ()
     assert any(e.domain == "yuyu-tei.jp" for e in fewshot)
+
+
+def test_submit_positive_writes_polarity_row_without_fetching(tmp_path: Path) -> None:
+    """submit_positive must not touch the HTTP client or LLM extractor and
+    must persist a polarity='positive' / status='positive_ack' row."""
+    http = _StubHttp(raises=AssertionError("HTTP must not be called for positive feedback"))
+    extractor = _StubExtractor([(0, "MUST NOT RUN")])
+    db, svc = _make_service(tmp_path, http=http, extractor=extractor)
+    spec, item = _make_spec_and_item(db)
+
+    outcome = svc.submit_positive(
+        item=item, spec=spec, chat_id=12345,
+        original_fair_value_jpy=16800,
+    )
+    assert outcome.status == "positive_ack"
+    assert outcome.confidence == "high"
+    assert outcome.extracted_avg_jpy == 16800
+    assert http.calls == 0
+    assert extractor.calls == 0
+    assert "👍" in outcome.summary_for_user
+
+    with db.connect() as connection:
+        row = connection.execute(
+            "SELECT polarity, status, claimed_url FROM price_feedback_events WHERE item_id=?",
+            (item.item_id,),
+        ).fetchone()
+    assert row is not None
+    assert row["polarity"] == "positive"
+    assert row["status"] == "positive_ack"
+    assert row["claimed_url"] == ""
+
+
+def test_submit_positive_handles_unknown_fair_value(tmp_path: Path) -> None:
+    """If the latest fair value lookup returned None (no FV cached yet),
+    submit_positive still writes a row with original_fair_value_jpy=None
+    rather than crashing."""
+    http = _StubHttp(raises=AssertionError("HTTP must not be called"))
+    extractor = _StubExtractor([(0, "MUST NOT RUN")])
+    db, svc = _make_service(tmp_path, http=http, extractor=extractor)
+    spec, item = _make_spec_and_item(db)
+
+    outcome = svc.submit_positive(
+        item=item, spec=spec, chat_id=12345,
+        original_fair_value_jpy=None,
+    )
+    assert outcome.status == "positive_ack"
+    assert outcome.extracted_avg_jpy is None
+
+
+def test_build_lookup_feedback_keyboard_has_both_polarity_buttons() -> None:
+    """Regression: the inline keyboard for a price-lookup result must
+    expose BOTH the positive (fbpos) and negative (fbprc) feedback
+    callbacks. Removing either button silently drops half the feedback
+    signal so a test guards both."""
+    from price_monitor_bot.formatters import build_lookup_feedback_keyboard
+    from market_monitor.models import TrackedItem
+    from tcg_tracker.service import TcgLookupResult
+    from tcg_tracker.catalog import TcgCardSpec
+
+    spec = TcgCardSpec(game="pokemon", title="MEGA アビスアイ", item_kind="sealed_box")
+    item = spec.to_tracked_item()
+    result = TcgLookupResult(spec=spec, item=item, offers=(), fair_value=None)
+
+    keyboard = build_lookup_feedback_keyboard(result)
+    assert keyboard is not None
+    rows = keyboard["inline_keyboard"]
+    flat = [btn for row in rows for btn in row]
+    callback_prefixes = {btn["callback_data"].split(":", 1)[0] for btn in flat}
+    assert "fbpos" in callback_prefixes
+    assert "fbprc" in callback_prefixes

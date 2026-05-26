@@ -189,14 +189,23 @@ def _section_reference_offer(offers: list[MarketOffer]) -> MarketOffer | None:
 
 def build_lookup_feedback_keyboard(result: TcgLookupResult) -> dict[str, object] | None:
     """Inline keyboard for the price-feedback flow. Returns None if no item_id
-    is available (shouldn't happen in practice). callback_data is
-    ``fbprc:<item_id>`` — must be <=64 bytes per Telegram spec; tcg-* item_ids
-    are ~20 chars so plenty of headroom."""
+    is available (shouldn't happen in practice).
+
+    Two callbacks share the same item_id payload:
+
+    - ``fbprc:<item_id>`` (negative): opens the URL ForceReply flow and runs
+      LLM extraction against the reference URL.
+    - ``fbpos:<item_id>`` (positive): one-tap acknowledgement — writes a
+      ``polarity='positive'`` row into ``price_feedback_events`` directly.
+
+    Telegram spec limits callback_data to <=64 bytes; ``tcg-*`` item_ids are
+    ~20 chars so both prefixes fit comfortably."""
     item_id = getattr(result.item, "item_id", None)
     if not item_id:
         return None
     return {
         "inline_keyboard": [[
+            {"text": "👍 合理", "callback_data": f"fbpos:{item_id}"},
             {"text": "❌ 價格不合理", "callback_data": f"fbprc:{item_id}"},
         ]],
     }

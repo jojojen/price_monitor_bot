@@ -64,7 +64,9 @@ FeedbackStatus = Literal[
     "extraction_failed",
     "low_consistency",
     "low_consensus",
+    "positive_ack",
 ]
+FeedbackPolarity = Literal["negative", "positive"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +88,7 @@ class PriceFeedbackEvent:
     raw_html_gzipped: bytes | None
     llm_notes_json: str
     status: FeedbackStatus
+    polarity: FeedbackPolarity = "negative"
     created_at: datetime = field(default_factory=utc_now)
     updated_at: datetime = field(default_factory=utc_now)
 

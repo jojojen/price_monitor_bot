@@ -104,6 +104,7 @@ CREATE TABLE IF NOT EXISTS price_feedback_events (
     raw_html_gzipped BLOB,
     llm_notes_json TEXT NOT NULL DEFAULT '{}',
     status TEXT NOT NULL DEFAULT 'analyzed',
+    polarity TEXT NOT NULL DEFAULT 'negative',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     FOREIGN KEY (item_id) REFERENCES tracked_items(item_id) ON DELETE CASCADE
@@ -308,7 +309,26 @@ class MonitorDatabase:
             # Each is idempotent; on a fresh DB both no-op.
             self._migrate_mercari_to_marketplace_v1(connection)
             self._migrate_marketplace_v1_to_v2(connection)
+            self._migrate_add_feedback_polarity(connection)
             connection.executescript(SCHEMA_MARKETPLACE)
+
+    def _migrate_add_feedback_polarity(self, connection: sqlite3.Connection) -> None:
+        """Add ``polarity`` to existing ``price_feedback_events`` tables.
+
+        Fresh DBs get the column from ``SCHEMA_BASE``; this migration only
+        runs on DBs created before the positive-feedback button shipped.
+        Idempotent: skips silently when the column is already present."""
+        if not _table_exists(connection, "price_feedback_events"):
+            return
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(price_feedback_events)").fetchall()
+        }
+        if "polarity" in columns:
+            return
+        connection.execute(
+            "ALTER TABLE price_feedback_events ADD COLUMN polarity TEXT NOT NULL DEFAULT 'negative'"
+        )
 
     def _backup_db_file(self, *, suffix: str) -> None:
         """Make a timestamped copy of the DB file before destructive migration.
@@ -938,10 +958,10 @@ class MonitorDatabase:
                     original_fair_value_jpy, claimed_url, claimed_domain, url_hash,
                     extracted_price_jpy_pass1, extracted_price_jpy_pass2,
                     consistency_pct, consensus_pct, extraction_confidence,
-                    raw_html_gzipped, llm_notes_json, status,
+                    raw_html_gzipped, llm_notes_json, status, polarity,
                     created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event.feedback_id,
@@ -961,6 +981,7 @@ class MonitorDatabase:
                     event.raw_html_gzipped,
                     event.llm_notes_json,
                     event.status,
+                    event.polarity,
                     event.created_at.isoformat()
                         if isinstance(event.created_at, datetime)
                         else event.created_at,

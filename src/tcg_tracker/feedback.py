@@ -79,6 +79,75 @@ class TcgPriceFeedbackService:
         self.extractor = extractor or LlmListingExtractor()
         self._fetch_timeout = fetch_timeout_seconds
 
+    def submit_positive(
+        self,
+        *,
+        item: TrackedItem,
+        spec: TcgCardSpec,
+        chat_id: str | int | None,
+        original_fair_value_jpy: int | None,
+    ) -> FeedbackOutcome:
+        """One-tap thumbs-up: user has confirmed the displayed fair-value is
+        reasonable. No URL to fetch, no LLM extraction — we just write a
+        ``polarity='positive'`` row to the same feedback table so positive
+        and negative feedback live in one queryable timeline."""
+        chat_key = str(chat_id) if chat_id is not None else None
+        created_at = utc_now()
+        feedback_id = MonitorDatabase._feedback_id(
+            item_id=item.item_id,
+            chat_id=chat_key,
+            url_hash=f"positive-{item.item_id}",
+            created_at=created_at.isoformat(),
+        )
+        event = PriceFeedbackEvent(
+            feedback_id=feedback_id,
+            chat_id=chat_key,
+            item_id=item.item_id,
+            game=spec.game,
+            item_kind=spec.item_kind,
+            original_fair_value_jpy=original_fair_value_jpy,
+            claimed_url="",
+            claimed_domain="",
+            url_hash="",
+            extracted_price_jpy_pass1=None,
+            extracted_price_jpy_pass2=None,
+            consistency_pct=None,
+            consensus_pct=None,
+            extraction_confidence="high",
+            raw_html_gzipped=None,
+            llm_notes_json="{}",
+            status="positive_ack",
+            polarity="positive",
+            created_at=created_at,
+            updated_at=created_at,
+        )
+        self.db.save_price_feedback(event)
+        fv_text = _fmt_jpy(original_fair_value_jpy)
+        summary = (
+            "👍 已記錄你對這個估價的正面回饋。\n"
+            f"確認價：{fv_text}"
+        )
+        return FeedbackOutcome(
+            feedback_id=feedback_id,
+            domain="",
+            extracted_avg_jpy=original_fair_value_jpy,
+            consistency_pct=None,
+            consensus_pct=None,
+            confidence="high",
+            status="positive_ack",
+            domain_trust=DomainTrust(
+                domain_id="",
+                game=spec.game,
+                item_kind=spec.item_kind,
+                domain="",
+                vote_count=0,
+                consensus_success_count=0,
+                consensus_fail_count=0,
+                bayes_accuracy_score=0.0,
+            ),
+            summary_for_user=summary,
+        )
+
     def submit(
         self,
         *,
