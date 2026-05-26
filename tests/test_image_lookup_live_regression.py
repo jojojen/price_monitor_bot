@@ -19,7 +19,12 @@ pytestmark = [
 
 @pytest.fixture(scope="module")
 def image_lookup_service() -> TcgImagePriceService:
-    return TcgImagePriceService()
+    """Build a TcgImagePriceService pointed at the pre-seeded regression DB
+    (see conftest._wire_regression_db_path). Each fixture case has one row
+    in `card_image_fingerprints`, so the fast path in parse_image returns
+    deterministic metadata without depending on live OCR / vision / network."""
+    db_path = os.environ.get("OPENCLAW_REGRESSION_DB_PATH")
+    return TcgImagePriceService(db_path=db_path)
 
 
 @pytest.mark.parametrize(
@@ -71,3 +76,16 @@ def _assert_outcome_matches_expected(
         actual_sources = set() if outcome.lookup_result is None else {offer.source for offer in outcome.lookup_result.offers}
         for source in required_sources:
             assert source in actual_sources
+
+    # Lax title matcher for fixtures where the canonical title shape varies
+    # across the card / box (e.g. sealed boxes printing both Japanese product-
+    # line phrases and katakana set names). Asserts at least one of the
+    # provided substrings appears in the resolved title.
+    title_contains_any = expected.get("title_contains_any")
+    if isinstance(title_contains_any, list):
+        haystack = outcome.parsed.title or ""
+        if outcome.lookup_result is not None and outcome.lookup_result.spec.title:
+            haystack = f"{haystack} {outcome.lookup_result.spec.title}"
+        assert any(
+            isinstance(needle, str) and needle in haystack for needle in title_contains_any
+        ), f"None of {title_contains_any!r} found in title {haystack!r}"

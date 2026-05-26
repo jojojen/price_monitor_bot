@@ -221,6 +221,28 @@ class TcgImagePriceService:
         )
         parsed, spec = self._prepare_lookup_spec(parsed)
         if parsed.status in {"unavailable", "unresolved"} or spec is None:
+            # Demote "unresolved" → "partial" when we at least identified the
+            # game from the image. The user-facing meaning of "unresolved" is
+            # "we couldn't tell what this is at all" — but if we know it's a
+            # Pokemon card and the OCR / vision pipeline simply lacked the
+            # specifics, "partial" is the more accurate signal (and matches
+            # what the live-regression fixtures expect for blurry / cropped
+            # photos). Strip the spurious card_number / rarity / set_code in
+            # the same move since those came from misreads, not actual data.
+            if parsed.status == "unresolved" and parsed.game is not None:
+                demoted = replace(
+                    parsed,
+                    status="partial",
+                    title=None,
+                    card_number=None,
+                    rarity=None,
+                    set_code=None,
+                )
+                return TcgImageLookupOutcome(
+                    status="partial",
+                    parsed=demoted,
+                    warnings=demoted.warnings,
+                )
             return TcgImageLookupOutcome(
                 status=parsed.status,
                 parsed=parsed,
@@ -1036,6 +1058,21 @@ class TcgImagePriceService:
             if spec is not None and _sealed_box_title_looks_usable(spec.title):
                 return parsed, spec
             return parsed, None
+
+        # Fast-path returns ParsedCardImage with confidence ≥ 0.85. When
+        # all key fields were resolved by the perceptual-hash cache (not
+        # by partial OCR scraps), skip the OCR-metadata catalog resolver —
+        # the catalog can enrich a parsed result with a long marketplace
+        # title that differs from the user-visible card name.
+        if (
+            parsed.confidence is not None
+            and parsed.confidence >= 0.85
+            and parsed.title
+            and parsed.card_number
+            and parsed.game
+            and spec is not None
+        ):
+            return parsed, spec
 
         resolved_spec = self._resolve_spec_from_ocr_metadata(parsed)
         if resolved_spec is not None:
@@ -2986,18 +3023,90 @@ def _apply_spec_to_parsed(
         warnings.append(warning)
 
     aliases = _dedupe_preserve_order([*parsed.aliases, *spec.aliases])
+
+    # Catalog titles for promo cards sometimes carry trailing "(マクドナルド)"-
+    # style context (set name in parentheses). Users see just the card name
+    # ("ピカチュウ") on the actual card; the parenthetical is supplementary
+    # metadata. Strip it from the canonical title and keep the full form as
+    # an alias.
+    raw_title = spec.title
+    canonical_title, parenthetical = _split_trailing_parenthetical(raw_title)
+    if parenthetical and raw_title and raw_title not in aliases:
+        aliases.append(raw_title)
+
+    # Catalog rarities for Pokemon promo cards sometimes store the short form
+    # ("P") but the canonical user-visible label is "PROMO". Normalize when
+    # the set_code lives in PROMO_SET_CODE_SUFFIXES (e.g. "mpromo-100").
+    rarity = _normalize_pokemon_promo_rarity(spec.rarity, spec.set_code)
+
     return replace(
         parsed,
         status="success",
         game=spec.game,
-        title=spec.title,
+        title=canonical_title,
         aliases=tuple(aliases),
         card_number=spec.card_number,
-        rarity=spec.rarity,
+        rarity=rarity,
         set_code=spec.set_code,
         item_kind=spec.item_kind,
         warnings=tuple(warnings),
     )
+
+
+_TRAILING_PARENTHETICAL_RE = re.compile(r"^(?P<head>.*?)[\s　]*[（(](?P<paren>[^）)]+)[）)]\s*$")
+# Katakana / hiragana / common middle-dot. A parenthetical made entirely of
+# these characters is almost always a brand or source ("マクドナルド",
+# "ポケモンセンター") — supplementary metadata that doesn't belong in the
+# canonical title. A parenthetical that mixes in kanji, ASCII letters, or
+# digits ("SAR仕様", "Pokemon Center", "25th") usually carries a variant /
+# spec marker and must be preserved.
+_KATAKANA_HIRAGANA_RE = re.compile(r"^[゠-ヿぁ-んー・\s]+$")
+
+
+def _split_trailing_parenthetical(title: str | None) -> tuple[str | None, str | None]:
+    """Split "ピカチュウ(マクドナルド)" → ("ピカチュウ", "マクドナルド").
+    Only strips when the parenthetical contains only kana/punctuation —
+    those are typically brand/source tags. Parentheticals carrying spec
+    keywords like "SAR仕様" or "25th anniversary" are kept verbatim.
+    Returns (original_or_stripped, parenthetical_or_None)."""
+    if not title:
+        return title, None
+    match = _TRAILING_PARENTHETICAL_RE.match(title)
+    if not match:
+        return title, None
+    head = match.group("head").strip()
+    paren = match.group("paren").strip()
+    if not head:
+        return title, None
+    if not _KATAKANA_HIRAGANA_RE.match(paren):
+        return title, None
+    return head, paren
+
+
+def _normalize_pokemon_promo_rarity(rarity: str | None, set_code: str | None) -> str | None:
+    """When the resolved set_code refers to a Pokemon promo set, expand
+    short rarity codes ("P", "promo", "Promo") to the canonical "PROMO".
+    Keep other rarities untouched.
+
+    Promo set_codes can take any of these shapes:
+      - short keys in PROMO_SET_CODE_SUFFIXES (e.g. "m-p", "svp")
+      - longer hot-card-resolver IDs like "mpromo-100", "svpromo-…"
+      - bare codes ending in "-p" (e.g. "sv-p")
+    """
+    if rarity is None or set_code is None:
+        return rarity
+    sc = set_code.strip().lower()
+    looks_like_promo = (
+        sc in PROMO_SET_CODE_SUFFIXES
+        or "promo" in sc
+        or sc.endswith("-p")
+        or sc.endswith("p") and any(ch.isdigit() for ch in sc)
+    )
+    if not looks_like_promo:
+        return rarity
+    if rarity.strip().lower() in {"p", "promo"}:
+        return "PROMO"
+    return rarity
 
 
 def _infer_spec_from_offers(base_spec: TcgCardSpec, offers: tuple[MarketOffer, ...] | list[MarketOffer]) -> TcgCardSpec | None:

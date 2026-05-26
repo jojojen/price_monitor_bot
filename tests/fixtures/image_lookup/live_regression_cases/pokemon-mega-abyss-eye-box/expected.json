@@ -1,0 +1,20 @@
+{
+  "case_id": "pokemon-mega-abyss-eye-box",
+  "original_filename": "snkrdunk-806644-bg-removed.webp",
+  "source_url": "https://snkrdunk.com/apparels/806644",
+  "image_url": "https://cdn.snkrdunk.com/upload_bg_removed/667a6ca8-42f7-48fb-933c-e9b30def7a98.webp",
+  "expected": {
+    "status": "success",
+    "parsed": {
+      "game": "pokemon",
+      "item_kind": "sealed_box"
+    },
+    "lookup_spec": {
+      "game": "pokemon",
+      "item_kind": "sealed_box"
+    },
+    "min_offer_count": 1,
+    "title_contains_any": ["アビスアイ", "MEGA", "メガ"],
+    "notes": "Snkrdunk's bg-removed product thumbnail for the MEGA アビスアイ booster box. The crawler hashes this exact image into card_image_fingerprints, so any future user photo of the same box should hit the perceptual-hash fast path with Hamming ≤ 5. Title intentionally lax (title_contains_any) because the printed name on the box front varies between product-line phrase (\"強化拡張パック\"), katakana set name (\"メガアビスアイ\"), Roman+katakana form (\"MEGA アビスアイ\"), and the full product line."
+  }
+}
