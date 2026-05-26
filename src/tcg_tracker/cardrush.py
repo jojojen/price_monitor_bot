@@ -64,10 +64,28 @@ class CardrushPokemonClient:
         )
         return matched
 
+    # Early termination thresholds — cardrush is slow (per-term ~1-2s + many
+    # variants from build_lookup_terms means 20+ search calls otherwise).
+    # Stop once we have enough candidates to score; downstream filtering
+    # works fine with 6 offers across 4 search terms.
+    _MAX_SEARCH_TERMS = 4
+    _ENOUGH_OFFERS = 6
+
     def _search_candidates(self, spec: TcgCardSpec) -> list[MarketOffer]:
         offers: list[MarketOffer] = []
         seen: set[str] = set()
-        for search_word in build_lookup_terms(spec):
+        for idx, search_word in enumerate(build_lookup_terms(spec)):
+            if idx >= self._MAX_SEARCH_TERMS:
+                logger.debug(
+                    "Cardrush stopping after %d search terms (cap reached); offers so far=%d",
+                    self._MAX_SEARCH_TERMS, len(offers),
+                )
+                break
+            if len(offers) >= self._ENOUGH_OFFERS:
+                logger.debug(
+                    "Cardrush stopping early; already have %d unique offers", len(offers),
+                )
+                break
             logger.debug("Cardrush search term=%s", search_word)
             try:
                 html = self.http_client.get_text(
@@ -185,10 +203,17 @@ class CardrushYugiohClient:
                 matched.append(replace(offer, score=score))
         return matched
 
+    _MAX_SEARCH_TERMS = 4
+    _ENOUGH_OFFERS = 6
+
     def _search_candidates(self, spec: TcgCardSpec) -> list[MarketOffer]:
         offers: list[MarketOffer] = []
         seen: set[str] = set()
-        for search_word in build_lookup_terms(spec):
+        for idx, search_word in enumerate(build_lookup_terms(spec)):
+            if idx >= self._MAX_SEARCH_TERMS:
+                break
+            if len(offers) >= self._ENOUGH_OFFERS:
+                break
             logger.debug("Cardrush Yugioh search term=%s", search_word)
             try:
                 html = self.http_client.get_text(

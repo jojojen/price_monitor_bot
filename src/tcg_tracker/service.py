@@ -104,15 +104,22 @@ class TcgPriceService:
             self.tier1_clients = (primary_client,)
             self.tier2_clients = ()
         else:
-            # Production default: snkrdunk + yuyutei (Tier 1) + the rest (Tier 2)
+            # Production default tiering rationale:
+            # Tier 1 (blocks the response): snkrdunk + yuyutei (broad
+            # general index) + cardrush_pokemon + cardrush_yugioh (per-game
+            # specialty stores; they early-exit for non-matching games so
+            # they're cheap when game ≠ pokemon/yugioh, and they're the
+            # ONLY reliable source for Pokemon when yuyutei is rate-limited).
+            # Tier 2 (best-effort, dropped past grace): magi, surugaya,
+            # mercari — slower / less reliable / per-game.
             shared_http_client = HttpClient(user_agent=yuyutei_user_agent)
             self.tier1_clients = (
                 SnkrdunkClient(shared_http_client),
                 primary_client,
-            )
-            self.tier2_clients = (
                 CardrushPokemonClient(shared_http_client),
                 CardrushYugiohClient(shared_http_client),
+            )
+            self.tier2_clients = (
                 MagiProductClient(shared_http_client),
                 SurugayaClient(shared_http_client),
                 MercariReferenceClient(),
