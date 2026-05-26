@@ -1,0 +1,13 @@
+{
+  "case_id": "pokemon-go",
+  "game": "pokemon",
+  "item_kind": "sealed_box",
+  "set_name_canonical": "ポケモンGO",
+  "title_contains_any": [
+    "ポケモンGO",
+    "ポケGO",
+    "GO"
+  ],
+  "source_url": "https://snkrdunk.com/apparels/58920",
+  "image_url": "https://cdn.snkrdunk.com/upload_bg_removed/20220620101014-0.webp"
+}

@@ -2403,6 +2403,17 @@ def _sealed_box_title_looks_usable(value: str | None) -> bool:
     }
     if compact_cleaned in generic_compacts:
         return False
+    # Reject titles that are nothing but a list of generic markers (e.g.
+    # "強化拡張パック / 拡張パック"). The vision model produces this shape
+    # when it leaks the example notation from the prompt and we should not
+    # treat it as a real set name. Split on the separators a model might
+    # emit (slash, fullwidth slash, comma, fullwidth comma, Japanese 、) and
+    # check whether every non-empty fragment is itself a bare generic marker.
+    fragments = [frag.strip() for frag in re.split(r"[/／,，、]", cleaned) if frag.strip()]
+    if len(fragments) >= 2:
+        compact_fragments = [re.sub(r"\s+", "", frag) for frag in fragments]
+        if all(frag in generic_compacts for frag in compact_fragments):
+            return False
     if _contains_japanese(cleaned):
         return len(compact_cleaned) >= 3
 

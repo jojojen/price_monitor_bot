@@ -1,0 +1,13 @@
+{
+  "case_id": "mega-premium-trainer-box",
+  "game": "pokemon",
+  "item_kind": "sealed_box",
+  "set_name_canonical": "プレミアムトレーナーボックスMEGA",
+  "title_contains_any": [
+    "プレミアムトレーナー",
+    "トレーナー",
+    "MEGA"
+  ],
+  "source_url": "https://snkrdunk.com/apparels/628150",
+  "image_url": "https://cdn.snkrdunk.com/upload_bg_removed/20250805020821-0.webp"
+}

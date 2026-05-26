@@ -12,6 +12,7 @@ from tcg_tracker.image_lookup import (
     TcgImagePriceService,
     _merge_local_vision_candidate,
     _repair_pokemon_card_number_with_slab,
+    _sealed_box_title_looks_usable,
     _select_footer_from_candidates,
     _title_looks_implausible,
     _validate_footer_candidate,
@@ -1320,6 +1321,50 @@ def test_local_vision_prompts_have_no_few_shot_collector_numbers() -> None:
             assert leak not in rendered, (
                 f"Few-shot leak detected: {prompt_fn.__name__} still contains {leak!r}"
             )
+
+
+def test_sealed_box_title_prompt_does_not_list_generic_markers_as_first_example() -> None:
+    """Regression: the sealed-box title prompt used to lead with
+    ``強化拡張パック / 拡張パック / ハイクラスパック / プレミアムトレーナーボックス``
+    as a *positive* example. Vision models (especially gemma3:12b) echoed
+    that whole slash-separated string back as the title whenever they
+    couldn't read the specific set name on the box — for instance on a
+    MEGA アビスアイ booster box. The prompt must not present this list as
+    a valid title shape; it should treat it as an anti-pattern."""
+    client = OllamaLocalVisionClient(endpoint="http://x", model="m", timeout_seconds=1)
+    rendered = client._build_sealed_box_title_prompt(game_hint="pokemon", title_hint=None)
+    assert "強化拡張パック / 拡張パック" not in rendered
+    assert "/ ハイクラスパック /" not in rendered
+    assert "プレミアムトレーナーボックス" not in rendered
+
+
+def test_sealed_box_title_looks_usable_rejects_slash_separated_generic_markers() -> None:
+    """The vision model occasionally returns titles that are a slash-
+    separated list of generic Japanese product-line words. Those are leaked
+    example notation, not a real box title. The usability filter must
+    reject them so downstream selection skips the polluted candidate."""
+    assert not _sealed_box_title_looks_usable("強化拡張パック / 拡張パック")
+    assert not _sealed_box_title_looks_usable("拡張パック / ハイクラスパック")
+    assert not _sealed_box_title_looks_usable("強化拡張パック/拡張パック")  # no spaces
+    assert not _sealed_box_title_looks_usable("強化拡張パック、拡張パック")  # JP comma
+    assert not _sealed_box_title_looks_usable("強化拡張パック，拡張パック")  # fullwidth comma
+    assert not _sealed_box_title_looks_usable("強化拡張パック／拡張パック")  # fullwidth slash
+
+
+def test_sealed_box_title_looks_usable_accepts_real_set_names() -> None:
+    """Positive cases the filter must keep accepting — these are the
+    shapes a real box front prints. Guards against the new anti-list rule
+    becoming over-eager."""
+    # Roman + katakana set names
+    assert _sealed_box_title_looks_usable("MEGA アビスアイ")
+    assert _sealed_box_title_looks_usable("MEGA ブレイブ")
+    # Katakana-only
+    assert _sealed_box_title_looks_usable("メガアビスアイ")
+    # Combined product line + set name (the canonical "good" form)
+    assert _sealed_box_title_looks_usable("強化拡張パック ポケモンカード151")
+    assert _sealed_box_title_looks_usable("強化拡張パック ポケモンカード151 未開封BOX")
+    # Numeric set token combined with product line (the way real boxes print it)
+    assert _sealed_box_title_looks_usable("ポケモンカード151")
 
 
 def test_parse_image_treats_low_confidence_as_unresolved(monkeypatch, tmp_path) -> None:
