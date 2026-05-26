@@ -3592,7 +3592,11 @@ def handle_telegram_callback_query(
     rerender = False
 
     if prefix == "snsdel" and payload:
-        # Legacy notification path: delete by @handle, replace keyboard.
+        # Notification one-tap delete. The storage layer (delete_watch_rule)
+        # automatically appends a polarity='negative' row to
+        # sns_auto_discovery_feedback + ratchets the per-domain actionable
+        # threshold up by DISCOVERY_TIGHTENING_STEP — see
+        # sns_monitor.storage.SnsDatabase.record_auto_discovery_feedback.
         handle = payload.lstrip("@")
         reply = processor._handle_sns_delete(f"@{handle}")
         if reply.startswith("✓"):
@@ -3605,6 +3609,40 @@ def handle_telegram_callback_query(
             rerender = True
         else:
             toast = reply[:200]
+    elif prefix == "snsaddok" and payload:
+        # Notification one-tap positive feedback. Looks up the rule's
+        # domains and writes polarity='positive' to the feedback table —
+        # bumps keep_count for each domain, leaves the threshold untouched
+        # (the learning loop tightens-only on negatives, never loosens).
+        handle = payload.lstrip("@")
+        sns_db = getattr(processor, "_sns_db", None)
+        if sns_db is None:
+            toast = "SNS monitor 未啟用，無法寫入回饋"
+        else:
+            try:
+                from sns_monitor.models import AccountWatch as _AccountWatch
+                rule = next(
+                    (
+                        r
+                        for r in sns_db.list_watch_rules()
+                        if isinstance(r, _AccountWatch)
+                        and (r.screen_name or "").lower() == handle.lower()
+                    ),
+                    None,
+                )
+                domains = tuple(getattr(rule, "domains", ()) or ()) if rule else ()
+                sns_db.record_auto_discovery_feedback(
+                    screen_name=handle,
+                    polarity="positive",
+                    domains=domains,
+                    chat_id=str(chat_id),
+                )
+                toast = f"👍 已記錄 @{handle}"
+                new_text = f"{original_text}\n\n👍 已記錄為投資訊號帳號"
+                rerender = True
+            except Exception:
+                logger.exception("snsaddok: positive feedback failed handle=@%s", handle)
+                toast = "回饋寫入失敗"
     elif prefix == "snsfb" and payload:
         # Inline-button feedback on a single SNS post (account or keyword watch).
         # Payload format: "<kind>:<tweet_id>:<rule_id>" where kind ∈ {up,down,bought}.
