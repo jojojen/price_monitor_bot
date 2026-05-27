@@ -16,7 +16,7 @@ from market_monitor.pricing import FairValueCalculator
 from market_monitor.storage import MonitorDatabase
 
 from .catalog import TcgCardSpec
-from .cardrush import CardrushPokemonClient, CardrushYugiohClient
+from .cardrush import CardrushOnepieceClient, CardrushPokemonClient, CardrushYugiohClient
 from .magi import MagiProductClient
 from .mercari_reference import MercariReferenceClient
 from .snkrdunk import SnkrdunkClient
@@ -118,6 +118,7 @@ class TcgPriceService:
                 primary_client,
                 CardrushPokemonClient(shared_http_client),
                 CardrushYugiohClient(shared_http_client),
+                CardrushOnepieceClient(shared_http_client),
             )
             self.tier2_clients = (
                 MagiProductClient(shared_http_client),

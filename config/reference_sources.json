@@ -44,9 +44,20 @@
     "notes": "Use for Union Arena card normalization and metadata verification, not price estimation."
   },
   {
+    "id": "one_piece_official_cardlist",
+    "name": "One Piece Card Game Official Card List",
+    "games": ["one_piece"],
+    "source_kind": "official_metadata",
+    "reference_roles": ["canonical_name", "card_number", "title", "product_line"],
+    "price_weight": 0.0,
+    "trust_score": 1.0,
+    "url": "https://www.onepiece-cardgame.com/cardlist/",
+    "notes": "Use for One Piece card normalization and metadata verification, not price estimation."
+  },
+  {
     "id": "yuyutei",
     "name": "Yuyu-Tei",
-    "games": ["pokemon", "ws", "yugioh", "union_arena"],
+    "games": ["pokemon", "ws", "yugioh", "union_arena", "one_piece"],
     "source_kind": "specialty_store",
     "reference_roles": ["ask_price", "bid_price", "inventory_signal"],
     "price_weight": 0.9,
@@ -110,6 +121,17 @@
     "notes": "Useful Yugioh single-card retail reference."
   },
   {
+    "id": "cardrush_one_piece_sell",
+    "name": "Card Rush One Piece Sell",
+    "games": ["one_piece"],
+    "source_kind": "specialty_store",
+    "reference_roles": ["ask_price", "inventory_signal"],
+    "price_weight": 0.87,
+    "trust_score": 0.88,
+    "url": "https://www.cardrush-op.jp/",
+    "notes": "Useful One Piece TCG single-card retail reference."
+  },
+  {
     "id": "hareruya2_buy",
     "name": "Hareruya 2 Buylist",
     "games": ["pokemon"],
@@ -145,7 +167,7 @@
   {
     "id": "magi_generic_tcg_search",
     "name": "Magi Generic TCG Search",
-    "games": ["yugioh", "union_arena"],
+    "games": ["yugioh", "union_arena", "one_piece"],
     "source_kind": "marketplace",
     "reference_roles": ["listing_price", "market_depth", "supply_signal"],
     "price_weight": 0.62,
@@ -156,7 +178,7 @@
   {
     "id": "mercari",
     "name": "Mercari JP",
-    "games": ["pokemon", "ws", "yugioh", "union_arena"],
+    "games": ["pokemon", "ws", "yugioh", "union_arena", "one_piece"],
     "source_kind": "marketplace",
     "reference_roles": ["listing_price", "new_listing_alert", "seller_signal"],
     "price_weight": 0.82,
@@ -167,7 +189,7 @@
   {
     "id": "yahoo_fleamarket",
     "name": "Yahoo Flea Market",
-    "games": ["pokemon", "ws", "yugioh", "union_arena"],
+    "games": ["pokemon", "ws", "yugioh", "union_arena", "one_piece"],
     "source_kind": "marketplace",
     "reference_roles": ["listing_price", "market_depth"],
     "price_weight": 0.68,
@@ -178,7 +200,7 @@
   {
     "id": "rakuma",
     "name": "Rakuma",
-    "games": ["pokemon", "ws", "yugioh", "union_arena"],
+    "games": ["pokemon", "ws", "yugioh", "union_arena", "one_piece"],
     "source_kind": "marketplace",
     "reference_roles": ["listing_price", "market_depth"],
     "price_weight": 0.65,

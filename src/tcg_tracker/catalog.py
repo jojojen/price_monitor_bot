@@ -12,6 +12,7 @@ GAME_CODES = {
     "ws": "ws",
     "yugioh": "ygo",
     "union_arena": "ua",
+    "one_piece": "opc",
 }
 SUPPORTED_GAMES = tuple(GAME_CODES)
 GAME_ALIASES = {
@@ -41,6 +42,19 @@ GAME_ALIASES = {
     "unionarea": "union_arena",
     "ua": "union_arena",
     "ユニオンアリーナ": "union_arena",
+    "one_piece": "one_piece",
+    "onepiece": "one_piece",
+    "optcg": "one_piece",
+    "opcg": "one_piece",
+    "op_tcg": "one_piece",
+    "opc": "one_piece",
+    "ワンピース": "one_piece",
+    "ワンピースカード": "one_piece",
+    "ワンピースカードゲーム": "one_piece",
+    "one_piece_card_game": "one_piece",
+    "one_piece_tcg": "one_piece",
+    "航海王": "one_piece",
+    "海賊王": "one_piece",
 }
 ITEM_KINDS = {"card", "sealed_box"}
 
@@ -58,7 +72,7 @@ def normalize_game_key(value: str | None) -> str | None:
 
 
 def supported_game_hint() -> str:
-    return "pokemon, ws, yugioh/ygo, union_arena/ua"
+    return "pokemon, ws, yugioh/ygo, union_arena/ua, one_piece/optcg"
 
 
 def build_tcg_item_id(

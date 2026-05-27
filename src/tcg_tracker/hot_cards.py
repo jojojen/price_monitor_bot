@@ -28,6 +28,7 @@ MAGI_POKEMON_LIST_URL = "https://magi.camp/brands/3/items"
 YUYUTEI_WS_TOP_URL = "https://yuyu-tei.jp/top/ws"
 YUYUTEI_YUGIOH_TOP_URL = "https://yuyu-tei.jp/top/ygo"
 YUYUTEI_UNION_ARENA_TOP_URL = "https://yuyu-tei.jp/top/ua"
+YUYUTEI_ONE_PIECE_TOP_URL = "https://yuyu-tei.jp/top/opc"
 SNKRDUNK_POKEMON_MONTHLY_TRADES_URL = "https://snkrdunk.com/articles/31649/"
 SNKRDUNK_POKEMON_UR_TRADES_URL = "https://snkrdunk.com/articles/31962/"
 SNKRDUNK_POKEMON_SA_TRADES_URL = "https://snkrdunk.com/articles/31708/"
@@ -198,16 +199,18 @@ class TcgHotCardService:
         self._buy_signal_cache: dict[str, tuple[float, HotCardBuySignal | None]] = {}
 
     def load_boards(self, *, limit: int = DEFAULT_BOARD_LIMIT) -> tuple[HotCardBoard, ...]:
-        with ThreadPoolExecutor(max_workers=4) as executor:
+        with ThreadPoolExecutor(max_workers=5) as executor:
             pokemon_future = executor.submit(self.load_pokemon_board, limit=limit)
             ws_future = executor.submit(self.load_ws_board, limit=limit)
             yugioh_future = executor.submit(self.load_yugioh_board, limit=limit)
             union_arena_future = executor.submit(self.load_union_arena_board, limit=limit)
+            one_piece_future = executor.submit(self.load_one_piece_board, limit=limit)
             return (
                 pokemon_future.result(),
                 ws_future.result(),
                 yugioh_future.result(),
                 union_arena_future.result(),
+                one_piece_future.result(),
             )
 
     def load_pokemon_board(self, *, limit: int = DEFAULT_BOARD_LIMIT) -> HotCardBoard:
@@ -282,8 +285,29 @@ class TcgHotCardService:
             items=items,
         )
 
+    def load_one_piece_board(self, *, limit: int = DEFAULT_BOARD_LIMIT) -> HotCardBoard:
+        parsed_items, methodology = self._load_yuyutei_top_board_items(
+            game="one_piece",
+            source_code="opc",
+            top_url=YUYUTEI_ONE_PIECE_TOP_URL,
+            label="One Piece",
+            minimum_price_jpy=300,
+        )
+        items = self._build_ranked_entries(
+            game="one_piece",
+            parsed_items=parsed_items,
+            limit=limit,
+        )
+        return HotCardBoard(
+            game="one_piece",
+            label="One Piece Liquidity Board",
+            methodology=methodology,
+            generated_at=datetime.now(timezone.utc),
+            items=items,
+        )
+
     def resolve_lookup_spec(self, spec: TcgCardSpec) -> TcgCardSpec | None:
-        if spec.game not in {"pokemon", "ws", "yugioh", "union_arena"}:
+        if spec.game not in {"pokemon", "ws", "yugioh", "union_arena", "one_piece"}:
             return None
         if spec.card_number:
             return None
@@ -600,6 +624,15 @@ class TcgHotCardService:
                 top_url=YUYUTEI_UNION_ARENA_TOP_URL,
                 label="Union Arena",
                 minimum_price_jpy=200,
+            )
+            return parsed_items
+        if game == "one_piece":
+            parsed_items, _ = self._load_yuyutei_top_board_items(
+                game="one_piece",
+                source_code="opc",
+                top_url=YUYUTEI_ONE_PIECE_TOP_URL,
+                label="One Piece",
+                minimum_price_jpy=300,
             )
             return parsed_items
         return []
@@ -1925,6 +1958,8 @@ def _build_social_query(*, game: str, item: _ParsedHotItem) -> str:
         query_parts.append("遊戯王")
     elif game == "union_arena":
         query_parts.append("ユニオンアリーナ")
+    elif game == "one_piece":
+        query_parts.append("ワンピースカード")
 
     if item.rarity and _looks_like_rarity(item.rarity):
         query_parts.append(item.rarity.upper())

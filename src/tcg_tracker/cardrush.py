@@ -23,6 +23,8 @@ CARDRUSH_BASE_URL = "https://www.cardrush-pokemon.jp"
 CARDRUSH_PRODUCT_LIST_URL = f"{CARDRUSH_BASE_URL}/product-list"
 CARDRUSH_YUGIOH_BASE_URL = "https://www.cardrush.jp"
 CARDRUSH_YUGIOH_PRODUCT_LIST_URL = f"{CARDRUSH_YUGIOH_BASE_URL}/product-list/0/0/normal"
+CARDRUSH_ONE_PIECE_BASE_URL = "https://www.cardrush-op.jp"
+CARDRUSH_ONE_PIECE_PRODUCT_LIST_URL = f"{CARDRUSH_ONE_PIECE_BASE_URL}/product-list"
 logger = logging.getLogger(__name__)
 
 
@@ -327,6 +329,130 @@ class CardrushYugiohClient:
                 )
             )
         return offers
+
+class CardrushOnepieceClient:
+    _cooldown_seconds = 600.0
+    _disabled_until_monotonic = 0.0
+    _disabled_lock = threading.Lock()
+
+    def __init__(self, http_client: HttpClient | None = None) -> None:
+        self.http_client = http_client or HttpClient()
+
+    def lookup(self, spec: TcgCardSpec, *, minimum_score: float | None = None) -> list[MarketOffer]:
+        if spec.game != "one_piece":
+            return []
+        if self._is_temporarily_disabled():
+            logger.debug("Cardrush One Piece lookup skipped because the source is temporarily disabled.")
+            return []
+
+        resolved_minimum_score = minimum_score if minimum_score is not None else minimum_match_score(spec)
+        matched: list[MarketOffer] = []
+        for offer in self._search_candidates(spec):
+            score = score_tcg_offer(spec, offer)
+            logger.debug("Cardrush One Piece candidate scored score=%s offer=%s", score, _offer_summary(offer))
+            if score >= resolved_minimum_score:
+                matched.append(replace(offer, score=score))
+        return matched
+
+    _MAX_SEARCH_TERMS = 4
+    _ENOUGH_OFFERS = 6
+
+    def _search_candidates(self, spec: TcgCardSpec) -> list[MarketOffer]:
+        offers: list[MarketOffer] = []
+        seen: set[str] = set()
+        for idx, search_word in enumerate(build_lookup_terms(spec)):
+            if idx >= self._MAX_SEARCH_TERMS:
+                break
+            if len(offers) >= self._ENOUGH_OFFERS:
+                break
+            logger.debug("Cardrush One Piece search term=%s", search_word)
+            try:
+                html = self.http_client.get_text(
+                    CARDRUSH_ONE_PIECE_PRODUCT_LIST_URL,
+                    params={"keyword": search_word},
+                    headers=CARDRUSH_BROWSER_HEADERS,
+                )
+            except Exception as exc:
+                self._temporarily_disable()
+                logger.warning(
+                    "Cardrush One Piece search failed term=%s; temporarily disabling the source for %.0f seconds. error=%s",
+                    search_word,
+                    self._cooldown_seconds,
+                    exc,
+                )
+                break
+            raw_offers = self._parse_search_page(html)
+            for offer in raw_offers:
+                if offer.url in seen:
+                    continue
+                seen.add(offer.url)
+                offers.append(offer)
+        return offers
+
+    @classmethod
+    def reset_temporary_disable(cls) -> None:
+        with cls._disabled_lock:
+            cls._disabled_until_monotonic = 0.0
+
+    @classmethod
+    def _temporarily_disable(cls) -> None:
+        with cls._disabled_lock:
+            cls._disabled_until_monotonic = time.monotonic() + cls._cooldown_seconds
+
+    @classmethod
+    def _is_temporarily_disabled(cls) -> bool:
+        with cls._disabled_lock:
+            return time.monotonic() < cls._disabled_until_monotonic
+
+    def _parse_search_page(self, html: str) -> list[MarketOffer]:
+        soup = BeautifulSoup(html, "html.parser")
+        offers: list[MarketOffer] = []
+        for anchor in soup.select("ul.item_list li.list_item_cell div.item_data a[href]"):
+            raw_text = " ".join(anchor.get_text(" ", strip=True).split())
+            if not raw_text:
+                continue
+
+            detail_url = urljoin(CARDRUSH_ONE_PIECE_BASE_URL, anchor["href"])
+            parsed = _parse_cardrush_text(
+                raw_text,
+                detail_url=detail_url,
+                board_url=CARDRUSH_ONE_PIECE_PRODUCT_LIST_URL,
+            )
+            if parsed is None or parsed.price_jpy is None:
+                continue
+
+            listing_id = urlparse(detail_url).path.strip("/") or detail_url
+            attributes = {
+                "card_number": parsed.card_number or "",
+                "rarity": parsed.rarity or "",
+                "version_code": parsed.set_code or "",
+                "set_code": parsed.set_code or "",
+                "image_alt": raw_text,
+            }
+            if _looks_like_sealed_box_listing(raw_text):
+                attributes["product_kind"] = "sealed_box"
+            if parsed.listing_count is not None:
+                attributes["listing_count"] = str(parsed.listing_count)
+            if looks_like_graded(raw_text) or looks_like_graded(parsed.title):
+                attributes["is_graded"] = "1"
+
+            offers.append(
+                MarketOffer(
+                    source="cardrush_one_piece",
+                    listing_id=listing_id,
+                    url=detail_url,
+                    title=parsed.title,
+                    price_jpy=parsed.price_jpy,
+                    price_kind="ask",
+                    captured_at=datetime.now(timezone.utc),
+                    source_category="specialty_store",
+                    availability=None if parsed.listing_count is None else f"stock {parsed.listing_count}",
+                    condition=parsed.condition,
+                    attributes=attributes,
+                )
+            )
+        return offers
+
 
 def _offer_summary(offer: MarketOffer) -> dict[str, object]:
     return {
