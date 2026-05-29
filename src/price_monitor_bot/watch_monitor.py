@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Callable
@@ -26,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 NotifyFn = Callable[[str, str], None]  # (chat_id, text)
 SnapshotFn = Callable[[str, list[str]], None]  # (chat_id, item_urls)
+FairValueFn = Callable[[str], "float | None"]  # query -> 二手均價(JPY) or None
 
 
 # (display name, emoji) per source. Adding a new source = one line here.
@@ -54,12 +56,14 @@ class MarketplaceWatchMonitor:
         clients: Mapping[str, MarketplaceSearchClient],
         notify_fn: NotifyFn,
         snapshot_fn: SnapshotFn | None = None,
+        fair_value_fn: FairValueFn | None = None,
         interval_seconds: int = 60,
     ) -> None:
         self._db = MonitorDatabase(db_path)
         self._clients = dict(clients)
         self._notify_fn = notify_fn
         self._snapshot_fn = snapshot_fn
+        self._fair_value_fn = fair_value_fn
         self._interval = interval_seconds
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -192,7 +196,13 @@ class MarketplaceWatchMonitor:
             new_count, changed_count, market, watch.watch_id, watch.query,
         )
 
-        text = _format_notification(watch=watch, market=market, new_or_changed=new_or_changed)
+        fair_value_avg = self._fair_value_for(watch.query)
+        text = _format_notification(
+            watch=watch,
+            market=market,
+            new_or_changed=new_or_changed,
+            fair_value_avg=fair_value_avg,
+        )
         try:
             self._notify_fn(watch.chat_id, text)
         except Exception:
@@ -226,6 +236,18 @@ class MarketplaceWatchMonitor:
                     )
         return True
 
+    def _fair_value_for(self, query: str) -> float | None:
+        """Best-effort 二手均價 for ``query``; never raises (degrades to None)."""
+        if self._fair_value_fn is None:
+            return None
+        try:
+            return self._fair_value_fn(query)
+        except Exception:
+            logger.exception(
+                "MarketplaceWatchMonitor: fair-value lookup failed query=%s", query,
+            )
+            return None
+
 
 def _summarize_mercari_condition_ids(condition_ids: list[int] | tuple[int, ...] | None) -> str:
     if not condition_ids:
@@ -235,11 +257,33 @@ def _summarize_mercari_condition_ids(condition_ids: list[int] | tuple[int, ...] 
     )
 
 
+# A listing is "划算" when at least this far below the sold-price average,
+# "偏貴" when at least this far above it; in between is "合理".
+_FAIR_VALUE_CHEAP_RATIO = 0.85
+_FAIR_VALUE_PRICEY_RATIO = 1.10
+
+
+def _fair_value_verdict(price_jpy: int, avg_jpy: float) -> str:
+    """One-line 公允價評語 comparing a listing price to the sold-price average.
+    Returns '' when the average is unusable (≤0)."""
+    if avg_jpy <= 0:
+        return ""
+    ratio = price_jpy / avg_jpy
+    diff_pct = abs(1.0 - ratio) * 100
+    avg_txt = f"二手均價 ¥{avg_jpy:,.0f}"
+    if ratio <= _FAIR_VALUE_CHEAP_RATIO:
+        return f"💰 划算：低於{avg_txt} 約 {diff_pct:.0f}%"
+    if ratio >= _FAIR_VALUE_PRICEY_RATIO:
+        return f"⚠️ 偏貴：高於{avg_txt} 約 {diff_pct:.0f}%"
+    return f"≈ 合理：接近{avg_txt}"
+
+
 def _format_notification(
     *,
     watch: MarketplaceWatch,
     market: str,
     new_or_changed: list[dict[str, object]],
+    fair_value_avg: float | None = None,
 ) -> str:
     new_count = sum(1 for i in new_or_changed if i.get("_event") != "price_changed")
     changed_count = sum(1 for i in new_or_changed if i.get("_event") == "price_changed")
@@ -277,6 +321,10 @@ def _format_notification(
             tag = "[新商品]"
         lines.append(f"・{tag} {title}")
         lines.append(f"  ¥{price:,}  {url}")
+        if fair_value_avg:
+            verdict = _fair_value_verdict(price, fair_value_avg)
+            if verdict:
+                lines.append(f"  {verdict}")
     if len(new_or_changed) > 5:
         lines.append(f"  …以及另外 {len(new_or_changed) - 5} 筆")
     return "\n".join(lines)
@@ -284,6 +332,37 @@ def _format_notification(
 
 _monitor_lock = threading.Lock()
 _monitor: MarketplaceWatchMonitor | None = None
+
+
+# Sold-price averages barely move minute-to-minute, and each fetch spins up a
+# Playwright browser (~tens of seconds). Cache per query so a watch that fires
+# repeatedly doesn't re-scrape; negative results (None) are cached too so we
+# don't hammer queries with too few sold samples.
+_FAIR_VALUE_TTL_SECONDS = 6 * 3600
+_fair_value_cache: dict[str, tuple[float, float | None]] = {}  # query -> (fetched_monotonic, avg)
+_fair_value_cache_lock = threading.Lock()
+
+
+def default_fair_value_fn() -> FairValueFn:
+    """A cached wrapper over ``fetch_avg_sold_price`` (Mercari sold-price avg)."""
+    from market_monitor.mercari_search import fetch_avg_sold_price
+
+    def _fn(query: str) -> float | None:
+        now = time.monotonic()
+        with _fair_value_cache_lock:
+            cached = _fair_value_cache.get(query)
+            if cached is not None and (now - cached[0]) < _FAIR_VALUE_TTL_SECONDS:
+                return cached[1]
+        try:
+            avg = fetch_avg_sold_price(query)
+        except Exception:
+            logger.exception("default_fair_value_fn: fetch failed query=%s", query)
+            avg = None
+        with _fair_value_cache_lock:
+            _fair_value_cache[query] = (now, avg)
+        return avg
+
+    return _fn
 
 
 def default_marketplace_clients() -> dict[str, MarketplaceSearchClient]:
@@ -305,6 +384,7 @@ def ensure_monitor(
     snapshot_fn: SnapshotFn | None = None,
     interval_seconds: int = 60,
     clients: Mapping[str, MarketplaceSearchClient] | None = None,
+    fair_value_fn: FairValueFn | None = None,
 ) -> tuple[MarketplaceWatchMonitor, bool]:
     """Return the running monitor singleton, starting it if needed.
     Returns (monitor, started_now)."""
@@ -318,6 +398,7 @@ def ensure_monitor(
             notify_fn=notify_fn,
             snapshot_fn=snapshot_fn,
             interval_seconds=interval_seconds,
+            fair_value_fn=fair_value_fn if fair_value_fn is not None else default_fair_value_fn(),
         )
         _monitor.start()
         return _monitor, True
