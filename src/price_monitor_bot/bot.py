@@ -3680,13 +3680,9 @@ def handle_telegram_callback_query(
                 else:
                     side_effects = list(result.get("side_effects") or ())
                     if kind == "up":
-                        toast = "✓ 已記錄 👍"
+                        toast = "✓ 已記錄 👍（已提高同類推文推播機率）"
                     elif kind == "bought":
-                        if "rule_schedule_shortened" in side_effects:
-                            new_minutes = result.get("new_schedule_minutes")
-                            toast = f"✓ 已記錄 💰（rule 加速檢查 → {new_minutes} 分鐘）"
-                        else:
-                            toast = "✓ 已記錄 💰（schedule 已達 floor）"
+                        toast = "✓ 已記錄 💰（已提高同類推文推播機率）"
                     else:  # down
                         if "rule_disabled" in side_effects:
                             toast = "✓ 已標記不感興趣（累計過閾值，rule 自動停用）"
