@@ -136,6 +136,8 @@ SNS_LIST_COMMANDS = {"/snslist", "/sns_list"}
 SNS_DELETE_COMMANDS = {"/snsdelete", "/sns_delete"}
 SNS_BUZZ_COMMANDS = {"/snsbuzz", "/sns_buzz"}
 KNOWLEDGE_COMMANDS = {"/knowledge", "/kb"}
+BACKUP_COMMANDS = {"/backupclaw", "/backup"}
+RECOVER_COMMANDS = {"/clawrecover", "/recoverclaw"}
 NEW_COMMANDS = {"/new"}
 HUNT_COMMANDS = {"/hunt", "/opportunity"}
 HEAVY_COMMANDS = PRICE_LOOKUP_COMMANDS | TREND_BOARD_COMMANDS | REPUTATION_SNAPSHOT_COMMANDS | WEB_RESEARCH_COMMANDS
@@ -824,6 +826,8 @@ class TelegramCommandProcessor:
         opportunity_target_unpinner: OpportunityTargetUnpinner | None = None,
         knowledge_handler: Callable[[str, str], str] | None = None,
         dynamic_tool_handler: Callable[[str], str] | None = None,
+        backup_handler: Callable[[str], str] | None = None,
+        recover_handler: Callable[[str], str] | None = None,
         collab_backfiller: "object | None" = None,
         feedback_service: "object | None" = None,
     ) -> None:
@@ -847,6 +851,8 @@ class TelegramCommandProcessor:
         self._opportunity_target_unpinner = opportunity_target_unpinner
         self._knowledge_handler = knowledge_handler
         self._dynamic_tool_handler = dynamic_tool_handler
+        self._backup_handler = backup_handler
+        self._recover_handler = recover_handler
         self._collab_backfiller = collab_backfiller
         self._feedback_service = feedback_service
         self._pending_photo_clarifications: dict[str, PendingTelegramPhotoClarification] = {}
@@ -1200,6 +1206,20 @@ class TelegramCommandProcessor:
             return TelegramTextReplyPlan(
                 ack=None,
                 reply=self._handle_knowledge(remainder, str(chat_id)),
+            )
+        if command in BACKUP_COMMANDS:
+            return TelegramTextReplyPlan(
+                ack="收到，正在備份龍蝦的資料庫與自學工具規格…",
+                reply=None,
+                reply_factory=lambda remainder=remainder: self._handle_backup(remainder),
+                run_in_background=True,
+            )
+        if command in RECOVER_COMMANDS:
+            return TelegramTextReplyPlan(
+                ack="收到，正在從備份還原龍蝦的資料庫…",
+                reply=None,
+                reply_factory=lambda remainder=remainder: self._handle_recover(remainder),
+                run_in_background=True,
             )
         if command in NEW_COMMANDS:
             return TelegramTextReplyPlan(
@@ -2388,6 +2408,35 @@ class TelegramCommandProcessor:
             logger.exception("knowledge handler failed raw=%r", raw)
             return f"知識庫指令失敗：{exc}"
 
+    def _handle_backup(self, raw: str) -> str:
+        """Dispatch /backupclaw to the registered backup handler.
+
+        The handler lives in aka_no_claw (it knows the project's data dir and
+        which non-git state must survive a machine migration). The optional
+        remainder is a destination path; empty means the configured default.
+        """
+        if self._backup_handler is None:
+            return "備份指令尚未啟用（需在 aka_no_claw 端註冊 backup_handler）。"
+        try:
+            return self._backup_handler(raw)
+        except Exception as exc:
+            logger.exception("backup handler failed raw=%r", raw)
+            return f"備份失敗：{exc}"
+
+    def _handle_recover(self, raw: str) -> str:
+        """Dispatch /clawrecover to the registered recover handler.
+
+        The handler lives in aka_no_claw. The optional remainder is a source
+        path and/or the ``force`` keyword; empty means the configured default.
+        """
+        if self._recover_handler is None:
+            return "還原指令尚未啟用（需在 aka_no_claw 端註冊 recover_handler）。"
+        try:
+            return self._recover_handler(raw)
+        except Exception as exc:
+            logger.exception("recover handler failed raw=%r", raw)
+            return f"還原失敗：{exc}"
+
     def _handle_new_tool(self, remainder: str) -> str:
         """Dispatch /new to the dynamic-tool runner (registered in aka_no_claw).
 
@@ -2714,6 +2763,11 @@ class TelegramCommandProcessor:
                 "/snsbuzz amd",
                 "--- 動態自寫工具 ---",
                 "/new 幫我查0050今年以來到5月的年化報酬",
+                "--- 資料備份／還原（換機可無縫繼承） ---",
+                "/backupclaw            # 備份到預設外接碟",
+                "/backupclaw /path/to/dir  # 備份到指定路徑",
+                "/clawrecover           # 從預設外接碟還原（重拉專案後用）",
+                "/clawrecover force     # 覆蓋現有資料庫",
                 "--- Opportunity Agent ---",
                 "/hunt status",
                 "/hunt remove 2",
@@ -3293,6 +3347,8 @@ def run_telegram_polling(
     opportunity_target_unpinner: OpportunityTargetUnpinner | None = None,
     knowledge_handler: Callable[[str, str], str] | None = None,
     dynamic_tool_handler: Callable[[str], str] | None = None,
+    backup_handler: Callable[[str], str] | None = None,
+    recover_handler: Callable[[str], str] | None = None,
     feedback_service: "object | None" = None,
     poll_timeout: int = 20,
     notify_startup: bool = False,
@@ -3336,6 +3392,8 @@ def run_telegram_polling(
         opportunity_target_unpinner=opportunity_target_unpinner,
         knowledge_handler=knowledge_handler,
         dynamic_tool_handler=dynamic_tool_handler,
+        backup_handler=backup_handler,
+        recover_handler=recover_handler,
         feedback_service=feedback_service,
     )
     resolved_photo_renderer = photo_renderer or default_photo_renderer()
