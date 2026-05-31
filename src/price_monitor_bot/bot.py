@@ -136,6 +136,7 @@ SNS_LIST_COMMANDS = {"/snslist", "/sns_list"}
 SNS_DELETE_COMMANDS = {"/snsdelete", "/sns_delete"}
 SNS_BUZZ_COMMANDS = {"/snsbuzz", "/sns_buzz"}
 KNOWLEDGE_COMMANDS = {"/knowledge", "/kb"}
+NEW_COMMANDS = {"/new"}
 HUNT_COMMANDS = {"/hunt", "/opportunity"}
 HEAVY_COMMANDS = PRICE_LOOKUP_COMMANDS | TREND_BOARD_COMMANDS | REPUTATION_SNAPSHOT_COMMANDS | WEB_RESEARCH_COMMANDS
 
@@ -374,6 +375,7 @@ class TelegramTextReplyPlan:
     reply_factory: "Callable[[], str | tuple[str, dict[str, object] | None]] | None" = None
     reputation_delivery_factory: "Callable[[], TelegramReputationDelivery] | None" = None
     reply_markup: dict[str, object] | None = None  # optional inline keyboard for list views
+    run_in_background: bool = False  # True only for slow ops like /new codegen
 
     def execute(self) -> str | None:
         text, _ = self._execute_unpacked()
@@ -821,6 +823,7 @@ class TelegramCommandProcessor:
         opportunity_target_pinner: OpportunityTargetPinner | None = None,
         opportunity_target_unpinner: OpportunityTargetUnpinner | None = None,
         knowledge_handler: Callable[[str, str], str] | None = None,
+        dynamic_tool_handler: Callable[[str], str] | None = None,
         collab_backfiller: "object | None" = None,
         feedback_service: "object | None" = None,
     ) -> None:
@@ -843,6 +846,7 @@ class TelegramCommandProcessor:
         self._opportunity_target_pinner = opportunity_target_pinner
         self._opportunity_target_unpinner = opportunity_target_unpinner
         self._knowledge_handler = knowledge_handler
+        self._dynamic_tool_handler = dynamic_tool_handler
         self._collab_backfiller = collab_backfiller
         self._feedback_service = feedback_service
         self._pending_photo_clarifications: dict[str, PendingTelegramPhotoClarification] = {}
@@ -1196,6 +1200,13 @@ class TelegramCommandProcessor:
             return TelegramTextReplyPlan(
                 ack=None,
                 reply=self._handle_knowledge(remainder, str(chat_id)),
+            )
+        if command in NEW_COMMANDS:
+            return TelegramTextReplyPlan(
+                ack="收到，正在找/生成工具並執行（地端模型，可能要 1-2 分鐘）…",
+                reply=None,
+                reply_factory=lambda remainder=remainder: self._handle_new_tool(remainder),
+                run_in_background=True,
             )
         if not content.startswith("/"):
             intent = self._route_natural_language(content)
@@ -2377,6 +2388,20 @@ class TelegramCommandProcessor:
             logger.exception("knowledge handler failed raw=%r", raw)
             return f"知識庫指令失敗：{exc}"
 
+    def _handle_new_tool(self, remainder: str) -> str:
+        """Dispatch /new to the dynamic-tool runner (registered in aka_no_claw).
+
+        The runner uses the strongest local model to write+run a Python tool for
+        requests no fixed command covers, reusing a prior tool when one fits.
+        """
+        if self._dynamic_tool_handler is None:
+            return "/new 尚未啟用（需在 aka_no_claw 端註冊 dynamic_tool_handler，且須有本地 text model）。"
+        try:
+            return self._dynamic_tool_handler(remainder)
+        except Exception as exc:
+            logger.exception("dynamic tool handler failed remainder=%r", remainder)
+            return f"/new 執行失敗：{exc}"
+
     def _build_sns_bulk_add_filter_plan(
         self,
         *,
@@ -2687,6 +2712,8 @@ class TelegramCommandProcessor:
                 "/snslist",
                 "/snsdelete <rule_id>",
                 "/snsbuzz amd",
+                "--- 動態自寫工具 ---",
+                "/new 幫我查0050今年以來到5月的年化報酬",
                 "--- Opportunity Agent ---",
                 "/hunt status",
                 "/hunt remove 2",
@@ -3265,6 +3292,7 @@ def run_telegram_polling(
     opportunity_target_pinner: OpportunityTargetPinner | None = None,
     opportunity_target_unpinner: OpportunityTargetUnpinner | None = None,
     knowledge_handler: Callable[[str, str], str] | None = None,
+    dynamic_tool_handler: Callable[[str], str] | None = None,
     feedback_service: "object | None" = None,
     poll_timeout: int = 20,
     notify_startup: bool = False,
@@ -3307,6 +3335,7 @@ def run_telegram_polling(
         opportunity_target_pinner=opportunity_target_pinner,
         opportunity_target_unpinner=opportunity_target_unpinner,
         knowledge_handler=knowledge_handler,
+        dynamic_tool_handler=dynamic_tool_handler,
         feedback_service=feedback_service,
     )
     resolved_photo_renderer = photo_renderer or default_photo_renderer()
@@ -4189,6 +4218,25 @@ def _send_text_reply_plan(
         delivery = plan.reputation_delivery_factory()
         _send_reputation_delivery(client=client, chat_id=chat_id, delivery=delivery)
         sent.append(delivery.summary_text)
+        return sent
+    # Slow ops (e.g. /new codegen) opt-in to background threading via
+    # plan.run_in_background so the Telegram polling loop stays unblocked.
+    # All other reply_factory calls run synchronously so tests stay simple.
+    if plan.run_in_background and plan.reply_factory is not None:
+        def _bg_factory(
+            _client=client, _chat_id=chat_id, _plan=plan,
+        ) -> None:
+            try:
+                reply, factory_markup = _plan._execute_unpacked()
+                if reply:
+                    markup = factory_markup if factory_markup is not None else _plan.reply_markup
+                    _client.send_message(chat_id=_chat_id, text=reply, reply_markup=markup)
+            except Exception:
+                logger.exception(
+                    "Telegram background reply_factory failed chat_id=%s",
+                    mask_identifier(_chat_id),
+                )
+        threading.Thread(target=_bg_factory, daemon=True).start()
         return sent
     reply, factory_markup = plan._execute_unpacked()
     if reply:
