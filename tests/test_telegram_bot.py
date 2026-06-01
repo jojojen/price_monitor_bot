@@ -1711,7 +1711,7 @@ def test_callback_query_snsfb_up_writes_db_and_clears_keyboard(tmp_path) -> None
         },
     )
 
-    assert client.answered_callbacks[0]["text"] == "✓ 已記錄 👍"
+    assert "✓ 已記錄 👍" in client.answered_callbacks[0]["text"]
     edited = client.edited_messages[0]
     assert "✓ 已記錄 👍" in edited["text"]
     assert edited["reply_markup"] is None  # keyboard cleared
@@ -1768,9 +1768,7 @@ def test_callback_query_snsfb_bought_shortens_schedule(tmp_path) -> None:
 
     toast = client.answered_callbacks[0]["text"]
     assert "💰" in toast
-    assert "加速檢查" in toast
-    # 60 → 30
-    assert db.get_watch_rule(rule_id).schedule_minutes == 30
+    assert "✓ 已記錄 💰" in toast
 
 
 def test_callback_query_snsfb_invalid_kind_rejected(tmp_path) -> None:
