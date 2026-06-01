@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import mimetypes
+import os
 import re
 import ssl
 import tempfile
@@ -3322,6 +3323,136 @@ def build_processing_ack(*, text: str | None = None, has_photo: bool = False) ->
     return None
 
 
+# ── Poll-loop health helpers ───────────────────────────────────────────────
+
+
+class PollHeartbeat:
+    """File-mtime liveness beacon written by the Telegram poll loop each round.
+
+    A companion watchdog thread calls is_stale() to detect the known failure
+    mode: poll loop dies while non-daemon monitor threads keep the process
+    alive, causing launchd to believe the service is healthy while /new and
+    all commands are dead.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def touch(self) -> None:
+        try:
+            self.path.write_text(str(time.time()))
+        except OSError:
+            logger.warning("Heartbeat write failed path=%s", self.path)
+
+    def last_beat(self) -> float | None:
+        try:
+            return float(self.path.read_text().strip())
+        except (OSError, ValueError):
+            return None
+
+    def is_stale(self, max_age_seconds: float, *, now: float | None = None) -> bool:
+        beat = self.last_beat()
+        if beat is None:
+            return False  # never written yet — still in warmup, not stale
+        ref = time.time() if now is None else now
+        return (ref - beat) > max_age_seconds
+
+
+def _is_conflict_error(exc: BaseException) -> bool:
+    """True when exc looks like a Telegram 409 Conflict (duplicate poller)."""
+    msg = str(exc)
+    return "409" in msg or "Conflict" in msg or "terminated by other getUpdates" in msg
+
+
+def _drain_pending_updates(
+    client: TelegramBotClient,
+    *,
+    max_attempts: int = 6,
+    backoff_seconds: float = 5.0,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> int | None:
+    """Drain queued updates at startup, tolerating transient 409 Conflicts.
+
+    Telegram holds the previous session's long-poll slot for up to
+    poll_timeout seconds after a restart; calling getUpdates during that
+    window returns 409 Conflict. We retry with backoff instead of letting the
+    RuntimeError propagate to SystemExit (which kills the poll loop while
+    non-daemon threads keep the process alive — the silent-death failure mode
+    documented in CLAUDE.md).
+
+    Returns the next offset to start from, or None if nothing was pending.
+    """
+    for attempt in range(1, max_attempts + 1):
+        try:
+            pending = client.get_updates(timeout=0)
+            if pending:
+                return int(pending[-1]["update_id"]) + 1
+            return None
+        except RuntimeError as exc:
+            if not _is_conflict_error(exc):
+                raise
+            logger.warning(
+                "Startup drain hit 409 Conflict (attempt %d/%d); sleeping %.0fs before retry",
+                attempt, max_attempts, backoff_seconds,
+            )
+            sleep_fn(backoff_seconds)
+    logger.error(
+        "Startup drain gave up after %d 409 attempts; continuing with offset=None",
+        max_attempts,
+    )
+    return None
+
+
+def start_poll_watchdog(
+    *,
+    heartbeat: PollHeartbeat,
+    client: TelegramBotClient,
+    alert_chat_ids: frozenset[str],
+    max_age_seconds: float,
+    check_interval_seconds: float = 30.0,
+    exit_on_stale: bool = True,
+) -> threading.Thread:
+    """Daemon thread that detects a wedged poll loop and forces a restart.
+
+    When the poll loop dies but daemon monitor threads keep the process alive,
+    launchd sees a healthy process while the bot is non-functional. This
+    watchdog notices the stale heartbeat, sends an alert to the admin chat,
+    then hard-exits so launchd KeepAlive respawns a clean instance.
+    """
+
+    def _run() -> None:
+        alerted = False
+        while True:
+            time.sleep(check_interval_seconds)
+            if not heartbeat.is_stale(max_age_seconds):
+                alerted = False
+                continue
+            logger.error(
+                "Poll loop heartbeat stale > %.0fs — poll loop likely wedged",
+                max_age_seconds,
+            )
+            if not alerted:
+                for cid in alert_chat_ids:
+                    try:
+                        client.send_message(
+                            chat_id=cid,
+                            text="⚠️ OpenClaw poll loop 心跳停止，準備重啟。",
+                        )
+                    except Exception:  # alert path must never crash the watchdog
+                        logger.exception(
+                            "Watchdog alert send failed chat_id=%s", mask_identifier(cid)
+                        )
+                alerted = True
+            if exit_on_stale:
+                logger.error("Watchdog forcing exit so launchd KeepAlive respawns")
+                os._exit(1)
+
+    thread = threading.Thread(target=_run, name="poll-watchdog", daemon=True)
+    thread.start()
+    return thread
+
+
 def run_telegram_polling(
     *,
     token: str,
@@ -3353,6 +3484,8 @@ def run_telegram_polling(
     poll_timeout: int = 20,
     notify_startup: bool = False,
     drop_pending_updates: bool = True,
+    heartbeat_path: Path | None = None,
+    watchdog_enabled: bool = True,
 ) -> int:
     client = TelegramBotClient(token, ssl_context=ssl_context)
     me = client.get_me()
@@ -3367,9 +3500,7 @@ def run_telegram_polling(
 
     offset: int | None = None
     if drop_pending_updates:
-        pending_updates = client.get_updates(timeout=0)
-        if pending_updates:
-            offset = int(pending_updates[-1]["update_id"]) + 1
+        offset = _drain_pending_updates(client)
 
     processor = TelegramCommandProcessor(
         lookup_renderer=lookup_renderer,
@@ -3404,9 +3535,34 @@ def run_telegram_polling(
             client.send_message(chat_id=cid, text="OpenClaw Telegram bot is online.")
             logger.info("Telegram startup notification sent chat_id=%s", mask_identifier(cid))
 
+    hb_path = heartbeat_path or Path("logs/telegram_heartbeat")
+    heartbeat = PollHeartbeat(hb_path)
+    heartbeat.touch()
+    stale_after = float(max(120, poll_timeout * 4))
+    if watchdog_enabled and allowed_chat_ids:
+        start_poll_watchdog(
+            heartbeat=heartbeat,
+            client=client,
+            alert_chat_ids=allowed_chat_ids,
+            max_age_seconds=stale_after,
+        )
+
+    consecutive_errors = 0
     try:
         while True:
-            updates = client.get_updates(offset=offset, timeout=poll_timeout)
+            try:
+                updates = client.get_updates(offset=offset, timeout=poll_timeout)
+            except RuntimeError as exc:
+                consecutive_errors += 1
+                backoff = min(60.0, 2.0 ** min(consecutive_errors, 5))
+                logger.warning(
+                    "getUpdates failed (%s); backoff %.0fs consecutive_errors=%d",
+                    exc, backoff, consecutive_errors,
+                )
+                time.sleep(backoff)
+                continue
+            consecutive_errors = 0
+            heartbeat.touch()
             for update in updates:
                 offset = int(update["update_id"]) + 1
                 callback_query = update.get("callback_query")

@@ -22,6 +22,7 @@ from price_monitor_bot.bot import (
     PendingTelegramPhotoClarification,
     PendingTelegramTextClarification,
     PhotoLookupReply,
+    PollHeartbeat,
     TelegramCommandProcessor,
     TelegramFileAttachment,
     TelegramPhotoIntentAnalysis,
@@ -30,6 +31,8 @@ from price_monitor_bot.bot import (
     TelegramReputationQuery,
     TelegramReputationDelivery,
     TelegramTextIntentOption,
+    _drain_pending_updates,
+    _is_conflict_error,
     build_processing_ack,
     format_liquidity_board,
     format_photo_lookup_result,
@@ -37,6 +40,7 @@ from price_monitor_bot.bot import (
     handle_telegram_message,
     parse_lookup_command,
     parse_reputation_snapshot_command,
+    start_poll_watchdog,
 )
 
 # Every call to `handle_telegram_message` now sends an immediate intake ack
@@ -3010,3 +3014,119 @@ def test_fbprc_url_reply_rejects_non_url(tmp_path: Path) -> None:
 
     assert fake_service.calls == []  # service NOT called
     assert any("不是合法 URL" in m for m in client.sent_messages)
+
+
+# ── Poll-loop health helpers ───────────────────────────────────────────────
+
+
+def test_poll_heartbeat_is_stale_after_threshold(tmp_path: Path) -> None:
+    hb = PollHeartbeat(tmp_path / "hb")
+    hb.touch()
+    stale_now = 500.0
+    beat = hb.last_beat()
+    assert beat is not None
+    assert not hb.is_stale(10.0, now=beat + 5.0)
+    assert hb.is_stale(10.0, now=beat + 11.0)
+
+
+def test_poll_heartbeat_never_stale_if_never_written(tmp_path: Path) -> None:
+    hb = PollHeartbeat(tmp_path / "hb_fresh")
+    assert hb.last_beat() is None
+    assert not hb.is_stale(0.0)
+
+
+def test_is_conflict_error_detects_409() -> None:
+    assert _is_conflict_error(RuntimeError("Telegram API HTTP 409 for getUpdates."))
+
+
+def test_is_conflict_error_detects_conflict_text() -> None:
+    assert _is_conflict_error(RuntimeError("Conflict: terminated by other getUpdates"))
+
+
+def test_is_conflict_error_ignores_other_errors() -> None:
+    assert not _is_conflict_error(RuntimeError("Telegram API HTTP 500 for getUpdates."))
+    assert not _is_conflict_error(RuntimeError("Connection refused"))
+
+
+def test_drain_pending_updates_returns_offset_on_success() -> None:
+    calls: list[int] = []
+
+    class _Client:
+        def get_updates(self, *, offset=None, timeout=0):
+            calls.append(timeout)
+            return [{"update_id": 42}]
+
+    result = _drain_pending_updates(_Client(), sleep_fn=lambda _: None)
+    assert result == 43
+    assert calls == [0]
+
+
+def test_drain_pending_updates_returns_none_when_empty() -> None:
+    class _Client:
+        def get_updates(self, *, offset=None, timeout=0):
+            return []
+
+    assert _drain_pending_updates(_Client(), sleep_fn=lambda _: None) is None
+
+
+def test_drain_pending_updates_retries_on_409_then_succeeds() -> None:
+    attempt = [0]
+
+    class _Client:
+        def get_updates(self, *, offset=None, timeout=0):
+            attempt[0] += 1
+            if attempt[0] < 3:
+                raise RuntimeError("Telegram API HTTP 409 for getUpdates.")
+            return [{"update_id": 7}]
+
+    slept: list[float] = []
+    result = _drain_pending_updates(_Client(), backoff_seconds=1.0, sleep_fn=slept.append)
+    assert result == 8
+    assert attempt[0] == 3
+    assert len(slept) == 2  # slept twice before succeeding
+
+
+def test_drain_pending_updates_gives_up_after_max_attempts() -> None:
+    class _Client:
+        def get_updates(self, *, offset=None, timeout=0):
+            raise RuntimeError("Telegram API HTTP 409 for getUpdates.")
+
+    result = _drain_pending_updates(
+        _Client(), max_attempts=3, backoff_seconds=0.0, sleep_fn=lambda _: None
+    )
+    assert result is None
+
+
+def test_drain_pending_updates_reraises_non_conflict_error() -> None:
+    class _Client:
+        def get_updates(self, *, offset=None, timeout=0):
+            raise RuntimeError("Telegram API HTTP 500 for getUpdates.")
+
+    with pytest.raises(RuntimeError, match="500"):
+        _drain_pending_updates(_Client(), sleep_fn=lambda _: None)
+
+
+def test_start_poll_watchdog_sends_alert_on_stale_heartbeat(tmp_path: Path) -> None:
+    import time as _time
+
+    hb = PollHeartbeat(tmp_path / "hb_wd")
+    alerted: list[str] = []
+
+    class _Client:
+        def send_message(self, *, chat_id, text, **_kw):
+            alerted.append(text)
+            return {}
+
+    # Write a heartbeat that is already 200s stale.
+    (tmp_path / "hb_wd").write_text(str(_time.time() - 200))
+
+    start_poll_watchdog(
+        heartbeat=hb,
+        client=_Client(),
+        alert_chat_ids=frozenset(["999"]),
+        max_age_seconds=10.0,
+        check_interval_seconds=0.05,
+        exit_on_stale=False,
+    )
+    _time.sleep(0.2)
+    assert any("心跳停止" in m for m in alerted)
