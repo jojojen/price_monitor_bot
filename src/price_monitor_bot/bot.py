@@ -831,6 +831,7 @@ class TelegramCommandProcessor:
         backup_handler: Callable[[str], str] | None = None,
         recover_handler: Callable[[str], str] | None = None,
         scorecard_handler: Callable[[str], str] | None = None,
+        rag_callback_handler: "Callable[[str, str, str], tuple[str, object]] | None" = None,
         collab_backfiller: "object | None" = None,
         feedback_service: "object | None" = None,
     ) -> None:
@@ -857,6 +858,7 @@ class TelegramCommandProcessor:
         self._backup_handler = backup_handler
         self._recover_handler = recover_handler
         self._scorecard_handler = scorecard_handler
+        self._rag_callback_handler = rag_callback_handler
         self._collab_backfiller = collab_backfiller
         self._feedback_service = feedback_service
         self._pending_photo_clarifications: dict[str, PendingTelegramPhotoClarification] = {}
@@ -3499,6 +3501,7 @@ def run_telegram_polling(
     backup_handler: Callable[[str], str] | None = None,
     recover_handler: Callable[[str], str] | None = None,
     scorecard_handler: Callable[[str], str] | None = None,
+    rag_callback_handler: "Callable[[str, str, str], tuple[str, object]] | None" = None,
     feedback_service: "object | None" = None,
     poll_timeout: int = 20,
     notify_startup: bool = False,
@@ -3545,6 +3548,7 @@ def run_telegram_polling(
         backup_handler=backup_handler,
         recover_handler=recover_handler,
         scorecard_handler=scorecard_handler,
+        rag_callback_handler=rag_callback_handler,
         feedback_service=feedback_service,
     )
     resolved_photo_renderer = photo_renderer or default_photo_renderer()
@@ -3968,7 +3972,7 @@ def handle_telegram_callback_query(
                 result = record_opportunity_feedback(
                     recommendation_id=rec_id,
                     kind=kind,
-                    collab_backfiller=self._collab_backfiller,
+                    collab_backfiller=processor._collab_backfiller,
                 )
             except Exception:
                 logger.exception("oppfb feedback failed rec_id=%s kind=%s", rec_id, kind)
@@ -4234,6 +4238,18 @@ def handle_telegram_callback_query(
         new_reply_markup = kb
         rerender = True
 
+    elif prefix in ("ragkeep", "ragdel") and payload:
+        rag_handler = getattr(processor, "_rag_callback_handler", None)
+        if rag_handler is None:
+            toast = "RAG digest 功能未啟用"
+        else:
+            try:
+                new_text, new_reply_markup = rag_handler(prefix, payload, original_text)
+                toast = "✅ 已保留" if prefix == "ragkeep" else "🗑️ 已刪除"
+                rerender = True
+            except Exception:
+                logger.exception("rag callback failed prefix=%s entry_id=%s", prefix, payload)
+                toast = "操作失敗，請看 log"
     elif prefix == "noop":
         pass  # label buttons — silently acknowledge, no action
     else:
