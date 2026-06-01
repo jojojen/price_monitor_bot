@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import logging
+import random
 import socket
 import shutil
 import ssl
 import subprocess
+import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -13,6 +15,33 @@ import truststore
 
 logger = logging.getLogger(__name__)
 _TRANSIENT_HTTP_EXCEPTIONS = (HTTPError, URLError, TimeoutError, socket.timeout)
+
+# Status codes worth retrying; anything else (4xx except 429) goes straight to
+# curl fallback without burning time on retries that won't help.
+_RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+_HTTP_MAX_RETRIES = 2
+_HTTP_RETRY_BASE_SEC = 1.5
+_HTTP_RETRY_AFTER_CAP_SEC = 30.0
+
+
+def _is_retryable(exc: Exception) -> bool:
+    if isinstance(exc, HTTPError):
+        return exc.code in _RETRYABLE_STATUS_CODES
+    return isinstance(exc, (URLError, TimeoutError, socket.timeout))
+
+
+def _retry_delay_seconds(exc: Exception, attempt: int) -> float:
+    """Back-off duration before the next retry. Respects Retry-After for 429."""
+    if isinstance(exc, HTTPError) and exc.code == 429:
+        raw = exc.headers.get("Retry-After") if exc.headers else None
+        if raw:
+            try:
+                return min(float(raw), _HTTP_RETRY_AFTER_CAP_SEC)
+            except ValueError:
+                pass
+        return _HTTP_RETRY_AFTER_CAP_SEC
+    jitter = random.uniform(0.5, 1.5)
+    return _HTTP_RETRY_BASE_SEC * jitter * (2.0 ** (attempt - 1))
 
 
 class HttpClient:
@@ -55,31 +84,46 @@ class HttpClient:
         )
         effective_timeout = timeout_seconds if timeout_seconds is not None else self.timeout_seconds
         logger.debug("HTTP GET target=%s timeout_seconds=%s", target, effective_timeout)
-        try:
-            with urlopen(request, timeout=effective_timeout, context=self.ssl_context) as response:
-                payload = response.read()
-                selected_encoding = encoding or response.headers.get_content_charset() or "utf-8"
-                text = payload.decode(selected_encoding, errors="replace")
-                logger.debug(
-                    "HTTP GET completed target=%s status=%s bytes=%s encoding=%s",
-                    target,
-                    getattr(response, "status", "unknown"),
-                    len(payload),
-                    selected_encoding,
+        last_exc: Exception | None = None
+        for attempt in range(1, _HTTP_MAX_RETRIES + 1):
+            try:
+                with urlopen(request, timeout=effective_timeout, context=self.ssl_context) as response:
+                    payload = response.read()
+                    selected_encoding = encoding or response.headers.get_content_charset() or "utf-8"
+                    text = payload.decode(selected_encoding, errors="replace")
+                    logger.debug(
+                        "HTTP GET completed target=%s status=%s bytes=%s encoding=%s",
+                        target,
+                        getattr(response, "status", "unknown"),
+                        len(payload),
+                        selected_encoding,
+                    )
+                    return text
+            except _TRANSIENT_HTTP_EXCEPTIONS as exc:
+                last_exc = exc
+                if not _is_retryable(exc) or attempt == _HTTP_MAX_RETRIES:
+                    break
+                delay = _retry_delay_seconds(exc, attempt)
+                logger.warning(
+                    "HTTP GET transient error attempt=%d/%d target=%s status=%s; retrying in %.1fs",
+                    attempt, _HTTP_MAX_RETRIES, target,
+                    exc.code if isinstance(exc, HTTPError) else type(exc).__name__,
+                    delay,
                 )
-                return text
-        except _TRANSIENT_HTTP_EXCEPTIONS as exc:
-            if isinstance(exc, HTTPError):
-                logger.warning("HTTP GET failed target=%s status=%s; trying curl fallback", target, exc.code)
-            elif isinstance(exc, URLError):
-                logger.warning("HTTP GET failed target=%s reason=%s; trying curl fallback", target, exc.reason)
-            else:
-                logger.warning("HTTP GET timed out target=%s error=%s; trying curl fallback", target, exc)
+                time.sleep(delay)
 
-            curl_text = self._get_text_with_curl(target=target, headers=request_headers, encoding=encoding, timeout=effective_timeout)
-            if curl_text is not None:
-                return curl_text
-            raise
+        assert last_exc is not None
+        if isinstance(last_exc, HTTPError):
+            logger.warning("HTTP GET failed target=%s status=%s; trying curl fallback", target, last_exc.code)
+        elif isinstance(last_exc, URLError):
+            logger.warning("HTTP GET failed target=%s reason=%s; trying curl fallback", target, last_exc.reason)
+        else:
+            logger.warning("HTTP GET timed out target=%s error=%s; trying curl fallback", target, last_exc)
+
+        curl_text = self._get_text_with_curl(target=target, headers=request_headers, encoding=encoding, timeout=effective_timeout)
+        if curl_text is not None:
+            return curl_text
+        raise last_exc
 
     def get_bytes(
         self,
@@ -109,25 +153,40 @@ class HttpClient:
         request = Request(target, headers=request_headers)
         effective_timeout = timeout_seconds if timeout_seconds is not None else self.timeout_seconds
         logger.debug("HTTP GET (bytes) target=%s timeout_seconds=%s", target, effective_timeout)
-        try:
-            with urlopen(request, timeout=effective_timeout, context=self.ssl_context) as response:
-                payload = response.read()
-                logger.debug(
-                    "HTTP GET (bytes) completed target=%s status=%s bytes=%s",
-                    target,
-                    getattr(response, "status", "unknown"),
-                    len(payload),
+        last_exc: Exception | None = None
+        for attempt in range(1, _HTTP_MAX_RETRIES + 1):
+            try:
+                with urlopen(request, timeout=effective_timeout, context=self.ssl_context) as response:
+                    payload = response.read()
+                    logger.debug(
+                        "HTTP GET (bytes) completed target=%s status=%s bytes=%s",
+                        target,
+                        getattr(response, "status", "unknown"),
+                        len(payload),
+                    )
+                    return payload
+            except _TRANSIENT_HTTP_EXCEPTIONS as exc:
+                last_exc = exc
+                if not _is_retryable(exc) or attempt == _HTTP_MAX_RETRIES:
+                    break
+                delay = _retry_delay_seconds(exc, attempt)
+                logger.warning(
+                    "HTTP GET (bytes) transient error attempt=%d/%d target=%s status=%s; retrying in %.1fs",
+                    attempt, _HTTP_MAX_RETRIES, target,
+                    exc.code if isinstance(exc, HTTPError) else type(exc).__name__,
+                    delay,
                 )
-                return payload
-        except _TRANSIENT_HTTP_EXCEPTIONS as exc:
-            if isinstance(exc, HTTPError):
-                logger.warning("HTTP GET (bytes) failed target=%s status=%s; trying curl fallback", target, exc.code)
-            else:
-                logger.warning("HTTP GET (bytes) failed target=%s error=%s; trying curl fallback", target, exc)
-            curl_bytes = self._get_bytes_with_curl(target=target, headers=request_headers, timeout=effective_timeout)
-            if curl_bytes is not None:
-                return curl_bytes
-            raise
+                time.sleep(delay)
+
+        assert last_exc is not None
+        if isinstance(last_exc, HTTPError):
+            logger.warning("HTTP GET (bytes) failed target=%s status=%s; trying curl fallback", target, last_exc.code)
+        else:
+            logger.warning("HTTP GET (bytes) failed target=%s error=%s; trying curl fallback", target, last_exc)
+        curl_bytes = self._get_bytes_with_curl(target=target, headers=request_headers, timeout=effective_timeout)
+        if curl_bytes is not None:
+            return curl_bytes
+        raise last_exc
 
     def _get_bytes_with_curl(
         self, *, target: str, headers: dict[str, str], timeout: int | None,

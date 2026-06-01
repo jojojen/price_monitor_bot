@@ -7,6 +7,7 @@ Dispatches by ``MarketplaceWatch.source`` to the right ``MarketplaceSearchClient
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import threading
 import time
@@ -48,6 +49,38 @@ def _source_display(source: str) -> tuple[str, str]:
     return _SOURCE_DISPLAY.get(source, (source.capitalize(), "📦"))
 
 
+@dataclasses.dataclass
+class _SourceBreaker:
+    """Simple consecutive-failure circuit breaker for one marketplace source."""
+    threshold: int = 3
+    cooldown_seconds: float = 300.0
+    _failures: int = dataclasses.field(default=0, init=False, repr=False)
+    _open_until: float = dataclasses.field(default=0.0, init=False, repr=False)
+
+    def is_open(self, source: str) -> bool:
+        if time.monotonic() < self._open_until:
+            return True
+        if self._open_until > 0.0:
+            # Circuit just closed — log recovery
+            self._open_until = 0.0
+            logger.info("MarketplaceWatchMonitor: circuit CLOSED source=%s", source)
+        return False
+
+    def record_success(self) -> None:
+        self._failures = 0
+        self._open_until = 0.0
+
+    def record_failure(self, source: str) -> None:
+        self._failures += 1
+        if self._failures >= self.threshold:
+            self._open_until = time.monotonic() + self.cooldown_seconds
+            logger.warning(
+                "MarketplaceWatchMonitor: circuit OPEN source=%s consecutive_failures=%d "
+                "cooldown=%.0fs",
+                source, self._failures, self.cooldown_seconds,
+            )
+
+
 class MarketplaceWatchMonitor:
     def __init__(
         self,
@@ -67,6 +100,7 @@ class MarketplaceWatchMonitor:
         self._interval = interval_seconds
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._breakers: dict[str, _SourceBreaker] = {}
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -147,6 +181,14 @@ class MarketplaceWatchMonitor:
             )
             return False
 
+        breaker = self._breakers.setdefault(market, _SourceBreaker())
+        if breaker.is_open(market):
+            logger.warning(
+                "MarketplaceWatchMonitor: circuit open market=%s watch_id=%s — skipping",
+                market, watch.watch_id,
+            )
+            return False
+
         options = watch.options_for(market)
         logger.info(
             "MarketplaceWatchMonitor: searching market=%s query=%s price_max=%d watch_id=%s options=%s",
@@ -159,11 +201,13 @@ class MarketplaceWatchMonitor:
                 price_max=watch.price_threshold_jpy,
                 source_options=options,
             )
+            breaker.record_success()
         except Exception:
             logger.exception(
                 "MarketplaceWatchMonitor: client search failed market=%s watch_id=%s",
                 market, watch.watch_id,
             )
+            breaker.record_failure(market)
             return False
 
         records = [listing_to_record(li) for li in listings]
