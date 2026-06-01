@@ -139,6 +139,7 @@ SNS_BUZZ_COMMANDS = {"/snsbuzz", "/sns_buzz"}
 KNOWLEDGE_COMMANDS = {"/knowledge", "/kb"}
 BACKUP_COMMANDS = {"/backupclaw", "/backup"}
 RECOVER_COMMANDS = {"/clawrecover", "/recoverclaw"}
+SCORECARD_COMMANDS = {"/stats", "/scorecard"}
 NEW_COMMANDS = {"/new"}
 HUNT_COMMANDS = {"/hunt", "/opportunity"}
 HEAVY_COMMANDS = PRICE_LOOKUP_COMMANDS | TREND_BOARD_COMMANDS | REPUTATION_SNAPSHOT_COMMANDS | WEB_RESEARCH_COMMANDS
@@ -829,6 +830,7 @@ class TelegramCommandProcessor:
         dynamic_tool_handler: Callable[[str], str] | None = None,
         backup_handler: Callable[[str], str] | None = None,
         recover_handler: Callable[[str], str] | None = None,
+        scorecard_handler: Callable[[str], str] | None = None,
         collab_backfiller: "object | None" = None,
         feedback_service: "object | None" = None,
     ) -> None:
@@ -854,6 +856,7 @@ class TelegramCommandProcessor:
         self._dynamic_tool_handler = dynamic_tool_handler
         self._backup_handler = backup_handler
         self._recover_handler = recover_handler
+        self._scorecard_handler = scorecard_handler
         self._collab_backfiller = collab_backfiller
         self._feedback_service = feedback_service
         self._pending_photo_clarifications: dict[str, PendingTelegramPhotoClarification] = {}
@@ -1221,6 +1224,11 @@ class TelegramCommandProcessor:
                 reply=None,
                 reply_factory=lambda remainder=remainder: self._handle_recover(remainder),
                 run_in_background=True,
+            )
+        if command in SCORECARD_COMMANDS:
+            return TelegramTextReplyPlan(
+                ack=None,
+                reply=self._handle_scorecard(remainder),
             )
         if command in NEW_COMMANDS:
             return TelegramTextReplyPlan(
@@ -2438,6 +2446,16 @@ class TelegramCommandProcessor:
             logger.exception("recover handler failed raw=%r", raw)
             return f"還原失敗：{exc}"
 
+    def _handle_scorecard(self, raw: str) -> str:
+        """Dispatch /stats to the opportunity scorecard handler (aka_no_claw)."""
+        if self._scorecard_handler is None:
+            return "統計指令尚未啟用（需在 aka_no_claw 端註冊 scorecard_handler）。"
+        try:
+            return self._scorecard_handler(raw)
+        except Exception as exc:
+            logger.exception("scorecard handler failed raw=%r", raw)
+            return f"統計失敗：{exc}"
+
     def _handle_new_tool(self, remainder: str) -> str:
         """Dispatch /new to the dynamic-tool runner (registered in aka_no_claw).
 
@@ -3480,6 +3498,7 @@ def run_telegram_polling(
     dynamic_tool_handler: Callable[[str], str] | None = None,
     backup_handler: Callable[[str], str] | None = None,
     recover_handler: Callable[[str], str] | None = None,
+    scorecard_handler: Callable[[str], str] | None = None,
     feedback_service: "object | None" = None,
     poll_timeout: int = 20,
     notify_startup: bool = False,
@@ -3525,6 +3544,7 @@ def run_telegram_polling(
         dynamic_tool_handler=dynamic_tool_handler,
         backup_handler=backup_handler,
         recover_handler=recover_handler,
+        scorecard_handler=scorecard_handler,
         feedback_service=feedback_service,
     )
     resolved_photo_renderer = photo_renderer or default_photo_renderer()
