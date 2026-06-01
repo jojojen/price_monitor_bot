@@ -832,6 +832,7 @@ class TelegramCommandProcessor:
         recover_handler: Callable[[str], str] | None = None,
         scorecard_handler: Callable[[str], str] | None = None,
         rag_callback_handler: "Callable[[str, str, str], tuple[str, object]] | None" = None,
+        knowledge_db_path: "str | None" = None,
         collab_backfiller: "object | None" = None,
         feedback_service: "object | None" = None,
     ) -> None:
@@ -859,6 +860,7 @@ class TelegramCommandProcessor:
         self._recover_handler = recover_handler
         self._scorecard_handler = scorecard_handler
         self._rag_callback_handler = rag_callback_handler
+        self._knowledge_db_path = knowledge_db_path
         self._collab_backfiller = collab_backfiller
         self._feedback_service = feedback_service
         self._pending_photo_clarifications: dict[str, PendingTelegramPhotoClarification] = {}
@@ -1209,6 +1211,13 @@ class TelegramCommandProcessor:
                 reply_factory=lambda remainder=remainder: self._handle_sns_buzz(remainder),
             )
         if command in KNOWLEDGE_COMMANDS:
+            sub = (remainder.strip().split() or [""])[0].lower()
+            if sub == "market":
+                text, reply_markup, _ = self.render_knowledge_market_view()
+                return TelegramTextReplyPlan(ack=None, reply=text, reply_markup=reply_markup)
+            if sub == "coding":
+                text, reply_markup, _ = self.render_knowledge_coding_view()
+                return TelegramTextReplyPlan(ack=None, reply=text, reply_markup=reply_markup)
             return TelegramTextReplyPlan(
                 ack=None,
                 reply=self._handle_knowledge(remainder, str(chat_id)),
@@ -1504,6 +1513,86 @@ class TelegramCommandProcessor:
             return bool(self._watch_db.delete_marketplace_watch(watch_id))
         except Exception:
             logger.exception("Marketplace watch delete failed watch_id=%s", watch_id)
+            return False
+
+    def render_knowledge_market_view(
+        self, *, page: int = 0, mode: str = LIST_VIEW_MODE_READ
+    ) -> tuple[str, dict[str, object] | None, int]:
+        if self._knowledge_db_path is None:
+            return "知識庫功能尚未啟用。", None, 0
+        try:
+            from openclaw_adapter.knowledge_db import KnowledgeDatabase
+        except ImportError:
+            return "知識庫功能不可用（openclaw_adapter 未安裝）。", None, 0
+        db = KnowledgeDatabase(self._knowledge_db_path)
+        entries = db.recent_entries(limit=200)
+        items: list[_ListRow] = []
+        for e in entries:
+            preview = (e.summary or "").strip().replace("\n", " ")[:80]
+            items.append(_ListRow(
+                id=e.entry_id,
+                text=f"• {e.entity_canonical} ({e.entity_type}, {e.confidence:.0%})\n  {preview}",
+                short_label=e.entity_canonical,
+                extra_buttons=(),
+                label_button=None,
+            ))
+        return _build_list_view(
+            list_kind="km",
+            items=items,
+            page=page,
+            mode=mode,
+            list_title="📚 RAG 市場知識",
+            empty_message="知識庫尚無市場條目。",
+        )
+
+    def render_knowledge_coding_view(
+        self, *, page: int = 0, mode: str = LIST_VIEW_MODE_READ
+    ) -> tuple[str, dict[str, object] | None, int]:
+        if self._knowledge_db_path is None:
+            return "知識庫功能尚未啟用。", None, 0
+        try:
+            from openclaw_adapter.knowledge_db import KnowledgeDatabase
+        except ImportError:
+            return "知識庫功能不可用（openclaw_adapter 未安裝）。", None, 0
+        db = KnowledgeDatabase(self._knowledge_db_path)
+        rows = db.all_codegen_knowledge()
+        items: list[_ListRow] = []
+        for r in rows:
+            preview = (r.technique or "").strip().replace("\n", " ")[:80]
+            items.append(_ListRow(
+                id=r.knowledge_id,
+                text=f"• [{r.category}] {r.title} ({r.confidence:.0%})\n  {preview}",
+                short_label=r.title,
+                extra_buttons=(),
+                label_button=None,
+            ))
+        return _build_list_view(
+            list_kind="kc",
+            items=items,
+            page=page,
+            mode=mode,
+            list_title="🧠 龍蝦 Coding 知識",
+            empty_message="尚無 coding 知識條目。",
+        )
+
+    def delete_knowledge_entry_by_id(self, entry_id: str) -> bool:
+        if self._knowledge_db_path is None:
+            return False
+        try:
+            from openclaw_adapter.knowledge_db import KnowledgeDatabase
+            return KnowledgeDatabase(self._knowledge_db_path).delete_entry(entry_id)
+        except Exception:
+            logger.exception("knowledge entry delete failed entry_id=%s", entry_id)
+            return False
+
+    def delete_codegen_by_id(self, knowledge_id: str) -> bool:
+        if self._knowledge_db_path is None:
+            return False
+        try:
+            from openclaw_adapter.knowledge_db import KnowledgeDatabase
+            return KnowledgeDatabase(self._knowledge_db_path).delete_codegen(knowledge_id)
+        except Exception:
+            logger.exception("codegen delete failed knowledge_id=%s", knowledge_id)
             return False
 
     def _handle_unwatch(self, raw: str) -> str:
@@ -3502,6 +3591,7 @@ def run_telegram_polling(
     recover_handler: Callable[[str], str] | None = None,
     scorecard_handler: Callable[[str], str] | None = None,
     rag_callback_handler: "Callable[[str, str, str], tuple[str, object]] | None" = None,
+    knowledge_db_path: "str | None" = None,
     feedback_service: "object | None" = None,
     poll_timeout: int = 20,
     notify_startup: bool = False,
@@ -3549,6 +3639,7 @@ def run_telegram_polling(
         recover_handler=recover_handler,
         scorecard_handler=scorecard_handler,
         rag_callback_handler=rag_callback_handler,
+        knowledge_db_path=knowledge_db_path,
         feedback_service=feedback_service,
     )
     resolved_photo_renderer = photo_renderer or default_photo_renderer()
@@ -3790,6 +3881,8 @@ def _list_view_renderer(processor: TelegramCommandProcessor, list_kind: str):
         "sl": getattr(processor, "render_snslist_view", None),
         "wl": getattr(processor, "render_watchlist_view", None),
         "hl": getattr(processor, "render_huntlist_view", None),
+        "km": getattr(processor, "render_knowledge_market_view", None),
+        "kc": getattr(processor, "render_knowledge_coding_view", None),
     }.get(list_kind)
 
 
@@ -3801,6 +3894,10 @@ def _list_item_deleter(processor: TelegramCommandProcessor, list_kind: str):
         return processor.delete_marketplace_watch_by_id, "Marketplace 追蹤"
     if list_kind == "hl":
         return processor.delete_huntlist_item_by_id, "Opportunity 候選"
+    if list_kind == "km":
+        return processor.delete_knowledge_entry_by_id, "市場知識條目"
+    if list_kind == "kc":
+        return processor.delete_codegen_by_id, "Coding 知識條目"
     return None, None
 
 
