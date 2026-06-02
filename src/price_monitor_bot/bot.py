@@ -141,6 +141,7 @@ BACKUP_COMMANDS = {"/backupclaw", "/backup"}
 RECOVER_COMMANDS = {"/clawrecover", "/recoverclaw"}
 SCORECARD_COMMANDS = {"/stats", "/scorecard"}
 NEW_COMMANDS = {"/new"}
+QUIZ_COMMANDS = {"/quiz"}
 HUNT_COMMANDS = {"/hunt", "/opportunity"}
 HEAVY_COMMANDS = PRICE_LOOKUP_COMMANDS | TREND_BOARD_COMMANDS | REPUTATION_SNAPSHOT_COMMANDS | WEB_RESEARCH_COMMANDS
 
@@ -832,6 +833,8 @@ class TelegramCommandProcessor:
         recover_handler: Callable[[str], str] | None = None,
         scorecard_handler: Callable[[str], str] | None = None,
         rag_callback_handler: "Callable[[str, str, str], tuple[str, object]] | None" = None,
+        quiz_handler: "Callable[[str, str], tuple[str, object]] | None" = None,
+        quiz_callback_handler: "Callable[[str, str], tuple[object, str, object]] | None" = None,
         knowledge_db_path: "str | None" = None,
         collab_backfiller: "object | None" = None,
         feedback_service: "object | None" = None,
@@ -860,6 +863,8 @@ class TelegramCommandProcessor:
         self._recover_handler = recover_handler
         self._scorecard_handler = scorecard_handler
         self._rag_callback_handler = rag_callback_handler
+        self._quiz_handler = quiz_handler
+        self._quiz_callback_handler = quiz_callback_handler
         self._knowledge_db_path = knowledge_db_path
         self._collab_backfiller = collab_backfiller
         self._feedback_service = feedback_service
@@ -1246,6 +1251,13 @@ class TelegramCommandProcessor:
                 ack="收到，正在找/生成工具並執行（地端模型，可能要 1-2 分鐘）…",
                 reply=None,
                 reply_factory=lambda remainder=remainder: self._handle_new_tool(remainder),
+                run_in_background=True,
+            )
+        if command in QUIZ_COMMANDS:
+            return TelegramTextReplyPlan(
+                ack="收到，正在出題（地端模型，可能要一點時間）…",
+                reply=None,
+                reply_factory=lambda remainder=remainder, cid=chat_id: self._handle_quiz(remainder, str(cid)),
                 run_in_background=True,
             )
         if not content.startswith("/"):
@@ -2537,6 +2549,22 @@ class TelegramCommandProcessor:
             logger.exception("recover handler failed raw=%r", raw)
             return f"還原失敗：{exc}"
 
+    def _handle_quiz(self, raw: str, chat_id: str) -> tuple[str, dict[str, object] | None]:
+        """Dispatch /quiz to the registered quiz handler (aka_no_claw owns QuizDatabase).
+
+        Handler returns either a bare reply string or a ``(text, reply_markup)``
+        tuple — the inline keyboard carries the multiple-choice answer buttons."""
+        if self._quiz_handler is None:
+            return ("測驗功能尚未啟用（需在 aka_no_claw 端註冊 quiz_handler）。", None)
+        try:
+            result = self._quiz_handler(raw, chat_id)
+        except Exception as exc:
+            logger.exception("quiz handler failed raw=%r", raw)
+            return (f"測驗指令失敗：{exc}", None)
+        if isinstance(result, tuple):
+            return result[0], result[1]
+        return result, None
+
     def _handle_scorecard(self, raw: str) -> str:
         """Dispatch /stats to the opportunity scorecard handler (aka_no_claw)."""
         if self._scorecard_handler is None:
@@ -3591,6 +3619,8 @@ def run_telegram_polling(
     recover_handler: Callable[[str], str] | None = None,
     scorecard_handler: Callable[[str], str] | None = None,
     rag_callback_handler: "Callable[[str, str, str], tuple[str, object]] | None" = None,
+    quiz_handler: "Callable[[str, str], tuple[str, object]] | None" = None,
+    quiz_callback_handler: "Callable[[str, str], tuple[object, str, object]] | None" = None,
     knowledge_db_path: "str | None" = None,
     feedback_service: "object | None" = None,
     poll_timeout: int = 20,
@@ -3639,6 +3669,8 @@ def run_telegram_polling(
         recover_handler=recover_handler,
         scorecard_handler=scorecard_handler,
         rag_callback_handler=rag_callback_handler,
+        quiz_handler=quiz_handler,
+        quiz_callback_handler=quiz_callback_handler,
         knowledge_db_path=knowledge_db_path,
         feedback_service=feedback_service,
     )
@@ -4346,6 +4378,19 @@ def handle_telegram_callback_query(
                 rerender = True
             except Exception:
                 logger.exception("rag callback failed prefix=%s entry_id=%s", prefix, payload)
+                toast = "操作失敗，請看 log"
+    elif prefix == "quiz" and payload:
+        # payload is "<question_id_prefix>:<chosen_option_index>" — the handler
+        # (aka_no_claw, owns QuizDatabase) grades it and returns the result view.
+        quiz_cb = getattr(processor, "_quiz_callback_handler", None)
+        if quiz_cb is None:
+            toast = "測驗功能未啟用"
+        else:
+            try:
+                toast, new_text, new_reply_markup = quiz_cb(payload, original_text)
+                rerender = new_text is not None
+            except Exception:
+                logger.exception("quiz callback failed payload=%s", payload)
                 toast = "操作失敗，請看 log"
     elif prefix == "noop":
         pass  # label buttons — silently acknowledge, no action

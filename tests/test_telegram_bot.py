@@ -3128,3 +3128,96 @@ def test_start_poll_watchdog_sends_alert_on_stale_heartbeat(tmp_path: Path) -> N
     )
     _time.sleep(0.2)
     assert any("心跳停止" in m for m in alerted)
+
+
+# ── /quiz command + quiz: callback ────────────────────────────────────────────
+
+
+def _quiz_processor(*, quiz_handler=None, quiz_callback_handler=None):
+    return TelegramCommandProcessor(
+        allowed_chat_ids=frozenset({"123"}),
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        quiz_handler=quiz_handler,
+        quiz_callback_handler=quiz_callback_handler,
+    )
+
+
+def test_quiz_command_runs_in_background_and_returns_question_with_keyboard() -> None:
+    seen = []
+    markup = {"inline_keyboard": [[{"text": "A", "callback_data": "quiz:a:qid:0"}]]}
+
+    def handler(raw, chat_id):
+        seen.append((raw, chat_id))
+        return ("🎴 JLPT N1 測驗\n\nA. foo\nB. bar", markup)
+
+    processor = _quiz_processor(quiz_handler=handler)
+    plan = processor.build_reply_plan(chat_id="123", text="/quiz JLPTN1 miku")
+
+    assert plan is not None
+    assert plan.run_in_background is True  # slow local-LLM op must not block poll loop
+    assert plan.ack  # an ack is shown immediately
+    text, factory_markup = plan._execute_unpacked()
+    assert "JLPT N1 測驗" in text
+    assert factory_markup == markup
+    # remainder after the command word is forwarded to the handler
+    assert seen and seen[0][0] == "JLPTN1 miku" and seen[0][1] == "123"
+
+
+def test_quiz_command_disabled_when_no_handler() -> None:
+    processor = _quiz_processor(quiz_handler=None)
+    plan = processor.build_reply_plan(chat_id="123", text="/quiz")
+    text, _ = plan._execute_unpacked()
+    assert "尚未啟用" in text
+
+
+def test_quiz_handler_string_result_is_wrapped() -> None:
+    processor = _quiz_processor(quiz_handler=lambda raw, cid: "純文字回覆")
+    plan = processor.build_reply_plan(chat_id="123", text="/quiz review")
+    text, markup = plan._execute_unpacked()
+    assert text == "純文字回覆"
+    assert markup is None
+
+
+def test_quiz_callback_grades_and_edits_message() -> None:
+    captured = {}
+
+    def cb(payload, original_text):
+        captured["payload"] = payload
+        captured["original"] = original_text
+        return ("✅ 答對了！", original_text + "\n\n✅ 正解！", None)
+
+    processor = _quiz_processor(quiz_callback_handler=cb)
+    client = FakeTelegramClient()
+
+    handle_telegram_callback_query(
+        client=client,
+        processor=processor,
+        callback_query=_callback_update(
+            chat_id="123", data="quiz:a:abc123:1", text="🎴 JLPT N1 測驗"
+        ),
+    )
+
+    assert captured["payload"] == "a:abc123:1"
+    assert captured["original"] == "🎴 JLPT N1 測驗"
+    assert len(client.edited_messages) == 1
+    edited = client.edited_messages[0]
+    assert "✅ 正解！" in edited["text"]
+    assert edited["reply_markup"] is None  # keyboard cleared after answering
+    assert client.answered_callbacks[0]["text"] == "✅ 答對了！"
+
+
+def test_quiz_callback_disabled_when_no_handler() -> None:
+    processor = _quiz_processor(quiz_callback_handler=None)
+    client = FakeTelegramClient()
+
+    handle_telegram_callback_query(
+        client=client,
+        processor=processor,
+        callback_query=_callback_update(chat_id="123", data="quiz:a:abc:0"),
+    )
+
+    # No handler → no edit, just a toast explaining the feature is off.
+    assert client.edited_messages == []
+    assert client.answered_callbacks[0]["text"] == "測驗功能未啟用"
