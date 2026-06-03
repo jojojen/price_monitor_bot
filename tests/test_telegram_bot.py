@@ -3165,6 +3165,49 @@ def test_quiz_command_runs_in_background_and_returns_question_with_keyboard() ->
     assert seen and seen[0][0] == "JLPTN1 miku" and seen[0][1] == "123"
 
 
+def _fetch_processor(*, fetch_renderer=None) -> TelegramCommandProcessor:
+    return TelegramCommandProcessor(
+        allowed_chat_ids=frozenset({"123"}),
+        lookup_renderer=lambda q: "unused",
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        fetch_renderer=fetch_renderer,
+    )
+
+
+def test_fetch_command_forwards_url_and_prompt_to_renderer() -> None:
+    seen: list[tuple[str, str]] = []
+
+    def renderer(url, prompt):
+        seen.append((url, prompt))
+        return f"答案：{url}"
+
+    processor = _fetch_processor(fetch_renderer=renderer)
+    plan = processor.build_reply_plan(
+        chat_id="123", text="/fetch https://example.com/a 這篇的重點是什麼",
+    )
+
+    assert plan is not None
+    assert plan.ack  # heavy op acks immediately
+    reply = plan.execute()
+    assert reply == "答案：https://example.com/a"
+    assert seen == [("https://example.com/a", "這篇的重點是什麼")]
+
+
+def test_fetch_command_disabled_when_no_renderer() -> None:
+    processor = _fetch_processor(fetch_renderer=None)
+    plan = processor.build_reply_plan(chat_id="123", text="/fetch https://example.com/a x")
+    reply = plan.execute()
+    assert "尚未設定" in reply
+
+
+def test_fetch_command_requires_url() -> None:
+    processor = _fetch_processor(fetch_renderer=lambda u, p: "unused")
+    plan = processor.build_reply_plan(chat_id="123", text="/fetch")
+    reply = plan.execute()
+    assert "請提供網址" in reply
+
+
 def test_quiz_command_disabled_when_no_handler() -> None:
     processor = _quiz_processor(quiz_handler=None)
     plan = processor.build_reply_plan(chat_id="123", text="/quiz")

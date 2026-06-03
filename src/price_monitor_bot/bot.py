@@ -56,6 +56,8 @@ PhotoLookupRenderer = Callable[["TelegramPhotoQuery"], "str | PhotoLookupReply"]
 PhotoIntentAnalyzer = Callable[["TelegramPhotoQuery"], "TelegramPhotoIntentAnalysis"]
 ReputationRenderer = Callable[["TelegramReputationQuery"], object]
 ResearchRenderer = Callable[["TelegramResearchQuery"], str]
+# (url, prompt) -> reply text. Reads a single page and answers a focused prompt.
+FetchRenderer = Callable[[str, str], str]
 OpportunityTargetRemover = Callable[[str], str]
 # (selector, kind, action, names) -> reply text. kind in {"aliases","related"}, action in {"add","remove"}.
 OpportunityAliasUpdater = Callable[[str, str, str, list[str]], str]
@@ -72,6 +74,7 @@ TREND_BOARD_COMMANDS = {"/trend", "/trending", "/hot", "/heat", "/liquidity"}
 PHOTO_SCAN_COMMANDS = {"/scan", "/image", "/photo"}
 REPUTATION_SNAPSHOT_COMMANDS = {"/snapshot", "/proof", "/repcheck", "/reputation"}
 WEB_RESEARCH_COMMANDS = {"/search", "/research", "/web"}
+WEB_FETCH_COMMANDS = {"/fetch", "/read"}
 WATCH_COMMANDS = {"/watch"}
 WATCHLIST_COMMANDS = {"/watchlist", "/watches"}
 UNWATCH_COMMANDS = {"/unwatch", "/stopwatch"}
@@ -815,6 +818,7 @@ class TelegramCommandProcessor:
         photo_intent_analyzer: PhotoIntentAnalyzer | None = None,
         reputation_renderer: ReputationRenderer | None = None,
         research_renderer: ResearchRenderer | None = None,
+        fetch_renderer: FetchRenderer | None = None,
         natural_language_router: TelegramNaturalLanguageRouter | None = None,
         allowed_chat_ids: frozenset[str] | None = None,
         status_renderer: Callable[[], str] | None = None,
@@ -845,6 +849,7 @@ class TelegramCommandProcessor:
         self._photo_intent_analyzer = photo_intent_analyzer or default_photo_intent_analyzer()
         self._reputation_renderer = reputation_renderer
         self._research_renderer = research_renderer
+        self._fetch_renderer = fetch_renderer
         self._natural_language_router = natural_language_router
         self._allowed_chat_ids: frozenset[str] = allowed_chat_ids or frozenset()
         self._status_renderer = status_renderer
@@ -1179,6 +1184,12 @@ class TelegramCommandProcessor:
                 reply=None,
                 reply_factory=lambda remainder=remainder: self._handle_web_research(remainder),
             )
+        if command in WEB_FETCH_COMMANDS:
+            return TelegramTextReplyPlan(
+                ack=build_processing_ack(text=content),
+                reply=None,
+                reply_factory=lambda remainder=remainder: self._handle_web_fetch(remainder),
+            )
         if command in WATCH_COMMANDS:
             return TelegramTextReplyPlan(
                 ack="收到追蹤指令，正在設定…",
@@ -1373,6 +1384,28 @@ class TelegramCommandProcessor:
         except Exception as exc:  # pragma: no cover - source/network-dependent.
             logger.exception("Telegram web research failed query=%s", trim_for_log(query, limit=240))
             return f"網路搜尋摘要失敗：{exc}"
+
+    def _handle_web_fetch(self, raw: str) -> str:
+        if self._fetch_renderer is None:
+            return "這個 OpenClaw 執行環境尚未設定網頁抓取功能。"
+        parts = raw.strip().split(maxsplit=1)
+        if not parts:
+            return (
+                "請提供網址與想問的問題。例如："
+                "/fetch https://example.com/article 這篇文章的重點是什麼"
+            )
+        url = parts[0]
+        prompt = parts[1].strip() if len(parts) >= 2 else ""
+        try:
+            logger.info(
+                "Telegram web fetch requested url=%s prompt=%s",
+                trim_for_log(url, limit=240),
+                trim_for_log(prompt, limit=240),
+            )
+            return self._fetch_renderer(url, prompt)
+        except Exception as exc:  # pragma: no cover - source/network-dependent.
+            logger.exception("Telegram web fetch failed url=%s", trim_for_log(url, limit=240))
+            return f"網頁抓取失敗：{exc}"
 
     def _handle_watch(
         self, raw: str, chat_id: str, *, markets: tuple[str, ...] | None = None,
@@ -3457,6 +3490,8 @@ def build_processing_ack(*, text: str | None = None, has_photo: bool = False) ->
         return "收到信譽快照查詢，先檢查既有 proof，必要時建立新快照。"
     if command in WEB_RESEARCH_COMMANDS:
         return "收到搜尋問題，正在找資料來源並整理答案。"
+    if command in WEB_FETCH_COMMANDS:
+        return "收到網址，正在抓取頁面內容並整理答案。"
     return None
 
 
@@ -3600,6 +3635,7 @@ def run_telegram_polling(
     photo_intent_analyzer: PhotoIntentAnalyzer | None = None,
     reputation_renderer: ReputationRenderer | None = None,
     research_renderer: ResearchRenderer | None = None,
+    fetch_renderer: FetchRenderer | None = None,
     natural_language_router: TelegramNaturalLanguageRouter | None = None,
     ssl_context: ssl.SSLContext | None = None,
     allowed_chat_ids: frozenset[str] | None = None,
@@ -3651,6 +3687,7 @@ def run_telegram_polling(
         photo_intent_analyzer=photo_intent_analyzer,
         reputation_renderer=reputation_renderer,
         research_renderer=research_renderer,
+        fetch_renderer=fetch_renderer,
         natural_language_router=natural_language_router,
         allowed_chat_ids=allowed_chat_ids,
         status_renderer=status_renderer,
