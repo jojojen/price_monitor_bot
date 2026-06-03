@@ -3226,9 +3226,10 @@ def test_quiz_handler_string_result_is_wrapped() -> None:
 def test_quiz_callback_grades_and_edits_message() -> None:
     captured = {}
 
-    def cb(payload, original_text):
+    def cb(payload, original_text, chat_id):
         captured["payload"] = payload
         captured["original"] = original_text
+        captured["chat_id"] = chat_id
         return ("✅ 答對了！", original_text + "\n\n✅ 正解！", None)
 
     processor = _quiz_processor(quiz_callback_handler=cb)
@@ -3244,6 +3245,7 @@ def test_quiz_callback_grades_and_edits_message() -> None:
 
     assert captured["payload"] == "a:abc123:1"
     assert captured["original"] == "🎴 JLPT N1 測驗"
+    assert captured["chat_id"] == "123"
     assert len(client.edited_messages) == 1
     edited = client.edited_messages[0]
     assert "✅ 正解！" in edited["text"]

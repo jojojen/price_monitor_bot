@@ -839,7 +839,7 @@ class TelegramCommandProcessor:
         scorecard_handler: Callable[[str], str] | None = None,
         rag_callback_handler: "Callable[[str, str, str], tuple[str, object]] | None" = None,
         quiz_handler: "Callable[[str, str], tuple[str, object]] | None" = None,
-        quiz_callback_handler: "Callable[[str, str], tuple[object, str, object]] | None" = None,
+        quiz_callback_handler: "Callable[[str, str, str], tuple[object, str, object]] | None" = None,
         knowledge_db_path: "str | None" = None,
         collab_backfiller: "object | None" = None,
         feedback_service: "object | None" = None,
@@ -3691,7 +3691,7 @@ def run_telegram_polling(
     scorecard_handler: Callable[[str], str] | None = None,
     rag_callback_handler: "Callable[[str, str, str], tuple[str, object]] | None" = None,
     quiz_handler: "Callable[[str, str], tuple[str, object]] | None" = None,
-    quiz_callback_handler: "Callable[[str, str], tuple[object, str, object]] | None" = None,
+    quiz_callback_handler: "Callable[[str, str, str], tuple[object, str, object]] | None" = None,
     knowledge_db_path: "str | None" = None,
     feedback_service: "object | None" = None,
     poll_timeout: int = 20,
@@ -4461,7 +4461,7 @@ def handle_telegram_callback_query(
             toast = "測驗功能未啟用"
         else:
             try:
-                toast, new_text, new_reply_markup = quiz_cb(payload, original_text)
+                toast, new_text, new_reply_markup = quiz_cb(payload, original_text, str(chat_id))
                 rerender = new_text is not None
             except Exception:
                 logger.exception("quiz callback failed payload=%s", payload)
