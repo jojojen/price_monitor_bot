@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import mimetypes
@@ -3531,6 +3532,40 @@ class PollHeartbeat:
         return (ref - beat) > max_age_seconds
 
 
+@contextlib.contextmanager
+def _heartbeat_beacon(
+    heartbeat: PollHeartbeat,
+    *,
+    interval_seconds: float = 20.0,
+    max_seconds: float = 240.0,
+):
+    """Keep the poll-loop heartbeat fresh while a slow handler runs.
+
+    The loop only touches the heartbeat once per poll round, so a legitimately
+    slow command (e.g. /search doing reformulation + page fetches + LLM
+    summarisation, which can take minutes) looks like a wedged loop and trips
+    the watchdog into a false restart. This refreshes the beacon every
+    ``interval_seconds`` for up to ``max_seconds`` — a busy-but-alive handler
+    survives, while one that truly hangs past ``max_seconds`` still goes stale
+    and triggers recovery.
+    """
+    stop = threading.Event()
+    deadline = time.monotonic() + max_seconds
+
+    def _beat() -> None:
+        while not stop.wait(interval_seconds):
+            if time.monotonic() >= deadline:
+                return
+            heartbeat.touch()
+
+    thread = threading.Thread(target=_beat, name="hb-beacon", daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+
+
 def _is_conflict_error(exc: BaseException) -> bool:
     """True when exc looks like a Telegram 409 Conflict (duplicate poller)."""
     msg = str(exc)
@@ -3751,22 +3786,24 @@ def run_telegram_polling(
                 offset = int(update["update_id"]) + 1
                 callback_query = update.get("callback_query")
                 if isinstance(callback_query, dict):
-                    handle_telegram_callback_query(
-                        client=client,
-                        processor=processor,
-                        callback_query=callback_query,
-                        photo_renderer=resolved_photo_renderer,
-                    )
+                    with _heartbeat_beacon(heartbeat):
+                        handle_telegram_callback_query(
+                            client=client,
+                            processor=processor,
+                            callback_query=callback_query,
+                            photo_renderer=resolved_photo_renderer,
+                        )
                     continue
                 message = update.get("message")
                 if not isinstance(message, dict):
                     continue
-                handle_telegram_message(
-                    client=client,
-                    processor=processor,
-                    photo_renderer=resolved_photo_renderer,
-                    message=message,
-                )
+                with _heartbeat_beacon(heartbeat):
+                    handle_telegram_message(
+                        client=client,
+                        processor=processor,
+                        photo_renderer=resolved_photo_renderer,
+                        message=message,
+                    )
     except KeyboardInterrupt:
         logger.info("Telegram polling stopped by KeyboardInterrupt")
         print("Telegram polling stopped.")
