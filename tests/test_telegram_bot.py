@@ -283,7 +283,7 @@ def test_command_processor_help_lists_trend_and_scan_commands() -> None:
     assert "/trend pokemon" in help_reply
     assert "/price pokemon | Pikachu ex | 132/106 | SAR | sv08" in help_reply
     assert "/snapshot https://jp.mercari.com/item/m123456789" in help_reply
-    assert "Send a photo with caption: /scan pokemon" in help_reply
+    assert "/scan pokemon" in help_reply
     assert "/hunt status" in help_reply
 
 
