@@ -147,6 +147,8 @@ SCORECARD_COMMANDS = {"/stats", "/scorecard"}
 NEW_COMMANDS = {"/new"}
 QUIZ_COMMANDS = {"/quiz"}
 QUIZ_LIKE_SONG_COMMANDS = {"/quizlikesong"}
+VOICE_COMMANDS = {"/voice"}
+SAY_COMMANDS = {"/say"}
 HUNT_COMMANDS = {"/hunt", "/opportunity"}
 HEAVY_COMMANDS = PRICE_LOOKUP_COMMANDS | TREND_BOARD_COMMANDS | REPUTATION_SNAPSHOT_COMMANDS | WEB_RESEARCH_COMMANDS
 
@@ -841,6 +843,9 @@ class TelegramCommandProcessor:
         rag_callback_handler: "Callable[[str, str, str], tuple[str, object]] | None" = None,
         quiz_handler: "Callable[[str, str], tuple[str, object]] | None" = None,
         quiz_callback_handler: "Callable[[str, str, str], tuple[object, str, object]] | None" = None,
+        voice_handler: "Callable[[str, str], object] | None" = None,
+        say_handler: "Callable[[str, str], object] | None" = None,
+        voice_callback_handler: "Callable[[str, str, str], tuple[object, str, object]] | None" = None,
         knowledge_db_path: "str | None" = None,
         collab_backfiller: "object | None" = None,
         feedback_service: "object | None" = None,
@@ -872,6 +877,9 @@ class TelegramCommandProcessor:
         self._rag_callback_handler = rag_callback_handler
         self._quiz_handler = quiz_handler
         self._quiz_callback_handler = quiz_callback_handler
+        self._voice_handler = voice_handler
+        self._say_handler = say_handler
+        self._voice_callback_handler = voice_callback_handler
         self._knowledge_db_path = knowledge_db_path
         self._collab_backfiller = collab_backfiller
         self._feedback_service = feedback_service
@@ -1280,6 +1288,16 @@ class TelegramCommandProcessor:
                 reply_factory=lambda remainder=remainder, cid=chat_id: self._handle_quiz(
                     "like song " + remainder.strip(), str(cid)
                 ),
+                run_in_background=True,
+            )
+        if command in VOICE_COMMANDS:
+            text, markup = self._handle_voice(remainder, str(chat_id))
+            return TelegramTextReplyPlan(ack=None, reply=text, reply_markup=markup)
+        if command in SAY_COMMANDS:
+            return TelegramTextReplyPlan(
+                ack="收到，正在合成語音…",
+                reply=None,
+                reply_factory=lambda remainder=remainder, cid=chat_id: self._handle_say(remainder, str(cid)),
                 run_in_background=True,
             )
         if not content.startswith("/"):
@@ -2609,6 +2627,34 @@ class TelegramCommandProcessor:
             return result[0], result[1]
         return result, None
 
+    def _handle_voice(self, raw: str, chat_id: str) -> tuple[str, dict[str, object] | None]:
+        """Dispatch /voice to the registered voice handler (aka_no_claw owns the
+        per-chat VoiceParams). Returns ``(text, reply_markup)`` — the inline keyboard
+        carries the ➖/➕ tuning buttons."""
+        if self._voice_handler is None:
+            return ("語音參數功能尚未啟用（需在 aka_no_claw 端註冊 voice_handler）。", None)
+        try:
+            result = self._voice_handler(raw, chat_id)
+        except Exception as exc:
+            logger.exception("voice handler failed raw=%r", raw)
+            return (f"語音參數指令失敗：{exc}", None)
+        if isinstance(result, tuple):
+            return result[0], result[1]
+        return result, None
+
+    def _handle_say(self, raw: str, chat_id: str) -> str:
+        """Dispatch /say to the registered say handler (synthesizes + sends the WAV
+        itself via its own TelegramBotClient, like the /quiz audio button). Returns a
+        status string, or empty when the handler already sent the document."""
+        if self._say_handler is None:
+            return "語音朗讀功能尚未啟用（需在 aka_no_claw 端註冊 say_handler）。"
+        try:
+            result = self._say_handler(raw, chat_id)
+        except Exception as exc:
+            logger.exception("say handler failed raw=%r", raw)
+            return f"語音朗讀失敗：{exc}"
+        return result if isinstance(result, str) else ""
+
     def _handle_scorecard(self, raw: str) -> str:
         """Dispatch /stats to the opportunity scorecard handler (aka_no_claw)."""
         if self._scorecard_handler is None:
@@ -3728,6 +3774,9 @@ def run_telegram_polling(
     rag_callback_handler: "Callable[[str, str, str], tuple[str, object]] | None" = None,
     quiz_handler: "Callable[[str, str], tuple[str, object]] | None" = None,
     quiz_callback_handler: "Callable[[str, str, str], tuple[object, str, object]] | None" = None,
+    voice_handler: "Callable[[str, str], object] | None" = None,
+    say_handler: "Callable[[str, str], object] | None" = None,
+    voice_callback_handler: "Callable[[str, str, str], tuple[object, str, object]] | None" = None,
     knowledge_db_path: "str | None" = None,
     feedback_service: "object | None" = None,
     poll_timeout: int = 20,
@@ -3779,6 +3828,9 @@ def run_telegram_polling(
         rag_callback_handler=rag_callback_handler,
         quiz_handler=quiz_handler,
         quiz_callback_handler=quiz_callback_handler,
+        voice_handler=voice_handler,
+        say_handler=say_handler,
+        voice_callback_handler=voice_callback_handler,
         knowledge_db_path=knowledge_db_path,
         feedback_service=feedback_service,
     )
@@ -4501,6 +4553,19 @@ def handle_telegram_callback_query(
                 rerender = new_text is not None
             except Exception:
                 logger.exception("quiz callback failed payload=%s", payload)
+                toast = "操作失敗，請看 log"
+    elif prefix == "voice" and payload:
+        # payload is "<param>:<+|->" or "reset" — the handler (aka_no_claw, owns the
+        # per-chat VoiceParams) steps/clamps/persists and returns the redrawn view.
+        voice_cb = getattr(processor, "_voice_callback_handler", None)
+        if voice_cb is None:
+            toast = "語音參數功能未啟用"
+        else:
+            try:
+                toast, new_text, new_reply_markup = voice_cb(payload, original_text, str(chat_id))
+                rerender = new_text is not None
+            except Exception:
+                logger.exception("voice callback failed payload=%s", payload)
                 toast = "操作失敗，請看 log"
     elif prefix == "noop":
         pass  # label buttons — silently acknowledge, no action
