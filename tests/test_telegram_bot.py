@@ -23,6 +23,7 @@ from price_monitor_bot.bot import (
     PendingTelegramTextClarification,
     PhotoLookupReply,
     PollHeartbeat,
+    RegisteredCommand,
     TelegramCommandProcessor,
     TelegramFileAttachment,
     TelegramPhotoIntentAnalysis,
@@ -3134,13 +3135,23 @@ def test_start_poll_watchdog_sends_alert_on_stale_heartbeat(tmp_path: Path) -> N
 
 
 def _quiz_processor(*, quiz_handler=None, quiz_callback_handler=None):
+    command_handlers = {}
+    if quiz_handler is not None:
+        command_handlers["/quiz"] = RegisteredCommand(
+            quiz_handler,
+            ack="收到，正在出題（地端模型，可能要一點時間）…",
+            background=True,
+        )
+    callback_handlers = {}
+    if quiz_callback_handler is not None:
+        callback_handlers["quiz"] = quiz_callback_handler
     return TelegramCommandProcessor(
         allowed_chat_ids=frozenset({"123"}),
         lookup_renderer=lambda query: query.name,
         board_loader=lambda: (_stub_board(),),
         catalog_renderer=lambda: "catalog",
-        quiz_handler=quiz_handler,
-        quiz_callback_handler=quiz_callback_handler,
+        command_handlers=command_handlers,
+        callback_handlers=callback_handlers,
     )
 
 
@@ -3208,11 +3219,13 @@ def test_fetch_command_requires_url() -> None:
     assert "請提供網址" in reply
 
 
-def test_quiz_command_disabled_when_no_handler() -> None:
+def test_quiz_command_unregistered_falls_through_to_unknown() -> None:
+    # No /quiz in the registry → generic dispatch is skipped and the command
+    # falls through to the built-in "Unknown command" reply.
     processor = _quiz_processor(quiz_handler=None)
     plan = processor.build_reply_plan(chat_id="123", text="/quiz")
     text, _ = plan._execute_unpacked()
-    assert "尚未啟用" in text
+    assert "Unknown command" in text
 
 
 def test_quiz_handler_string_result_is_wrapped() -> None:
@@ -3253,7 +3266,7 @@ def test_quiz_callback_grades_and_edits_message() -> None:
     assert client.answered_callbacks[0]["text"] == "✅ 答對了！"
 
 
-def test_quiz_callback_disabled_when_no_handler() -> None:
+def test_quiz_callback_unregistered_falls_through() -> None:
     processor = _quiz_processor(quiz_callback_handler=None)
     client = FakeTelegramClient()
 
@@ -3263,6 +3276,119 @@ def test_quiz_callback_disabled_when_no_handler() -> None:
         callback_query=_callback_update(chat_id="123", data="quiz:a:abc:0"),
     )
 
-    # No handler → no edit, just a toast explaining the feature is off.
+    # No registered "quiz" prefix → no edit, default unknown-button toast.
     assert client.edited_messages == []
-    assert client.answered_callbacks[0]["text"] == "測驗功能未啟用"
+    assert client.answered_callbacks[0]["text"] == "未知按鈕"
+
+
+# ── command/callback registry extension point ─────────────────────────────────
+
+
+def _registry_processor(*, command_handlers=None, callback_handlers=None):
+    return TelegramCommandProcessor(
+        allowed_chat_ids=frozenset({"123"}),
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        command_handlers=command_handlers or {},
+        callback_handlers=callback_handlers or {},
+    )
+
+
+def test_registry_sync_command_returns_text_and_markup() -> None:
+    markup = {"inline_keyboard": [[{"text": "x", "callback_data": "voice:speed:+"}]]}
+    seen = []
+
+    def handler(remainder, chat_id):
+        seen.append((remainder, chat_id))
+        return ("語音參數", markup)
+
+    processor = _registry_processor(
+        command_handlers={"/voice": RegisteredCommand(handler)}
+    )
+    plan = processor.build_reply_plan(chat_id="123", text="/voice speed 1.5")
+
+    assert plan.run_in_background is False
+    assert plan.ack is None
+    assert plan.execute() == "語音參數"
+    assert plan.reply_markup == markup
+    assert seen == [("speed 1.5", "123")]
+
+
+def test_registry_background_command_uses_factory_and_ack() -> None:
+    calls = []
+
+    def handler(remainder, chat_id):
+        calls.append((remainder, chat_id))
+        return f"done:{remainder}:{chat_id}"
+
+    spec = RegisteredCommand(handler, ack="收到…", background=True)
+    processor = _registry_processor(command_handlers={"/say": spec})
+    plan = processor.build_reply_plan(chat_id="123", text="/say こんにちは")
+
+    assert plan.run_in_background is True
+    assert plan.ack == "收到…"
+    # The handler must not have run yet — only the factory defers it.
+    assert calls == []
+    reply = plan.execute()
+    assert reply == "done:こんにちは:123"
+    assert calls == [("こんにちは", "123")]
+
+
+def test_registry_command_error_returns_friendly_plan() -> None:
+    def boom(remainder, chat_id):
+        raise RuntimeError("爆炸")
+
+    processor = _registry_processor(
+        command_handlers={"/voice": RegisteredCommand(boom)}
+    )
+    plan = processor.build_reply_plan(chat_id="123", text="/voice x")
+    reply = plan.execute()
+    assert "指令失敗" in reply
+    assert "爆炸" in reply
+
+
+def test_registry_does_not_shadow_builtin_commands() -> None:
+    # A registry must never intercept built-ins like /ping.
+    called = []
+    processor = _registry_processor(
+        command_handlers={
+            "/ping": RegisteredCommand(lambda r, c: called.append(1) or "hijacked")
+        }
+    )
+    plan = processor.build_reply_plan(chat_id="123", text="/ping")
+    assert plan.execute() == "pong"
+    assert called == []
+
+
+def test_registry_callback_routes_and_rerenders() -> None:
+    def cb(payload, original_text, chat_id):
+        return ("✅", original_text + f"\n{payload}/{chat_id}", None)
+
+    processor = _registry_processor(callback_handlers={"voice": cb})
+    client = FakeTelegramClient()
+
+    handle_telegram_callback_query(
+        client=client,
+        processor=processor,
+        callback_query=_callback_update(chat_id="123", data="voice:speed:+", text="參數"),
+    )
+
+    assert len(client.edited_messages) == 1
+    assert "speed:+/123" in client.edited_messages[0]["text"]
+    assert client.answered_callbacks[0]["text"] == "✅"
+
+
+def test_registry_callback_does_not_shadow_builtin_prefix() -> None:
+    # Built-in prefixes (e.g. noop) must still win over an unrelated registry.
+    processor = _registry_processor(callback_handlers={"voice": lambda *a: ("x", "y", None)})
+    client = FakeTelegramClient()
+
+    handle_telegram_callback_query(
+        client=client,
+        processor=processor,
+        callback_query=_callback_update(chat_id="123", data="noop", text="label"),
+    )
+
+    # noop silently acknowledges with no edit.
+    assert client.edited_messages == []
