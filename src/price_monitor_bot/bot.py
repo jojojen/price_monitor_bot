@@ -791,7 +791,7 @@ class TelegramCommandProcessor:
 
     def is_allowed_chat(self, chat_id: str | int) -> bool:
         if not self._allowed_chat_ids:
-            return True
+            return False  # fail-closed: no allowlist = deny all (startup guard catches this first)
         return str(chat_id) in self._allowed_chat_ids
 
     def get_pending_photo_clarification(self, chat_id: str | int) -> PendingTelegramPhotoClarification | None:
@@ -2761,6 +2761,10 @@ def run_telegram_polling(
     heartbeat_path: Path | None = None,
     watchdog_enabled: bool = True,
 ) -> int:
+    if not allowed_chat_ids:
+        raise RuntimeError(
+            "OPENCLAW_TELEGRAM_CHAT_IDS 未設定，拒絕啟動（防止 fail-open：空 allowlist = 全球可存取）"
+        )
     client = TelegramBotClient(token, ssl_context=ssl_context)
     me = client.get_me()
     username = me.get("username", "<unknown>")
