@@ -289,12 +289,17 @@ def test_command_processor_help_lists_trend_and_scan_commands() -> None:
 
 
 def test_command_processor_handles_hunt_status() -> None:
+    def _stub_hunt(remainder: str, chat_id: str) -> str:
+        if remainder.strip() in {"status", ""}:
+            return "targets: Umbreon"
+        return "unknown"
+
     processor = TelegramCommandProcessor(
         allowed_chat_ids=frozenset({"123"}),
         lookup_renderer=lambda query: query.name,
         board_loader=lambda: (_stub_board(),),
         catalog_renderer=lambda: "catalog",
-        opportunity_status_renderer=lambda: "targets: Umbreon",
+        command_handlers={"/hunt": RegisteredCommand(_stub_hunt)},
     )
 
     assert processor.build_reply(chat_id="123", text="/hunt status") == "targets: Umbreon"
@@ -2424,34 +2429,57 @@ def test_callback_query_cond_done_returns_to_watchlist_edit_mode() -> None:
 # ── Paginated /hunt view ──────────────────────────────────────────────────────
 
 def _make_huntlist_processor(candidates: list[dict[str, object]]) -> tuple[TelegramCommandProcessor, dict]:
-    """Build a processor wired with stub opportunity providers.
+    """Build a processor wired with stub opportunity view/deleter via registry.
 
     Returns (processor, scratch) where scratch is a dict the test can inspect
-    to see which candidate_id the remover was called with.
+    to see which candidate_id the deleter was called with.
     """
+    from price_monitor_bot.list_view import LIST_VIEW_MODE_READ, ListRow, build_list_view
+
     scratch: dict[str, object] = {"removed": [], "candidates": list(candidates)}
 
-    def list_provider():
-        return list(scratch["candidates"])
-
-    def remover(target):
-        # `dismiss_opportunity_target` accepts candidate_id as selector; mimic
-        # its success-message contract so `delete_huntlist_item_by_id`'s
-        # prefix-based check works.
+    def _hl_view(*, page: int = 0, mode: str = LIST_VIEW_MODE_READ):
+        items = []
         for c in scratch["candidates"]:
-            if c["candidate_id"] == target:
+            cid = str(c.get("candidate_id") or "")
+            if not cid:
+                continue
+            game = str(c.get("game") or "?")
+            title = str(c.get("title") or "(no title)")
+            heat = c.get("heat_score")
+            heat_text = f"{float(heat):.0f}" if heat is not None else "?"
+            sq = str(c.get("search_query") or "")
+            items.append(
+                ListRow(
+                    id=cid,
+                    text=f"[{game}] {title}\n  heat={heat_text}  search: {sq}",
+                    short_label=f"[{game}] {title[:18]}",
+                )
+            )
+        return build_list_view(
+            list_kind="hl",
+            items=items,
+            page=page,
+            mode=mode,
+            list_title="📋 Opportunity 候選",
+            empty_message="目前沒有 Opportunity 候選。等下一輪 agent tick 收集到目標後再看。",
+        )
+
+    def _hl_deleter(candidate_id: str) -> bool:
+        for c in scratch["candidates"]:
+            if c["candidate_id"] == candidate_id:
                 scratch["candidates"].remove(c)
-                scratch["removed"].append(target)
-                return f"已從機會清單移除\n目標：[{c['game']}] {c['title']}\n之後相同 candidate_id 再出現時會保持隱藏。"
-        return f"找不到可移除的 active 目標：{target}"
+                scratch["removed"].append(candidate_id)
+                return True
+        return False
 
     proc = TelegramCommandProcessor(
         allowed_chat_ids=frozenset({"123"}),
         lookup_renderer=lambda query: query.name,
         board_loader=lambda: (_stub_board(),),
         catalog_renderer=lambda: "catalog",
-        opportunity_list_provider=list_provider,
-        opportunity_target_remover=remover,
+        view_handlers={"hl": _hl_view},
+        item_deleter_handlers={"hl": (_hl_deleter, "Opportunity 候選")},
     )
     return proc, scratch
 
@@ -2472,12 +2500,13 @@ def _make_hunt_candidate(i: int) -> dict[str, object]:
 def test_huntlist_view_renders_with_per_item_delete_in_edit_mode() -> None:
     processor, _ = _make_huntlist_processor([_make_hunt_candidate(i) for i in range(3)])
 
-    text_r, kb_r, _ = processor.render_huntlist_view()
+    view = processor._view_registry["hl"]
+    text_r, kb_r, _ = view()
     assert "📋 Opportunity 候選" in text_r
     assert "共 3 筆" in text_r
     assert len(kb_r["inline_keyboard"]) == 1  # nav only
 
-    _, kb_e, _ = processor.render_huntlist_view(mode="e")
+    _, kb_e, _ = view(mode="e")
     assert len(kb_e["inline_keyboard"]) == 4  # 3 deletes + nav
     delete_data = [row[0]["callback_data"] for row in kb_e["inline_keyboard"][:3]]
     assert delete_data == [
@@ -2514,7 +2543,8 @@ def test_callback_query_del_hl_dismisses_candidate_and_rerenders() -> None:
 
 def test_huntlist_view_empty_when_no_provider_results() -> None:
     processor, _ = _make_huntlist_processor([])
-    text, kb, page = processor.render_huntlist_view()
+    view = processor._view_registry["hl"]
+    text, kb, page = view()
     assert "目前沒有 Opportunity 候選" in text
     assert kb is None
     assert page == 0

@@ -66,13 +66,6 @@ ReputationRenderer = Callable[["TelegramReputationQuery"], object]
 ResearchRenderer = Callable[["TelegramResearchQuery"], str]
 # (url, prompt) -> reply text. Reads a single page and answers a focused prompt.
 FetchRenderer = Callable[[str, str], str]
-OpportunityTargetRemover = Callable[[str], str]
-# (selector, kind, action, names) -> reply text. kind in {"aliases","related"}, action in {"add","remove"}.
-OpportunityAliasUpdater = Callable[[str, str, str, list[str]], str]
-# (name) -> reply text. Marks a candidate (existing or newly created) as 🎯 Target.
-OpportunityTargetPinner = Callable[[str], str]
-# (selector) -> reply text. Removes the 🎯 Target flag without dismissing the candidate.
-OpportunityTargetUnpinner = Callable[[str], str]
 BoardLoader = Callable[[], tuple[HotCardBoard, ...]]
 CatalogRenderer = Callable[[], str]
 WatchlistStore = object  # MonitorDatabase or None
@@ -143,7 +136,6 @@ def _normalize_markets(values: object) -> tuple[str, ...]:
         out.append(normal)
     return tuple(out)
 SET_PRICE_COMMANDS = {"/setprice", "/updatewatch"}
-HUNT_COMMANDS = {"/hunt", "/opportunity"}
 HEAVY_COMMANDS = PRICE_LOOKUP_COMMANDS | TREND_BOARD_COMMANDS | REPUTATION_SNAPSHOT_COMMANDS | WEB_RESEARCH_COMMANDS
 
 logger = logging.getLogger(__name__)
@@ -758,12 +750,6 @@ class TelegramCommandProcessor:
         watch_db: MonitorDatabase | None = None,
         sns_db: SnsDatabase | None = None,
         sns_buzz_fn: Callable[[str], str] | None = None,
-        opportunity_status_renderer: Callable[[], str] | None = None,
-        opportunity_target_remover: OpportunityTargetRemover | None = None,
-        opportunity_list_provider: Callable[[], list[dict[str, object]]] | None = None,
-        opportunity_alias_updater: OpportunityAliasUpdater | None = None,
-        opportunity_target_pinner: OpportunityTargetPinner | None = None,
-        opportunity_target_unpinner: OpportunityTargetUnpinner | None = None,
         collab_backfiller: "object | None" = None,
         feedback_service: "object | None" = None,
         command_handlers: "dict[str, RegisteredCommand] | None" = None,
@@ -784,12 +770,6 @@ class TelegramCommandProcessor:
         self._watch_db = watch_db
         self._sns_db = sns_db
         self._sns_buzz_fn = sns_buzz_fn
-        self._opportunity_status_renderer = opportunity_status_renderer
-        self._opportunity_target_remover = opportunity_target_remover
-        self._opportunity_list_provider = opportunity_list_provider
-        self._opportunity_alias_updater = opportunity_alias_updater
-        self._opportunity_target_pinner = opportunity_target_pinner
-        self._opportunity_target_unpinner = opportunity_target_unpinner
         self._collab_backfiller = collab_backfiller
         self._feedback_service = feedback_service
         self._command_registry: dict[str, RegisteredCommand] = command_handlers or {}
@@ -1094,17 +1074,6 @@ class TelegramCommandProcessor:
                 return TelegramTextReplyPlan(ack=spec.ack, reply=result[0], reply_markup=result[1])
             return TelegramTextReplyPlan(ack=spec.ack, reply=result)
 
-        if command in HUNT_COMMANDS:
-            action = remainder.strip().lower()
-            # `/hunt`、`/hunt list`、空動作 → 進入分頁清單（若 provider 有設定）。
-            # `/hunt status` 維持舊「狀態 + 推薦紀錄」純文字輸出。
-            if (
-                self._opportunity_list_provider is not None
-                and action in {"", "list", "candidates", "targets", "目標", "候選"}
-            ):
-                text, reply_markup, _ = self.render_huntlist_view()
-                return TelegramTextReplyPlan(ack=None, reply=text, reply_markup=reply_markup)
-            return TelegramTextReplyPlan(ack=None, reply=self._handle_hunt(remainder))
         if command in PRICE_LOOKUP_COMMANDS:
             return TelegramTextReplyPlan(
                 ack=build_processing_ack(text=content),
@@ -1480,137 +1449,6 @@ class TelegramCommandProcessor:
             f"價格上限：¥{old_price:,} → ¥{new_price:,}"
         )
 
-    def _handle_hunt(self, raw: str) -> str:
-        action = raw.strip().lower()
-        if action in {"", "status", "candidates", "list", "targets", "目標", "候選"}:
-            if self._opportunity_status_renderer is None:
-                return "Opportunity agent status is not configured in this runtime."
-            return self._opportunity_status_renderer()
-        if _is_hunt_remove_action(raw):
-            if self._opportunity_target_remover is None:
-                return "Opportunity target removal is not configured in this runtime."
-            target = _extract_hunt_remove_target(raw)
-            if not target:
-                return "請提供要移除的目標，例如：/hunt remove 2 或 /hunt remove Umbreon ex SAR"
-            return self._opportunity_target_remover(target)
-        if _is_hunt_pin_action(raw):
-            if self._opportunity_target_pinner is None:
-                return "Opportunity target pinner is not configured in this runtime."
-            name = _extract_hunt_pin_target(raw)
-            if not name:
-                return "請提供要釘為目標的商品名，例如：/hunt pin アビスアイ box"
-            return self._opportunity_target_pinner(name)
-        if _is_hunt_unpin_action(raw):
-            if self._opportunity_target_unpinner is None:
-                return "Opportunity target unpinner is not configured in this runtime."
-            selector = _extract_hunt_unpin_target(raw)
-            if not selector:
-                return "請提供要從目標清單移除的編號或名稱，例如：/hunt unpin 1"
-            return self._opportunity_target_unpinner(selector)
-        alias_reply = self._maybe_handle_hunt_alias(raw)
-        if alias_reply is not None:
-            return alias_reply
-        return (
-            "可用格式：\n"
-            "  /hunt status\n"
-            "  /hunt pin <商品名>          ← 🎯 主動加入目標清單\n"
-            "  /hunt unpin <編號或名稱>     ← 從目標清單移除（保留 candidate）\n"
-            "  /hunt remove <編號或名稱>   ← 永久封殺該 candidate\n"
-            "  /hunt alias <編號或id> add 別名A, 別名B\n"
-            "  /hunt alias <編號或id> remove 別名A\n"
-            "  /hunt related <編號或id> add 關鍵字"
-        )
-
-    def _maybe_handle_hunt_alias(self, raw: str) -> str | None:
-        """Parse `/hunt alias|related <selector> add|remove <names>`.
-
-        Returns the reply text when matched, None otherwise so the caller falls
-        back to the generic usage hint. Names accept ','/'、'/'，' separators.
-        """
-        import re as _re
-
-        match = _re.match(
-            r"^\s*(?P<kind>alias|aliases|related|related_keywords)\s+(?P<rest>.+)$",
-            raw,
-            _re.IGNORECASE,
-        )
-        if match is None:
-            return None
-        kind_raw = match.group("kind").lower()
-        kind = "aliases" if kind_raw.startswith("alias") else "related"
-        rest = match.group("rest").strip()
-        action_match = _re.search(r"\b(add|remove|rm|del|delete)\b", rest, _re.IGNORECASE)
-        if action_match is None:
-            return f"請指定 add 或 remove。例如：/hunt {kind_raw} <編號或id> add 別名A"
-        selector = rest[: action_match.start()].strip()
-        if not selector:
-            return f"請提供候選編號或 id。例如：/hunt {kind_raw} 2 add 別名A"
-        action_word = action_match.group(1).lower()
-        action = "remove" if action_word in {"remove", "rm", "del", "delete"} else "add"
-        tail = rest[action_match.end():].strip()
-        if not tail:
-            return f"請提供至少一個名稱。例如：/hunt {kind_raw} {selector} {action} ピカチュウex SAR"
-        names = _split_alias_names(tail)
-        if not names:
-            return "請提供至少一個有效的名稱。"
-        if self._opportunity_alias_updater is None:
-            return "Opportunity alias updater is not configured in this runtime."
-        return self._opportunity_alias_updater(selector, kind, action, names)
-
-    def render_huntlist_view(
-        self, *, page: int = 0, mode: str = LIST_VIEW_MODE_READ
-    ) -> tuple[str, dict[str, object] | None, int]:
-        """Render the paginated Opportunity candidate view. Returns (text, reply_markup, page)."""
-        if self._opportunity_list_provider is None:
-            return "Opportunity 候選清單未啟用（list provider 未設定）。", None, 0
-        try:
-            candidates = list(self._opportunity_list_provider())
-        except Exception as exc:
-            logger.exception("Hunt list provider failed")
-            return f"列表失敗：{exc}", None, 0
-
-        items: list[_ListRow] = []
-        for candidate in candidates:
-            candidate_id = str(candidate.get("candidate_id") or "")
-            if not candidate_id:
-                continue
-            game = str(candidate.get("game") or "?")
-            product_type = str(candidate.get("product_type") or "other")
-            title = str(candidate.get("title") or "(no title)")
-            heat = candidate.get("heat_score")
-            heat_text = f"{float(heat):.0f}" if heat is not None else "?"
-            search_query = str(candidate.get("search_query") or "")
-            text_block = (
-                f"[{game} / {product_type}] {title}\n"
-                f"  heat={heat_text}  search: {search_query}"
-            )
-            short = f"[{game}] {title[:18]}"
-            items.append(_ListRow(id=candidate_id, text=text_block, short_label=short))
-
-        return _build_list_view(
-            list_kind="hl",
-            items=items,
-            page=page,
-            mode=mode,
-            list_title="📋 Opportunity 候選",
-            empty_message="目前沒有 Opportunity 候選。等下一輪 agent tick 收集到目標後再看。",
-        )
-
-    def delete_huntlist_item_by_id(self, candidate_id: str) -> bool:
-        """Dismiss an opportunity candidate by id via the existing remover.
-
-        Returns True only on confirmed removal (the remover's reply starts
-        with the success prefix from ``dismiss_opportunity_target``).
-        """
-        if self._opportunity_target_remover is None:
-            return False
-        try:
-            reply = self._opportunity_target_remover(candidate_id)
-        except Exception:
-            logger.exception("Hunt delete failed candidate_id=%s", candidate_id)
-            return False
-        return isinstance(reply, str) and reply.startswith("已從機會清單移除")
-
     def build_reputation_delivery(self, raw: str) -> TelegramReputationDelivery:
         if self._reputation_renderer is None:
             return TelegramReputationDelivery(
@@ -1820,10 +1658,16 @@ class TelegramCommandProcessor:
                 trim_for_log(target, limit=160),
                 intent.confidence,
             )
+            hunt_spec = self._command_registry.get("/hunt")
+            if hunt_spec is not None:
+                return TelegramTextReplyPlan(
+                    ack=f"已理解：相當於 /hunt remove {target}，正在移除。",
+                    reply=None,
+                    reply_factory=lambda target=target: hunt_spec.handler(f"remove {target}", str(chat_id)),
+                )
             return TelegramTextReplyPlan(
-                ack=f"已理解：相當於 /hunt remove {target}，正在移除。",
-                reply=None,
-                reply_factory=lambda target=target: self._handle_hunt(f"remove {target}"),
+                ack=None,
+                reply="Hunt 功能未設定（registry 未載入）。",
             )
 
         # ── SNS intents ────────────────────────────────────────────────────────
@@ -2426,163 +2270,6 @@ def parse_reputation_snapshot_command(raw: str) -> TelegramReputationQuery:
     return TelegramReputationQuery(query_url=query_url)
 
 
-_HUNT_PIN_KEYWORDS: tuple[str, ...] = (
-    "pin",
-    "target",
-    "watch",
-    "track",
-    "加入目標",
-    "鎖定",
-    "盯",
-    "釘",
-)
-
-_HUNT_UNPIN_KEYWORDS: tuple[str, ...] = (
-    "unpin",
-    "untarget",
-    "unwatch",
-    "untrack",
-    "取消鎖定",
-    "解除目標",
-    "解鎖",
-)
-
-
-def _action_keyword_match(raw: str, keywords: tuple[str, ...]) -> str | None:
-    """Return the matching keyword if `raw` is exactly that keyword or starts
-    with `keyword + space`. Used for "/hunt pin foo"-style action dispatch."""
-    stripped = raw.strip()
-    if not stripped:
-        return None
-    lowered = stripped.lower()
-    for keyword in keywords:
-        key_lower = keyword.lower()
-        if lowered == key_lower or lowered.startswith(f"{key_lower} "):
-            return keyword
-        if stripped == keyword or stripped.startswith(f"{keyword} "):
-            return keyword
-    return None
-
-
-def _strip_action_keyword(raw: str, keyword: str) -> str:
-    stripped = raw.strip()
-    lowered_stripped = stripped.lower()
-    key_lower = keyword.lower()
-    if lowered_stripped == key_lower or stripped == keyword:
-        return ""
-    if lowered_stripped.startswith(f"{key_lower} "):
-        return stripped[len(keyword) :].strip()
-    if stripped.startswith(f"{keyword} "):
-        return stripped[len(keyword) :].strip()
-    return stripped
-
-
-def _is_hunt_pin_action(raw: str) -> bool:
-    if _action_keyword_match(raw, _HUNT_UNPIN_KEYWORDS) is not None:
-        return False  # unpin matches "unwatch" etc; check unpin first
-    return _action_keyword_match(raw, _HUNT_PIN_KEYWORDS) is not None
-
-
-def _extract_hunt_pin_target(raw: str) -> str:
-    matched = _action_keyword_match(raw, _HUNT_PIN_KEYWORDS)
-    if matched is None:
-        return ""
-    return _strip_action_keyword(raw, matched)
-
-
-def _is_hunt_unpin_action(raw: str) -> bool:
-    return _action_keyword_match(raw, _HUNT_UNPIN_KEYWORDS) is not None
-
-
-def _extract_hunt_unpin_target(raw: str) -> str:
-    matched = _action_keyword_match(raw, _HUNT_UNPIN_KEYWORDS)
-    if matched is None:
-        return ""
-    return _strip_action_keyword(raw, matched)
-
-
-def _is_hunt_remove_action(raw: str) -> bool:
-    lowered = raw.strip().lower()
-    if not lowered:
-        return False
-    return any(
-        lowered == keyword or lowered.startswith(f"{keyword} ")
-        for keyword in (
-            "remove",
-            "delete",
-            "dismiss",
-            "hide",
-            "ignore",
-            "drop",
-            "not interested",
-            "no interest",
-            "移除",
-            "刪除",
-            "删除",
-            "不要",
-            "不感興趣",
-            "不感兴趣",
-            "沒興趣",
-            "没兴趣",
-            "外して",
-            "削除",
-        )
-    )
-
-
-def _extract_hunt_remove_target(raw: str) -> str:
-    target = raw.strip()
-    for phrase in (
-        "not interested in",
-        "not interested",
-        "no interest in",
-        "no interest",
-        "remove",
-        "delete",
-        "dismiss",
-        "hide",
-        "ignore",
-        "drop",
-        "target",
-        "candidate",
-        "opportunity",
-        "移除",
-        "刪除",
-        "删除",
-        "不要",
-        "不感興趣",
-        "不感兴趣",
-        "沒興趣",
-        "没兴趣",
-        "外して",
-        "削除",
-        "目標",
-        "目标",
-        "候選",
-        "候选",
-    ):
-        target = re.sub(re.escape(phrase), " ", target, flags=re.IGNORECASE)
-    target = re.sub(r"^(?:第)?\s*(\d{1,2})\s*(?:個|个|項|项|筆|笔|番)?$", r"\1", target.strip())
-    target = re.sub(r"[，、。！？!?：:；;]", " ", target)
-    return " ".join(target.split()).strip()
-
-
-def _split_alias_names(tail: str) -> list[str]:
-    """Split a /hunt alias names string into individual names.
-
-    Accepts ASCII comma, full-width comma (，) and Japanese enumeration (、)
-    as separators. When no separator is present, the entire tail is treated
-    as a single name (so multi-word aliases like "テラスタル ピカチュウ sar"
-    survive without manual quoting).
-    """
-    standardized = tail.replace("，", ",").replace("、", ",").strip()
-    if not standardized:
-        return []
-    if "," in standardized:
-        return [part.strip() for part in standardized.split(",") if part.strip()]
-    return [standardized]
-
-
 def format_liquidity_board(board: HotCardBoard, *, limit: int = 5) -> str:
     lines = [board.label]
     for item in board.items[:limit]:
@@ -3028,12 +2715,6 @@ def run_telegram_polling(
     watch_db: MonitorDatabase | None = None,
     sns_db: SnsDatabase | None = None,
     sns_buzz_fn: Callable[[str], str] | None = None,
-    opportunity_status_renderer: Callable[[], str] | None = None,
-    opportunity_target_remover: OpportunityTargetRemover | None = None,
-    opportunity_list_provider: Callable[[], list[dict[str, object]]] | None = None,
-    opportunity_alias_updater: OpportunityAliasUpdater | None = None,
-    opportunity_target_pinner: OpportunityTargetPinner | None = None,
-    opportunity_target_unpinner: OpportunityTargetUnpinner | None = None,
     feedback_service: "object | None" = None,
     command_handlers: "dict[str, RegisteredCommand] | None" = None,
     callback_handlers: "dict[str, Callable[[str, str, str], tuple[object, str, object]]] | None" = None,
@@ -3074,12 +2755,6 @@ def run_telegram_polling(
         watch_db=watch_db,
         sns_db=sns_db,
         sns_buzz_fn=sns_buzz_fn,
-        opportunity_status_renderer=opportunity_status_renderer,
-        opportunity_target_remover=opportunity_target_remover,
-        opportunity_list_provider=opportunity_list_provider,
-        opportunity_alias_updater=opportunity_alias_updater,
-        opportunity_target_pinner=opportunity_target_pinner,
-        opportunity_target_unpinner=opportunity_target_unpinner,
         feedback_service=feedback_service,
         command_handlers=command_handlers,
         callback_handlers=callback_handlers,
@@ -3347,8 +3022,6 @@ def _list_item_deleter(processor: TelegramCommandProcessor, list_kind: str):
         return registered
     if list_kind == "wl":
         return processor.delete_marketplace_watch_by_id, "Marketplace 追蹤"
-    if list_kind == "hl":
-        return processor.delete_huntlist_item_by_id, "Opportunity 候選"
     return None, None
 
 
@@ -3417,42 +3090,6 @@ def handle_telegram_callback_query(
         except Exception:
             logger.exception("registered callback failed prefix=%s", prefix)
             toast = "操作失敗，請看 log"
-    elif prefix == "oppfb" and payload:
-        # Inline-button feedback on an Opportunity recommendation.
-        # Payload format: "<kind>:<recommendation_id>" where kind ∈ {up,down,bought}.
-        kind, _, rec_id = payload.partition(":")
-        if kind not in {"up", "down", "bought"} or not rec_id:
-            toast = "未知回饋"
-        else:
-            try:
-                from openclaw_adapter.opportunity_feedback import (
-                    record_opportunity_feedback,
-                )
-                result = record_opportunity_feedback(
-                    recommendation_id=rec_id,
-                    kind=kind,
-                    collab_backfiller=processor._collab_backfiller,
-                )
-            except Exception:
-                logger.exception("oppfb feedback failed rec_id=%s kind=%s", rec_id, kind)
-                toast = "回饋寫入失敗，請看 log"
-            else:
-                if result.get("status") != "ok":
-                    toast = f"記錄失敗：{result.get('reason', 'unknown')}"
-                else:
-                    side_effects = list(result.get("side_effects") or ())
-                    if kind == "up":
-                        toast = "✓ 已記錄 👍" + (" + 升級為目標" if "promoted_to_target" in side_effects else "")
-                    elif kind == "bought":
-                        toast = "✓ 已記錄 💰" + (" + 升級為目標" if "promoted_to_target" in side_effects else "")
-                    else:  # down
-                        if "auto_dismissed" in side_effects:
-                            toast = "✓ 已標記不感興趣（累計過閾值，自動 dismiss）"
-                        else:
-                            toast = "✓ 已標記不感興趣（24h cooldown）"
-                    new_text = f"{original_text}\n\n{toast}"
-                    new_reply_markup = None  # clear buttons; reply_markup=None means edit_message_text sets no keyboard
-                    rerender = True
     elif prefix == "pg" and payload.count(":") == 2:
         list_kind, page_str, mode = payload.split(":", 2)
         renderer = _list_view_renderer(processor, list_kind)
