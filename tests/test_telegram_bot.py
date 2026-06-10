@@ -1616,12 +1616,88 @@ class _FakeSnsDatabase:
 
 
 def _processor_with_sns_db(sns_db) -> TelegramCommandProcessor:
-    return TelegramCommandProcessor(
+    """Build a TelegramCommandProcessor wired with inline SNS registry handlers.
+
+    The SNS command/callback handlers are now in aka_no_claw's openclaw_adapter
+    (not importable from this venv), so we inline minimal equivalents here so
+    the dispatch-mechanism tests remain valid.
+    """
+    from price_monitor_bot.list_view import LIST_VIEW_MODE_READ, ListRow, build_list_view
+
+    # -- inline SNS list view (mirrors build_snslist_view_fn logic) -----------
+    def _sl_view(*, page: int = 0, mode: str = LIST_VIEW_MODE_READ):
+        if sns_db is None:
+            return "SNS 監控尚未啟用（sns_db 未設定）。", None, 0
+        rules = list(sns_db.list_watch_rules())
+        rules.sort(key=lambda r: (not getattr(r, "enabled", True), r.rule_id))
+        items = []
+        for rule in rules:
+            source = getattr(rule, "source", "x")
+            screen_name = getattr(rule, "screen_name", None)
+            query_text = getattr(rule, "query", None)
+            category = getattr(rule, "category", None)
+            if screen_name:
+                handle_display = f"r/{screen_name}" if source == "reddit" else f"@{screen_name}"
+                include_kw = getattr(rule, "include_keywords", ()) or ()
+                filters = f" filter[{', '.join(include_kw)}]" if include_kw else ""
+                info, short = f"{handle_display}{filters}", handle_display
+            elif query_text:
+                info, short = f'"{query_text}"', f'"{query_text[:18]}"'
+            elif category:
+                info = short = f"Trend:{category}"
+            else:
+                info = "Unknown"; short = rule.rule_id[:8]
+            domains = getattr(rule, "domains", ())
+            domain_seg = f" domain[{', '.join(domains)}]" if domains else " domain[?]"
+            sched_seg = (f" schedule:{rule.schedule_minutes}m"
+                         if getattr(rule, "schedule_minutes", None) else "")
+            status = "✓" if getattr(rule, "enabled", True) else "✗"
+            text_block = (f"  {status} [{source}] {info}{domain_seg}{sched_seg}"
+                          f" ({rule.rule_id[:8]}…)")
+            items.append(ListRow(id=rule.rule_id, text=text_block, short_label=short))
+        return build_list_view(
+            list_kind="sl", items=items, page=page, mode=mode,
+            list_title="📋 SNS 監控規則",
+            empty_message="尚無 SNS 監控規則。\n用法：/snsadd @username",
+        )
+
+    # -- inline snsdel callback (mirrors build_snsdel_callback_handler logic) -
+    def _snsdel_cb(payload: str, original_text: str, chat_id: str):
+        handle = payload.lstrip("@")
+        rules = list(sns_db.list_watch_rules())
+        rule_id = None
+        for rule in rules:
+            if (rule.rule_id == handle or rule.rule_id.startswith(handle)
+                    or getattr(rule, "screen_name", "").lower() == handle.lower()):
+                rule_id = rule.rule_id
+                break
+        if rule_id is None:
+            return (f"已經不在追蹤 @{handle}",
+                    f"{original_text}\n\n✓ 已刪除 @{handle}（先前已移除）", None)
+        found = sns_db.delete_watch_rule(rule_id)
+        if found:
+            return f"已刪除 @{handle}", f"{original_text}\n\n✓ 已刪除 @{handle}", None
+        return (f"已經不在追蹤 @{handle}",
+                f"{original_text}\n\n✓ 已刪除 @{handle}（先前已移除）", None)
+
+    # -- inline sl deleter ----------------------------------------------------
+    def _sl_deleter(rule_id: str) -> bool:
+        return bool(sns_db.delete_watch_rule(rule_id)) if sns_db else False
+
+    class _SnsProcessor(TelegramCommandProcessor):
+        """Thin subclass adding render_snslist_view for backward-compat in tests."""
+        def render_snslist_view(self, *, page: int = 0, mode: str = LIST_VIEW_MODE_READ):
+            return _sl_view(page=page, mode=mode)
+
+    return _SnsProcessor(
         allowed_chat_ids=frozenset({"123"}),
         lookup_renderer=lambda query: query.name,
         board_loader=lambda: (_stub_board(),),
         catalog_renderer=lambda: "catalog",
         sns_db=sns_db,
+        callback_handlers={"snsdel": _snsdel_cb},
+        view_handlers={"sl": _sl_view},
+        item_deleter_handlers={"sl": (_sl_deleter, "SNS 規則")},
     )
 
 
@@ -1683,12 +1759,39 @@ def _setup_snsfb_processor(tmp_path):
         chat_id="123",
     )
     db.save_watch_rule(rule)
+
+    def _snsfb_cb(payload: str, original_text: str, chat_id: str) -> tuple:
+        parts = payload.split(":", 2)
+        if len(parts) != 3 or parts[0] not in {"up", "down", "bought"}:
+            return "未知回饋", None, None
+        kind, tweet_id, rule_id = parts
+        db_path = getattr(db, "path", None)
+        if db_path is None:
+            return "SNS monitor 未啟用，無法寫入回饋", None, None
+        from sns_monitor.feedback import record_sns_feedback
+        result = record_sns_feedback(db=db, tweet_id=tweet_id, rule_id=rule_id,
+                                     chat_id=str(chat_id), kind=kind)
+        if result.get("status") != "ok":
+            return f"記錄失敗：{result.get('reason', 'unknown')}", None, None
+        side_effects = list(result.get("side_effects") or ())
+        if kind == "up":
+            toast = "✓ 已記錄 👍（已提高同類推文推播機率）"
+        elif kind == "bought":
+            toast = "✓ 已記錄 💰（已提高同類推文推播機率）"
+        else:
+            if "rule_disabled" in side_effects:
+                toast = "✓ 已標記不感興趣（累計過閾值，rule 自動停用）"
+            else:
+                toast = "✓ 已標記不感興趣（24h cooldown）"
+        return toast, f"{original_text}\n\n{toast}", None
+
     proc = TelegramCommandProcessor(
         allowed_chat_ids=frozenset({"123"}),
         lookup_renderer=lambda query: query.name,
         board_loader=lambda: (_stub_board(),),
         catalog_renderer=lambda: "catalog",
         sns_db=db,
+        callback_handlers={"snsfb": _snsfb_cb},
     )
     return proc, db, rule.rule_id
 

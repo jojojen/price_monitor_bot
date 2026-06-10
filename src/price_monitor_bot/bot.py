@@ -41,6 +41,13 @@ from tcg_tracker.image_lookup import (
 
 from .commands import lookup_card
 from .formatters import build_lookup_feedback_keyboard, format_jpy, format_lookup_result_telegram
+from .list_view import (
+    LIST_VIEW_MODE_EDIT,
+    LIST_VIEW_MODE_READ,
+    LIST_VIEW_PAGE_SIZE,
+    ListRow,
+    build_list_view,
+)
 from .logging_utils import mask_identifier, trim_for_log
 from .natural_language import (
     TelegramNaturalLanguageIntent,
@@ -136,11 +143,6 @@ def _normalize_markets(values: object) -> tuple[str, ...]:
         out.append(normal)
     return tuple(out)
 SET_PRICE_COMMANDS = {"/setprice", "/updatewatch"}
-SNS_ADD_COMMANDS = {"/snsadd", "/sns_add"}
-SNS_LIST_COMMANDS = {"/snslist", "/sns_list"}
-SNS_DELETE_COMMANDS = {"/snsdelete", "/sns_delete"}
-SNS_BUZZ_COMMANDS = {"/snsbuzz", "/sns_buzz"}
-KNOWLEDGE_COMMANDS = {"/knowledge", "/kb"}
 HUNT_COMMANDS = {"/hunt", "/opportunity"}
 HEAVY_COMMANDS = PRICE_LOOKUP_COMMANDS | TREND_BOARD_COMMANDS | REPUTATION_SNAPSHOT_COMMANDS | WEB_RESEARCH_COMMANDS
 
@@ -149,31 +151,10 @@ PHOTO_CLARIFICATION_TTL_SECONDS = 15 * 60
 TEXT_CLARIFICATION_TTL_SECONDS = 15 * 60
 TEXT_AMBIGUITY_CONFIDENCE_THRESHOLD = 0.55
 
-LIST_VIEW_PAGE_SIZE = 5
-LIST_VIEW_MODE_READ = "r"
-LIST_VIEW_MODE_EDIT = "e"
-
-
-@dataclass(frozen=True, slots=True)
-class _ListRow:
-    """One row of a paginated /snslist // /watchlist // /hunt view.
-
-    `id` lands in the delete-button's callback_data, so it must be short
-    enough to keep `del:<kind>:<id>` under Telegram's 64-byte limit.
-    `text` is the rendered multi-line block for read mode; `short_label`
-    is the truncated label shown on the delete button in edit mode.
-    `extra_buttons` is appended next to the delete button on the same row
-    (used by /watchlist to add a "🎛 設定狀態" button).
-    `label_button` when set is inserted as a full-width row directly above
-    the action buttons in edit mode, so the delete button appears below the
-    item label rather than across from it.
-    """
-
-    id: str
-    text: str
-    short_label: str
-    extra_buttons: tuple[dict[str, object], ...] = ()
-    label_button: dict[str, object] | None = None
+# LIST_VIEW_PAGE_SIZE, LIST_VIEW_MODE_READ/EDIT imported from .list_view above.
+# Internal aliases so existing code in this file needs no further changes.
+_ListRow = ListRow
+_build_list_view = build_list_view
 
 
 _CONDITION_PICKER_TITLE = "🎛 設定狀態"
@@ -269,63 +250,6 @@ def _build_condition_picker_view(
         "callback_data": f"cond:{watch_id}:done",
     }])
     return "\n".join(lines), {"inline_keyboard": keyboard}
-
-
-def _build_list_view(
-    *,
-    list_kind: str,
-    items: list[_ListRow],
-    page: int,
-    mode: str,
-    list_title: str,
-    empty_message: str,
-) -> tuple[str, dict[str, object] | None, int]:
-    """Render a paginated list view. Returns (text, reply_markup, clamped_page).
-
-    `clamped_page` is `page` snapped into `[0, total_pages)`; callers that
-    re-render after deletion can pass `page=current_page` and read back the
-    page actually shown (it may shift up by one if they just removed the
-    last item on the last page).
-    """
-    if not items:
-        return empty_message, None, 0
-
-    total = len(items)
-    total_pages = max(1, (total + LIST_VIEW_PAGE_SIZE - 1) // LIST_VIEW_PAGE_SIZE)
-    clamped = max(0, min(page, total_pages - 1))
-    start = clamped * LIST_VIEW_PAGE_SIZE
-    visible = items[start : start + LIST_VIEW_PAGE_SIZE]
-
-    header = f"{list_title}  第 {clamped + 1}/{total_pages} 頁（共 {total} 筆）"
-    body_lines = [row.text for row in visible if row.text]
-    text = "\n".join([header, "", *body_lines] if body_lines else [header])
-
-    keyboard: list[list[dict[str, object]]] = []
-    if mode == LIST_VIEW_MODE_EDIT:
-        for row in visible:
-            if row.label_button is not None:
-                keyboard.append([row.label_button])
-            btn_label = f"❌ 刪除 {row.short_label}".strip() if row.short_label else "❌ 刪除"
-            row_buttons: list[dict[str, object]] = [{
-                "text": btn_label,
-                "callback_data": f"del:{list_kind}:{row.id}",
-            }]
-            row_buttons.extend(row.extra_buttons)
-            keyboard.append(row_buttons)
-
-    nav: list[dict[str, object]] = []
-    if clamped > 0:
-        nav.append({"text": "⬅️ 上頁", "callback_data": f"pg:{list_kind}:{clamped - 1}:{mode}"})
-    if mode == LIST_VIEW_MODE_READ:
-        nav.append({"text": "✏️ 編輯", "callback_data": f"pg:{list_kind}:{clamped}:{LIST_VIEW_MODE_EDIT}"})
-    else:
-        nav.append({"text": "✓ 完成", "callback_data": f"pg:{list_kind}:{clamped}:{LIST_VIEW_MODE_READ}"})
-    if clamped < total_pages - 1:
-        nav.append({"text": "下頁 ➡️", "callback_data": f"pg:{list_kind}:{clamped + 1}:{mode}"})
-    nav.append({"text": "✖️ 關閉", "callback_data": f"close:{list_kind}"})
-    keyboard.append(nav)
-
-    return text, {"inline_keyboard": keyboard}, clamped
 
 
 @dataclass(frozen=True, slots=True)
@@ -840,12 +764,12 @@ class TelegramCommandProcessor:
         opportunity_alias_updater: OpportunityAliasUpdater | None = None,
         opportunity_target_pinner: OpportunityTargetPinner | None = None,
         opportunity_target_unpinner: OpportunityTargetUnpinner | None = None,
-        knowledge_handler: Callable[[str, str], str] | None = None,
-        knowledge_db_path: "str | None" = None,
         collab_backfiller: "object | None" = None,
         feedback_service: "object | None" = None,
         command_handlers: "dict[str, RegisteredCommand] | None" = None,
         callback_handlers: "dict[str, Callable[[str, str, str], tuple[object, str, object]]] | None" = None,
+        view_handlers: "dict[str, Callable[..., tuple[str, dict | None, int]]] | None" = None,
+        item_deleter_handlers: "dict[str, tuple[Callable[[str], bool], str]] | None" = None,
     ) -> None:
         self._lookup_renderer = lookup_renderer
         self._board_loader = board_loader
@@ -866,14 +790,18 @@ class TelegramCommandProcessor:
         self._opportunity_alias_updater = opportunity_alias_updater
         self._opportunity_target_pinner = opportunity_target_pinner
         self._opportunity_target_unpinner = opportunity_target_unpinner
-        self._knowledge_handler = knowledge_handler
-        self._knowledge_db_path = knowledge_db_path
         self._collab_backfiller = collab_backfiller
         self._feedback_service = feedback_service
         self._command_registry: dict[str, RegisteredCommand] = command_handlers or {}
         self._callback_registry: dict[
             str, Callable[[str, str, str], tuple[object, str, object]]
         ] = callback_handlers or {}
+        self._view_registry: dict[str, Callable[..., tuple[str, "dict | None", int]]] = (
+            view_handlers or {}
+        )
+        self._deleter_registry: dict[str, tuple[Callable[[str], bool], str]] = (
+            item_deleter_handlers or {}
+        )
         self._pending_photo_clarifications: dict[str, PendingTelegramPhotoClarification] = {}
         self._pending_text_clarifications: dict[str, PendingTelegramTextClarification] = {}
         self._pending_sns_bulk_updates: dict[str, PendingTelegramSnsBulkUpdate] = {}
@@ -1231,35 +1159,6 @@ class TelegramCommandProcessor:
                 ack=None,
                 reply=self._handle_set_price(remainder),
             )
-        if command in SNS_ADD_COMMANDS:
-            return TelegramTextReplyPlan(
-                ack="收到 X 追蹤指令，正在設定…",
-                reply=None,
-                reply_factory=lambda remainder=remainder, cid=chat_id: self._handle_sns_add(remainder, str(cid)),
-            )
-        if command in SNS_LIST_COMMANDS:
-            text, reply_markup, _ = self.render_snslist_view()
-            return TelegramTextReplyPlan(ack=None, reply=text, reply_markup=reply_markup)
-        if command in SNS_DELETE_COMMANDS:
-            return TelegramTextReplyPlan(ack=None, reply=self._handle_sns_delete(remainder))
-        if command in SNS_BUZZ_COMMANDS:
-            return TelegramTextReplyPlan(
-                ack="收到，正在抓取 X 熱門討論並交給 LLM 整理…",
-                reply=None,
-                reply_factory=lambda remainder=remainder: self._handle_sns_buzz(remainder),
-            )
-        if command in KNOWLEDGE_COMMANDS:
-            sub = (remainder.strip().split() or [""])[0].lower()
-            if sub == "market":
-                text, reply_markup, _ = self.render_knowledge_market_view()
-                return TelegramTextReplyPlan(ack=None, reply=text, reply_markup=reply_markup)
-            if sub == "coding":
-                text, reply_markup, _ = self.render_knowledge_coding_view()
-                return TelegramTextReplyPlan(ack=None, reply=text, reply_markup=reply_markup)
-            return TelegramTextReplyPlan(
-                ack=None,
-                reply=self._handle_knowledge(remainder, str(chat_id)),
-            )
         if not content.startswith("/"):
             intent = self._route_natural_language(content)
             if _is_text_intent_ambiguous(intent):
@@ -1547,86 +1446,6 @@ class TelegramCommandProcessor:
             return bool(self._watch_db.delete_marketplace_watch(watch_id))
         except Exception:
             logger.exception("Marketplace watch delete failed watch_id=%s", watch_id)
-            return False
-
-    def render_knowledge_market_view(
-        self, *, page: int = 0, mode: str = LIST_VIEW_MODE_READ
-    ) -> tuple[str, dict[str, object] | None, int]:
-        if self._knowledge_db_path is None:
-            return "知識庫功能尚未啟用。", None, 0
-        try:
-            from openclaw_adapter.knowledge_db import KnowledgeDatabase
-        except ImportError:
-            return "知識庫功能不可用（openclaw_adapter 未安裝）。", None, 0
-        db = KnowledgeDatabase(self._knowledge_db_path)
-        entries = db.recent_entries(limit=200)
-        items: list[_ListRow] = []
-        for e in entries:
-            preview = (e.summary or "").strip().replace("\n", " ")[:80]
-            items.append(_ListRow(
-                id=e.entry_id,
-                text=f"• {e.entity_canonical} ({e.entity_type}, {e.confidence:.0%})\n  {preview}",
-                short_label=e.entity_canonical,
-                extra_buttons=(),
-                label_button=None,
-            ))
-        return _build_list_view(
-            list_kind="km",
-            items=items,
-            page=page,
-            mode=mode,
-            list_title="📚 RAG 市場知識",
-            empty_message="知識庫尚無市場條目。",
-        )
-
-    def render_knowledge_coding_view(
-        self, *, page: int = 0, mode: str = LIST_VIEW_MODE_READ
-    ) -> tuple[str, dict[str, object] | None, int]:
-        if self._knowledge_db_path is None:
-            return "知識庫功能尚未啟用。", None, 0
-        try:
-            from openclaw_adapter.knowledge_db import KnowledgeDatabase
-        except ImportError:
-            return "知識庫功能不可用（openclaw_adapter 未安裝）。", None, 0
-        db = KnowledgeDatabase(self._knowledge_db_path)
-        rows = db.all_codegen_knowledge()
-        items: list[_ListRow] = []
-        for r in rows:
-            preview = (r.technique or "").strip().replace("\n", " ")[:80]
-            items.append(_ListRow(
-                id=r.knowledge_id,
-                text=f"• [{r.category}] {r.title} ({r.confidence:.0%})\n  {preview}",
-                short_label=r.title,
-                extra_buttons=(),
-                label_button=None,
-            ))
-        return _build_list_view(
-            list_kind="kc",
-            items=items,
-            page=page,
-            mode=mode,
-            list_title="🧠 龍蝦 Coding 知識",
-            empty_message="尚無 coding 知識條目。",
-        )
-
-    def delete_knowledge_entry_by_id(self, entry_id: str) -> bool:
-        if self._knowledge_db_path is None:
-            return False
-        try:
-            from openclaw_adapter.knowledge_db import KnowledgeDatabase
-            return KnowledgeDatabase(self._knowledge_db_path).delete_entry(entry_id)
-        except Exception:
-            logger.exception("knowledge entry delete failed entry_id=%s", entry_id)
-            return False
-
-    def delete_codegen_by_id(self, knowledge_id: str) -> bool:
-        if self._knowledge_db_path is None:
-            return False
-        try:
-            from openclaw_adapter.knowledge_db import KnowledgeDatabase
-            return KnowledgeDatabase(self._knowledge_db_path).delete_codegen(knowledge_id)
-        except Exception:
-            logger.exception("codegen delete failed knowledge_id=%s", knowledge_id)
             return False
 
     def _handle_unwatch(self, raw: str) -> str:
@@ -2036,7 +1855,7 @@ class TelegramCommandProcessor:
             return TelegramTextReplyPlan(
                 ack=f"已理解：相當於 /snsadd {remainder}，正在新增 X 追蹤{ack_suffix}…",
                 reply=None,
-                reply_factory=lambda r=remainder, c=cid: self._handle_sns_add(r, c),
+                reply_factory=lambda r=remainder, c=cid: self._command_registry["/snsadd"].handler(r, c),
             )
         if intent.intent == "sns_add_keyword":
             if not intent.sns_keyword:
@@ -2047,11 +1866,15 @@ class TelegramCommandProcessor:
             return TelegramTextReplyPlan(
                 ack=f"已理解：相當於 /snsadd keyword:{kw}",
                 reply=None,
-                reply_factory=lambda k=kw, c=cid: self._handle_sns_add(f"keyword:{k}", c),
+                reply_factory=lambda k=kw, c=cid: self._command_registry["/snsadd"].handler(f"keyword:{k}", c),
             )
         if intent.intent == "sns_list":
             logger.info("Telegram NL routed intent=sns_list")
-            text, reply_markup, _ = self.render_snslist_view()
+            vfn = self._view_registry.get("sl")
+            if vfn:
+                text, reply_markup, _ = vfn(page=0, mode=LIST_VIEW_MODE_READ)
+            else:
+                text, reply_markup = "SNS 監控尚未啟用。", None
             return TelegramTextReplyPlan(ack=None, reply=text, reply_markup=reply_markup)
         if intent.intent == "sns_delete":
             target = (intent.sns_handle and f"@{intent.sns_handle}") or intent.watch_id
@@ -2061,10 +1884,11 @@ class TelegramCommandProcessor:
                     reply="請告訴我要移除哪個 X 帳號或規則 ID，例如：刪除追蹤 @elonmusk",
                 )
             logger.info("Telegram NL routed intent=sns_delete target=%s", target)
+            cid = str(chat_id)
             return TelegramTextReplyPlan(
                 ack=f"已理解：相當於 /snsdelete {target}",
                 reply=None,
-                reply_factory=lambda t=target: self._handle_sns_delete(t),
+                reply_factory=lambda t=target, c=cid: self._command_registry["/snsdelete"].handler(t, c),
             )
         if intent.intent == "sns_buzz":
             q = intent.sns_buzz_query
@@ -2074,10 +1898,11 @@ class TelegramCommandProcessor:
                     reply="請告訴我關鍵字，例如：整理一下 amd 最近的熱門討論",
                 )
             logger.info("Telegram NL routed intent=sns_buzz query=%s", q)
+            cid = str(chat_id)
             return TelegramTextReplyPlan(
                 ack=f"已理解：相當於 /snsbuzz {q}，正在抓 Reddit 熱門討論並交給 LLM 整理…",
                 reply=None,
-                reply_factory=lambda x=q: self._handle_sns_buzz(x),
+                reply_factory=lambda x=q, c=cid: self._command_registry["/snsbuzz"].handler(x, c),
             )
 
         if intent.intent == "sns_bulk_add_filter":
@@ -2109,438 +1934,18 @@ class TelegramCommandProcessor:
                 )
             handle = intent.sns_handle
             logger.info("Telegram NL routed intent=sns_clear_filter handle=%s", handle)
+            cid = str(chat_id)
             return TelegramTextReplyPlan(
                 ack=f"已理解：把 @{handle} 的 filter 清空（保留追蹤）",
                 reply=None,
-                reply_factory=lambda h=handle: self._handle_sns_clear_filter(h),
+                reply_factory=lambda h=handle, c=cid: self._command_registry["/snsclearfilter"].handler(h, c),
             )
 
         return None
 
-    def _handle_sns_add(self, raw: str, chat_id: str) -> str:
-        """Handle /snsadd command to add an X/Reddit account, keyword, or trend watch."""
-        if self._sns_db is None:
-            return "SNS 監控尚未啟用（sns_db 未設定）。"
-        from sns_monitor.filters import (
-            extract_labeled_brackets,
-            extract_schedule_minutes,
-            parse_account_watch_text,
-            split_source_prefix,
-        )
-        from sns_monitor.models import AccountWatch, KeywordWatch, TrendWatch
-        from sns_monitor.storage import SnsDatabase
-
-        # Per-source defaults — kept in sync with sources/*.py default_*_schedule_minutes.
-        # Inlined here to avoid import cycles via sources -> reddit_buzz -> subprocess.
-        default_schedules: dict[tuple[str, str], int] = {
-            ("x", "account"): 15, ("x", "keyword"): 30, ("x", "trend"): 60,
-            ("reddit", "account"): 30, ("reddit", "keyword"): 60,
-        }
-        source_label = {"x": "X", "reddit": "Reddit"}
-
-        try:
-            raw = raw.strip()
-            if not raw:
-                return (
-                    '用法：/snsadd x:@username\n'
-                    '     /snsadd x:@username filter[抽選] domain[pokemon] schedule:30\n'
-                    '     /snsadd x:keyword:搜尋詞 domain[gundam]\n'
-                    '     /snsadd x:trend:trending\n'
-                    '     /snsadd reddit:r/PokemonTCG domain[pokemon] schedule:30\n'
-                    '     /snsadd reddit:keyword:Umbreon ex domain[pokemon]'
-                )
-
-            # 1. Pull `schedule:NN` out of the raw text first so it doesn't
-            #    leak into source / kind parsing downstream.
-            schedule_override, raw = extract_schedule_minutes(raw)
-
-            # 2. Strip `<source>:` prefix. No prefix → backcompat default "x".
-            source, body = split_source_prefix(raw)
-
-            # 3. Reddit trend watches don't exist — fail loudly.
-            if source == "reddit" and body.lower().startswith("trend:"):
-                return "Reddit 來源不支援 trend 追蹤。請改用 reddit:r/<subreddit> 或 reddit:keyword:<關鍵字>。"
-
-            # Reddit account form is `r/<subreddit>` (parse_account_watch_text
-            # already handles both `@xxx` and `r/xxx`); X account form is `@<handle>`.
-            account_target = parse_account_watch_text(body)
-            if account_target is not None:
-                screen_name, include_keywords, domains = account_target
-                rule_id = SnsDatabase._watch_rule_id("account", screen_name, source)
-                existing_rule = self._sns_db.get_watch_rule(rule_id)
-                resolved_domains = (
-                    domains if domains is not None else getattr(existing_rule, "domains", ())
-                )
-                schedule_minutes = (
-                    schedule_override
-                    if schedule_override is not None
-                    else getattr(existing_rule, "schedule_minutes", None)
-                    or default_schedules.get((source, "account"), 30)
-                )
-                display = f"r/{screen_name}" if source == "reddit" else f"@{screen_name}"
-                rule = AccountWatch(
-                    rule_id=rule_id,
-                    screen_name=screen_name,
-                    user_id=getattr(existing_rule, "user_id", None),
-                    label=getattr(existing_rule, "label", None) or display,
-                    include_keywords=include_keywords,
-                    domains=resolved_domains,
-                    enabled=True,
-                    schedule_minutes=schedule_minutes,
-                    chat_id=chat_id,
-                    last_checked_at=getattr(existing_rule, "last_checked_at", None),
-                    source=source,
-                )
-                self._sns_db.save_watch_rule(rule)
-                logger.info(
-                    "SNS account watch added source=%s target=%s chat_id=%s include_keywords=%s domains=%s schedule=%dm",
-                    source, screen_name, chat_id, include_keywords, resolved_domains, schedule_minutes,
-                )
-                filter_line = f"\n篩選：{', '.join(include_keywords)}" if include_keywords else ""
-                domain_line = f"\n領域：{', '.join(resolved_domains)}" if resolved_domains else ""
-                kind_label = "subreddit" if source == "reddit" else "帳號"
-                return (
-                    f"✓ 已新增 {source_label.get(source, source)} {kind_label}追蹤：{display}"
-                    f"{filter_line}{domain_line}\n排程：每 {schedule_minutes} 分鐘\nID: {rule_id[:8]}…"
-                )
-            elif body.lower().startswith("keyword:"):
-                explicit_filter, parsed_domains, body_clean = extract_labeled_brackets(body[len("keyword:"):])
-                query = body_clean.strip()
-                if not query:
-                    return "請提供搜尋關鍵字。例如：/snsadd x:keyword:機動戰士 domain[gundam]"
-                rule_id = SnsDatabase._watch_rule_id("keyword", query, source)
-                existing_rule = self._sns_db.get_watch_rule(rule_id)
-                resolved_domains = (
-                    parsed_domains if parsed_domains is not None else getattr(existing_rule, "domains", ())
-                )
-                schedule_minutes = (
-                    schedule_override
-                    if schedule_override is not None
-                    else getattr(existing_rule, "schedule_minutes", None)
-                    or default_schedules.get((source, "keyword"), 60)
-                )
-                rule = KeywordWatch(
-                    rule_id=rule_id,
-                    query=query,
-                    label=f'"{query}"',
-                    domains=resolved_domains,
-                    enabled=True,
-                    schedule_minutes=schedule_minutes,
-                    chat_id=chat_id,
-                    last_checked_at=None,
-                    source=source,
-                )
-                self._sns_db.save_watch_rule(rule)
-                logger.info(
-                    "SNS keyword watch added source=%s query=%s chat_id=%s domains=%s schedule=%dm",
-                    source, query, chat_id, resolved_domains, schedule_minutes,
-                )
-                domain_line = f"\n領域：{', '.join(resolved_domains)}" if resolved_domains else ""
-                return (
-                    f'✓ 已新增 {source_label.get(source, source)} 關鍵字追蹤："{query}"{domain_line}'
-                    f"\n排程：每 {schedule_minutes} 分鐘\nID: {rule_id[:8]}…"
-                )
-            elif body.lower().startswith("trend:"):
-                _, parsed_domains, body_clean = extract_labeled_brackets(body[len("trend:"):])
-                category = body_clean.strip()
-                if category not in {"trending", "for-you", "news", "sports", "entertainment"}:
-                    return "不支援的分類。請使用：trending, for-you, news, sports, 或 entertainment"
-                rule_id = SnsDatabase._watch_rule_id("trend", category, source)
-                existing_rule = self._sns_db.get_watch_rule(rule_id)
-                resolved_domains = (
-                    parsed_domains if parsed_domains is not None else getattr(existing_rule, "domains", ())
-                )
-                schedule_minutes = (
-                    schedule_override
-                    if schedule_override is not None
-                    else getattr(existing_rule, "schedule_minutes", None)
-                    or default_schedules.get((source, "trend"), 60)
-                )
-                rule = TrendWatch(
-                    rule_id=rule_id,
-                    category=category,
-                    label=f"Trend: {category}",
-                    domains=resolved_domains,
-                    enabled=True,
-                    schedule_minutes=schedule_minutes,
-                    chat_id=chat_id,
-                    last_checked_at=None,
-                    source=source,
-                )
-                self._sns_db.save_watch_rule(rule)
-                logger.info(
-                    "SNS trend watch added source=%s category=%s chat_id=%s schedule=%dm",
-                    source, category, chat_id, schedule_minutes,
-                )
-                return (
-                    f"✓ 已新增 {source_label.get(source, source)} 熱門話題追蹤：{category}"
-                    f"\n排程：每 {schedule_minutes} 分鐘\nID: {rule_id[:8]}…"
-                )
-            else:
-                return (
-                    '不認識的格式。用法：\n'
-                    '  /snsadd x:@username [filter[…] domain[…] schedule:NN]\n'
-                    '  /snsadd x:keyword:搜尋詞 / x:trend:trending\n'
-                    '  /snsadd reddit:r/<subreddit> / reddit:keyword:<關鍵字>'
-                )
-        except Exception as exc:
-            logger.exception("SNS add failed raw=%s chat_id=%s", raw, chat_id)
-            return f"新增失敗：{exc}"
-
-    def _handle_sns_list(self) -> str:
-        """Backward-compatible thin wrapper. Returns plain text only.
-
-        The interactive paginated + edit-mode keyboard lives on
-        ``render_snslist_view`` and is reached via the
-        TelegramCommandProcessor dispatch path that consults it directly.
-        """
-        text, _, _ = self.render_snslist_view(page=0, mode=LIST_VIEW_MODE_READ)
-        return text
-
-    def render_snslist_view(
-        self, *, page: int = 0, mode: str = LIST_VIEW_MODE_READ
-    ) -> tuple[str, dict[str, object] | None, int]:
-        """Render the paginated SNS-list view. Returns (text, reply_markup, page)."""
-        if self._sns_db is None:
-            return "SNS 監控尚未啟用（sns_db 未設定）。", None, 0
-        try:
-            rules = list(self._sns_db.list_watch_rules())
-        except Exception as exc:
-            logger.exception("SNS list failed")
-            return f"列表失敗：{exc}", None, 0
-
-        # Stable order: enabled-first (so deactivated rules sink to the bottom),
-        # then by rule_id so the page slice doesn't shift mid-session.
-        rules.sort(key=lambda r: (not r.enabled, r.rule_id))
-
-        items: list[_ListRow] = []
-        for rule in rules:
-            status = "✓" if rule.enabled else "✗"
-            source = getattr(rule, "source", "x")
-            source_tag = f"[{source}] "
-            screen_name = getattr(rule, "screen_name", None)
-            query_text = getattr(rule, "query", None)
-            category = getattr(rule, "category", None)
-            if screen_name:
-                handle_display = f"r/{screen_name}" if source == "reddit" else f"@{screen_name}"
-                include_kw = getattr(rule, "include_keywords", ()) or ()
-                filters = f" filter[{', '.join(include_kw)}]" if include_kw else ""
-                info = f"{handle_display}{filters}"
-                short = handle_display
-            elif query_text:
-                info = f'"{query_text}"'
-                short = f'"{query_text[:18]}"'
-            elif category:
-                info = f"Trend:{category}"
-                short = f"Trend:{category}"
-            else:
-                info = "Unknown"
-                short = rule.rule_id[:8]
-            domains = getattr(rule, "domains", ())
-            domain_segment = f" domain[{', '.join(domains)}]" if domains else " domain[?]"
-            schedule_segment = f" schedule:{rule.schedule_minutes}m" if getattr(rule, "schedule_minutes", None) else ""
-            text_block = f"  {status} {source_tag}{info}{domain_segment}{schedule_segment} ({rule.rule_id[:8]}…)"
-            items.append(_ListRow(id=rule.rule_id, text=text_block, short_label=short))
-
-        text, reply_markup, clamped = _build_list_view(
-            list_kind="sl",
-            items=items,
-            page=page,
-            mode=mode,
-            list_title="📋 SNS 監控規則",
-            empty_message="尚無 SNS 監控規則。\n用法：/snsadd @username",
-        )
-        return text, reply_markup, clamped
-
-    def delete_sns_rule_by_id(self, rule_id: str) -> bool:
-        """Delete a SNS watch rule by its full rule_id. Returns True if a row was removed."""
-        if self._sns_db is None:
-            return False
-        try:
-            return bool(self._sns_db.delete_watch_rule(rule_id))
-        except Exception:
-            logger.exception("SNS delete by id failed rule_id=%s", rule_id)
-            return False
-
-    def _handle_sns_delete(self, raw: str) -> str:
-        """Handle /snsdelete to remove an SNS rule by rule_id, @handle, or keyword:xxx."""
-        if self._sns_db is None:
-            return "SNS 監控尚未啟用（sns_db 未設定）。"
-        try:
-            target = raw.strip()
-            if not target:
-                return "請提供 @帳號 或規則 ID。例如：/snsdelete @elonmusk 或 /snsdelete abc12345"
-
-            rule_id = self._resolve_sns_rule_id(target)
-            if rule_id is None:
-                return f"找不到對應的 SNS 規則：{target}"
-
-            label = self._describe_sns_rule(rule_id)
-            found = self._sns_db.delete_watch_rule(rule_id)
-            if found:
-                logger.info("SNS rule deleted rule_id=%s target=%s", rule_id, target)
-                return f"✓ 已刪除 SNS 監控：{label}"
-            return f"找不到規則 {target}"
-        except Exception as exc:
-            logger.exception("SNS delete failed raw=%s", raw)
-            return f"刪除失敗：{exc}"
-
-    def _resolve_sns_rule_id(self, target: str) -> str | None:
-        """Resolve a user-supplied target to a SNS rule_id.
-
-        Accepts: a hex rule_id prefix, '@handle' / 'r/sub' for account watches,
-        'keyword:xxx' for keyword watches, and the source-prefixed forms
-        ('reddit:r/sub', 'reddit:keyword:xxx', 'x:@handle', ...).
-        """
-        if self._sns_db is None:
-            return None
-
-        cleaned = target.strip()
-        if not cleaned:
-            return None
-
-        rules = list(self._sns_db.list_watch_rules())
-
-        # 1) Exact / prefix match on rule_id
-        for rule in rules:
-            if rule.rule_id == cleaned or rule.rule_id.startswith(cleaned):
-                return rule.rule_id
-
-        # 2) Optional `<source>:` prefix narrows the search. Inline a small
-        #    prefix-split here to avoid a hard sns_monitor dependency in the
-        #    test path (test venv may not have sns_monitor installed).
-        source_filter = "x"
-        had_source_prefix = False
-        body = cleaned
-        for src in ("reddit:", "x:"):
-            if cleaned.lower().startswith(src):
-                source_filter = src[:-1]
-                had_source_prefix = True
-                body = cleaned[len(src):].strip()
-                break
-
-        def _source_matches(rule) -> bool:
-            return (not had_source_prefix) or getattr(rule, "source", "x") == source_filter
-
-        # 3) @handle → X account watch
-        if body.startswith("@"):
-            handle = body.lstrip("@").lower()
-            for rule in rules:
-                if (
-                    getattr(rule, "screen_name", "").lower() == handle
-                    and _source_matches(rule)
-                ):
-                    return rule.rule_id
-            return None
-
-        # 4) r/<sub> → Reddit subreddit account watch
-        if body.lower().startswith("r/"):
-            sub = body[2:].strip().lower()
-            for rule in rules:
-                if (
-                    getattr(rule, "screen_name", "").lower() == sub
-                    and (getattr(rule, "source", "x") == "reddit" if not had_source_prefix else _source_matches(rule))
-                ):
-                    return rule.rule_id
-            return None
-
-        # 5) keyword:xxx → keyword watch
-        if body.lower().startswith("keyword:"):
-            query = body.split(":", 1)[1].strip().lower()
-            for rule in rules:
-                if (
-                    getattr(rule, "query", "").lower() == query
-                    and _source_matches(rule)
-                ):
-                    return rule.rule_id
-            return None
-
-        # 6) Bare token → try as handle (without @ or r/)
-        bare = body.lstrip("@").lower()
-        for rule in rules:
-            if (
-                getattr(rule, "screen_name", "").lower() == bare
-                and _source_matches(rule)
-            ):
-                return rule.rule_id
-
-        return None
-
-    def _describe_sns_rule(self, rule_id: str) -> str:
-        if self._sns_db is None:
-            return rule_id[:8]
-        for rule in self._sns_db.list_watch_rules():
-            if rule.rule_id != rule_id:
-                continue
-            screen_name = getattr(rule, "screen_name", None)
-            if screen_name:
-                include_keywords = getattr(rule, "include_keywords", ())
-                filters = f" [{', '.join(include_keywords)}]" if include_keywords else ""
-                return f"@{screen_name}{filters}"
-            query = getattr(rule, "query", None)
-            if query:
-                return f"關鍵字「{query}」"
-            return rule.rule_id[:8]
-        return rule_id[:8]
-
-    def _handle_sns_clear_filter(self, handle: str) -> str:
-        """Clear include_keywords on an account watch while keeping the rule active."""
-        if self._sns_db is None:
-            return "SNS 監控尚未啟用（sns_db 未設定）。"
-        from dataclasses import replace
-        from sns_monitor.models import AccountWatch
-        from sns_monitor.storage import SnsDatabase
-
-        try:
-            screen_name = handle.lstrip("@").strip()
-            if not screen_name:
-                return "請提供 @ 帳號，例如：把 @elonmusk 的 filter 拿掉。"
-            rule_id = SnsDatabase._watch_rule_id("account", screen_name)
-            existing_rule = self._sns_db.get_watch_rule(rule_id)
-            if not isinstance(existing_rule, AccountWatch):
-                return f"找不到 @{screen_name} 的 X 帳號追蹤規則（請先用 /snsadd 新增）。"
-            if not existing_rule.include_keywords:
-                return f"✓ @{screen_name} 目前沒有 filter，無需清空。"
-            previous = existing_rule.include_keywords
-            cleared = replace(existing_rule, include_keywords=())
-            self._sns_db.save_watch_rule(cleared)
-            logger.info(
-                "SNS filter cleared screen_name=%s previous=%s", screen_name, previous,
-            )
-            return f"✓ 已清空 @{screen_name} 的 filter（追蹤仍啟用，原本：{', '.join(previous)}）。"
-        except Exception as exc:
-            logger.exception("SNS clear filter failed handle=%s", handle)
-            return f"清空 filter 失敗：{exc}"
-
-    def _handle_sns_buzz(self, raw: str) -> str:
-        """Handle /snsbuzz <keyword> command: summarize X buzz on a topic via LLM."""
-        if self._sns_buzz_fn is None:
-            return "SNS Buzz 功能尚未啟用（需要 X 客戶端與 LLM endpoint）。"
-        query = raw.strip()
-        if not query:
-            return "請提供關鍵字。例如：/snsbuzz amd"
-        try:
-            return self._sns_buzz_fn(query)
-        except Exception as exc:
-            logger.exception("SNS buzz failed query=%s", query)
-            return f"熱門整理失敗：{exc}"
-
-    def _handle_knowledge(self, raw: str, chat_id: str) -> str:
-        """Dispatch /knowledge subcommands to the registered handler.
-
-        The actual handler lives in aka_no_claw (it owns ``KnowledgeDatabase``).
-        This method only does presence checking and forwards the remainder —
-        the handler parses the action / entity / summary itself.
-        """
-        if self._knowledge_handler is None:
-            return (
-                "知識庫指令尚未啟用（需在 aka_no_claw 端註冊 knowledge_handler）。"
-            )
-        try:
-            return self._knowledge_handler(raw, chat_id)
-        except Exception as exc:
-            logger.exception("knowledge handler failed raw=%r", raw)
-            return f"知識庫指令失敗：{exc}"
+    # _handle_sns_add / render_snslist_view / _handle_sns_delete /
+    # _resolve_sns_rule_id / _describe_sns_rule / _handle_sns_clear_filter /
+    # _handle_sns_buzz — all moved to openclaw_adapter.sns_commands (Task 2).
 
     def _build_sns_bulk_add_filter_plan(
         self,
@@ -3629,11 +3034,11 @@ def run_telegram_polling(
     opportunity_alias_updater: OpportunityAliasUpdater | None = None,
     opportunity_target_pinner: OpportunityTargetPinner | None = None,
     opportunity_target_unpinner: OpportunityTargetUnpinner | None = None,
-    knowledge_handler: Callable[[str, str], str] | None = None,
-    knowledge_db_path: "str | None" = None,
     feedback_service: "object | None" = None,
     command_handlers: "dict[str, RegisteredCommand] | None" = None,
     callback_handlers: "dict[str, Callable[[str, str, str], tuple[object, str, object]]] | None" = None,
+    view_handlers: "dict[str, Callable[..., tuple[str, dict | None, int]]] | None" = None,
+    item_deleter_handlers: "dict[str, tuple[Callable[[str], bool], str]] | None" = None,
     poll_timeout: int = 20,
     notify_startup: bool = False,
     drop_pending_updates: bool = True,
@@ -3675,11 +3080,11 @@ def run_telegram_polling(
         opportunity_alias_updater=opportunity_alias_updater,
         opportunity_target_pinner=opportunity_target_pinner,
         opportunity_target_unpinner=opportunity_target_unpinner,
-        knowledge_handler=knowledge_handler,
-        knowledge_db_path=knowledge_db_path,
         feedback_service=feedback_service,
         command_handlers=command_handlers,
         callback_handlers=callback_handlers,
+        view_handlers=view_handlers,
+        item_deleter_handlers=item_deleter_handlers,
     )
     resolved_photo_renderer = photo_renderer or default_photo_renderer()
 
@@ -3917,28 +3322,33 @@ def _handle_sns_bulk_update_callback(
 
 
 def _list_view_renderer(processor: TelegramCommandProcessor, list_kind: str):
-    """Return the ``render_*_view`` method for the given list kind, or None."""
+    """Return the ``render_*_view`` callable for the given list kind, or None.
+
+    Checks the processor's view registry first (injected by aka_no_claw for
+    kinds like km/kc), then falls back to built-in method lookup.
+    """
+    registered = processor._view_registry.get(list_kind)
+    if registered is not None:
+        return registered
     return {
-        "sl": getattr(processor, "render_snslist_view", None),
         "wl": getattr(processor, "render_watchlist_view", None),
         "hl": getattr(processor, "render_huntlist_view", None),
-        "km": getattr(processor, "render_knowledge_market_view", None),
-        "kc": getattr(processor, "render_knowledge_coding_view", None),
     }.get(list_kind)
 
 
 def _list_item_deleter(processor: TelegramCommandProcessor, list_kind: str):
-    """Return ``(callable(item_id) -> bool, label)`` for the given list kind, or (None, None)."""
-    if list_kind == "sl":
-        return processor.delete_sns_rule_by_id, "SNS 規則"
+    """Return ``(callable(item_id) -> bool, label)`` for the given list kind, or (None, None).
+
+    Checks the processor's deleter registry first (injected by aka_no_claw),
+    then falls back to built-in method dispatch.
+    """
+    registered = processor._deleter_registry.get(list_kind)
+    if registered is not None:
+        return registered
     if list_kind == "wl":
         return processor.delete_marketplace_watch_by_id, "Marketplace 追蹤"
     if list_kind == "hl":
         return processor.delete_huntlist_item_by_id, "Opportunity 候選"
-    if list_kind == "km":
-        return processor.delete_knowledge_entry_by_id, "市場知識條目"
-    if list_kind == "kc":
-        return processor.delete_codegen_by_id, "Coding 知識條目"
     return None, None
 
 
@@ -4007,106 +3417,6 @@ def handle_telegram_callback_query(
         except Exception:
             logger.exception("registered callback failed prefix=%s", prefix)
             toast = "操作失敗，請看 log"
-    elif prefix == "snsdel" and payload:
-        # Notification one-tap delete. The storage layer (delete_watch_rule)
-        # automatically appends a polarity='negative' row to
-        # sns_auto_discovery_feedback + ratchets the per-domain actionable
-        # threshold up by DISCOVERY_TIGHTENING_STEP — see
-        # sns_monitor.storage.SnsDatabase.record_auto_discovery_feedback.
-        handle = payload.lstrip("@")
-        reply = processor._handle_sns_delete(f"@{handle}")
-        if reply.startswith("✓"):
-            toast = f"已刪除 @{handle}"
-            new_text = f"{original_text}\n\n✓ 已刪除 @{handle}"
-            rerender = True
-        elif reply.startswith("找不到"):
-            toast = f"已經不在追蹤 @{handle}"
-            new_text = f"{original_text}\n\n✓ 已刪除 @{handle}（先前已移除）"
-            rerender = True
-        else:
-            toast = reply[:200]
-    elif prefix == "snsaddok" and payload:
-        # Notification one-tap positive feedback. Looks up the rule's
-        # domains and writes polarity='positive' to the feedback table —
-        # bumps keep_count for each domain, leaves the threshold untouched
-        # (the learning loop tightens-only on negatives, never loosens).
-        handle = payload.lstrip("@")
-        sns_db = getattr(processor, "_sns_db", None)
-        if sns_db is None:
-            toast = "SNS monitor 未啟用，無法寫入回饋"
-        else:
-            try:
-                from sns_monitor.models import AccountWatch as _AccountWatch
-                rule = next(
-                    (
-                        r
-                        for r in sns_db.list_watch_rules()
-                        if isinstance(r, _AccountWatch)
-                        and (r.screen_name or "").lower() == handle.lower()
-                    ),
-                    None,
-                )
-                domains = tuple(getattr(rule, "domains", ()) or ()) if rule else ()
-                sns_db.record_auto_discovery_feedback(
-                    screen_name=handle,
-                    polarity="positive",
-                    domains=domains,
-                    chat_id=str(chat_id),
-                )
-                toast = f"👍 已記錄 @{handle}"
-                new_text = f"{original_text}\n\n👍 已記錄為投資訊號帳號"
-                rerender = True
-            except Exception:
-                logger.exception("snsaddok: positive feedback failed handle=@%s", handle)
-                toast = "回饋寫入失敗"
-    elif prefix == "snsfb" and payload:
-        # Inline-button feedback on a single SNS post (account or keyword watch).
-        # Payload format: "<kind>:<tweet_id>:<rule_id>" where kind ∈ {up,down,bought}.
-        parts = payload.split(":", 2)
-        if len(parts) != 3 or parts[0] not in {"up", "down", "bought"}:
-            toast = "未知回饋"
-        else:
-            kind, tweet_id, rule_id = parts
-            try:
-                from sns_monitor.feedback import record_sns_feedback
-                from sns_monitor.storage import SnsDatabase
-                sns_db_path = (
-                    processor._sns_db.path if processor._sns_db is not None
-                    else None
-                )
-                if sns_db_path is None:
-                    toast = "SNS monitor 未啟用，無法寫入回饋"
-                else:
-                    db = SnsDatabase(sns_db_path)
-                    result = record_sns_feedback(
-                        db=db, tweet_id=tweet_id, rule_id=rule_id,
-                        chat_id=str(chat_id), kind=kind,
-                    )
-            except Exception:
-                logger.exception(
-                    "snsfb feedback failed tweet_id=%s rule_id=%s kind=%s",
-                    tweet_id, rule_id, kind,
-                )
-                toast = "回饋寫入失敗，請看 log"
-            else:
-                if "result" not in locals() or result.get("status") != "ok":
-                    reason = (result.get("reason", "unknown")
-                              if "result" in locals() else "sns_db unavailable")
-                    toast = f"記錄失敗：{reason}"
-                else:
-                    side_effects = list(result.get("side_effects") or ())
-                    if kind == "up":
-                        toast = "✓ 已記錄 👍（已提高同類推文推播機率）"
-                    elif kind == "bought":
-                        toast = "✓ 已記錄 💰（已提高同類推文推播機率）"
-                    else:  # down
-                        if "rule_disabled" in side_effects:
-                            toast = "✓ 已標記不感興趣（累計過閾值，rule 自動停用）"
-                        else:
-                            toast = "✓ 已標記不感興趣（24h cooldown）"
-                    new_text = f"{original_text}\n\n{toast}"
-                    new_reply_markup = None
-                    rerender = True
     elif prefix == "oppfb" and payload:
         # Inline-button feedback on an Opportunity recommendation.
         # Payload format: "<kind>:<recommendation_id>" where kind ∈ {up,down,bought}.
