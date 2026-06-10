@@ -756,6 +756,7 @@ class TelegramCommandProcessor:
         callback_handlers: "dict[str, Callable[[str, str, str], tuple[object, str, object]]] | None" = None,
         view_handlers: "dict[str, Callable[..., tuple[str, dict | None, int]]] | None" = None,
         item_deleter_handlers: "dict[str, tuple[Callable[[str], bool], str]] | None" = None,
+        watch_inbox: "object | None" = None,
     ) -> None:
         self._lookup_renderer = lookup_renderer
         self._board_loader = board_loader
@@ -768,6 +769,7 @@ class TelegramCommandProcessor:
         self._allowed_chat_ids: frozenset[str] = allowed_chat_ids or frozenset()
         self._status_renderer = status_renderer
         self._watch_db = watch_db
+        self._watch_inbox = watch_inbox
         self._sns_db = sns_db
         self._sns_buzz_fn = sns_buzz_fn
         self._collab_backfiller = collab_backfiller
@@ -1312,7 +1314,16 @@ class TelegramCommandProcessor:
             updated_at="",
             market_options=market_options,
         )
-        if self._watch_db is not None:
+        if self._watch_inbox is not None:
+            self._watch_inbox.push("add_watch", {
+                "watch_id": watch_id,
+                "query": query,
+                "price_threshold_jpy": threshold,
+                "markets": list(markets),
+                "market_options": market_options,
+                "chat_id": chat_id,
+            }, chat_id=chat_id)
+        elif self._watch_db is not None:
             self._watch_db.add_marketplace_watch(watch)
         logger.info(
             "Watch added watch_id=%s query=%s threshold=%d markets=%s chat_id=%s",
@@ -1409,6 +1420,9 @@ class TelegramCommandProcessor:
         return self.delete_marketplace_watch_by_id(watch_id)
 
     def delete_marketplace_watch_by_id(self, watch_id: str) -> bool:
+        if self._watch_inbox is not None:
+            self._watch_inbox.push("delete_watch", {"watch_id": watch_id})
+            return True
         if self._watch_db is None:
             return False
         try:
@@ -1418,30 +1432,41 @@ class TelegramCommandProcessor:
             return False
 
     def _handle_unwatch(self, raw: str) -> str:
-        if self._watch_db is None:
+        if self._watch_db is None and self._watch_inbox is None:
             return "追蹤功能尚未啟用（watch_db 未設定）。"
         watch_id = raw.strip()
         if not watch_id:
             return "請提供追蹤 ID。格式：/unwatch <ID>\n可用 /watchlist 查看所有 ID。"
-        deleted = self._watch_db.delete_marketplace_watch(watch_id)
+        if self._watch_inbox is not None:
+            # Read-only check before queuing
+            if self._watch_db is not None and self._watch_db.get_marketplace_watch(watch_id) is None:
+                return f"找不到追蹤 ID [{watch_id}]，請用 /watchlist 確認。"
+            self._watch_inbox.push("delete_watch", {"watch_id": watch_id})
+            logger.info("Watch delete queued watch_id=%s", watch_id)
+            return f"已移除追蹤 [{watch_id}]"
+        deleted = self._watch_db.delete_marketplace_watch(watch_id)  # type: ignore[union-attr]
         if deleted:
             logger.info("Watch deleted watch_id=%s", watch_id)
             return f"已移除追蹤 [{watch_id}]"
         return f"找不到追蹤 ID [{watch_id}]，請用 /watchlist 確認。"
 
     def _handle_set_price(self, raw: str) -> str:
-        if self._watch_db is None:
+        if self._watch_db is None and self._watch_inbox is None:
             return "追蹤功能尚未啟用（watch_db 未設定）。"
         try:
             watch_id, new_price = parse_set_price_command(raw)
         except ValueError as exc:
             return f"{exc}\n格式範例：/setprice abc12345 50000"
-        watch = self._watch_db.get_marketplace_watch(watch_id)
+        watch = self._watch_db.get_marketplace_watch(watch_id) if self._watch_db is not None else None
         if watch is None:
             return f"找不到追蹤 ID [{watch_id}]，請用 /watchlist 確認。"
         old_price = watch.price_threshold_jpy
-        self._watch_db.update_marketplace_watch(watch_id, price_threshold_jpy=new_price)
-        logger.info("Watch price updated watch_id=%s old=%d new=%d", watch_id, old_price, new_price)
+        if self._watch_inbox is not None:
+            self._watch_inbox.push("update_watch", {"watch_id": watch_id, "price_threshold_jpy": new_price})
+            logger.info("Watch price update queued watch_id=%s old=%d new=%d", watch_id, old_price, new_price)
+        else:
+            self._watch_db.update_marketplace_watch(watch_id, price_threshold_jpy=new_price)  # type: ignore[union-attr]
+            logger.info("Watch price updated watch_id=%s old=%d new=%d", watch_id, old_price, new_price)
         return (
             f"已更新追蹤目標價\n"
             f"ID: {watch_id}\n"
@@ -2123,10 +2148,19 @@ class TelegramCommandProcessor:
                 "/quiz review            # 查看近期作答",
                 "/quizlikesong <youtube_url>   # 收藏新歌並建立題庫",
                 "",
+                "--- 語音 ---",
+                "/voice <日文>            # 語音合成（AivisSpeech），預覽參數",
+                "/say <日文>              # 直接合成並傳送 WAV",
+                "",
+                "--- 知識庫 ---",
+                "/knowledge market       # 查詢市場知識（集換式卡牌）",
+                "/knowledge coding       # 查詢程式技術知識",
+                "",
                 "--- Opportunity Agent ---",
                 "/hunt                   # 目標清單",
                 "/hunt status            # 狀態 + 推薦紀錄",
                 "/hunt remove 2          # 移除目標 #2",
+                "/stats                  # 作答統計",
                 "",
                 "--- 動態自寫工具 ---",
                 "/new 幫我查0050今年以來到5月的年化報酬",
@@ -2720,6 +2754,7 @@ def run_telegram_polling(
     callback_handlers: "dict[str, Callable[[str, str, str], tuple[object, str, object]]] | None" = None,
     view_handlers: "dict[str, Callable[..., tuple[str, dict | None, int]]] | None" = None,
     item_deleter_handlers: "dict[str, tuple[Callable[[str], bool], str]] | None" = None,
+    watch_inbox: "object | None" = None,
     poll_timeout: int = 20,
     notify_startup: bool = False,
     drop_pending_updates: bool = True,
@@ -2760,6 +2795,7 @@ def run_telegram_polling(
         callback_handlers=callback_handlers,
         view_handlers=view_handlers,
         item_deleter_handlers=item_deleter_handlers,
+        watch_inbox=watch_inbox,
     )
     resolved_photo_renderer = photo_renderer or default_photo_renderer()
 
@@ -2888,15 +2924,14 @@ def _handle_condition_callback(
         mercari_opts = dict(merged_options.get("mercari") or {})
         mercari_opts["condition_ids"] = list(new_ids)
         merged_options["mercari"] = mercari_opts
-        watch_db.update_marketplace_watch(watch_id, market_options=merged_options)
-        # Re-fetch (defensive) and re-render picker with the new state.
-        watch = watch_db.get_marketplace_watch(watch_id)
-        next_condition_ids = (
-            _condition_ids_from_options(watch.options_for("mercari"))
-            if watch is not None else new_ids
-        )
+        watch_inbox = getattr(processor, "_watch_inbox", None)
+        if watch_inbox is not None:
+            watch_inbox.push("update_watch", {"watch_id": watch_id, "market_options": merged_options})
+        else:
+            watch_db.update_marketplace_watch(watch_id, market_options=merged_options)
+        # Re-render picker optimistically (new_ids may lag by one inbox poll cycle).
         text, kb = _build_condition_picker_view(
-            watch_id=watch_id, query=(watch.query if watch else ""), condition_ids=next_condition_ids,
+            watch_id=watch_id, query=watch.query, condition_ids=new_ids,
         )
         return None, text, kb
 
@@ -3214,6 +3249,7 @@ def handle_telegram_callback_query(
         # Toggle a marketplace on/off for a watch
         watch_id, market = payload.split(":", 1)
         watch_db = getattr(processor, "_watch_db", None)
+        watch_inbox = getattr(processor, "_watch_inbox", None)
         if watch_db and watch_id:
             watch = watch_db.get_marketplace_watch(watch_id)
             if watch:
@@ -3225,12 +3261,18 @@ def handle_telegram_callback_query(
                     else:
                         current.remove(market)
                         new_mkt = tuple(m for m in DEFAULT_MARKETS if m in current)
-                        watch_db.update_marketplace_watch(watch_id, markets=new_mkt)
+                        if watch_inbox is not None:
+                            watch_inbox.push("update_watch", {"watch_id": watch_id, "markets": list(new_mkt)})
+                        else:
+                            watch_db.update_marketplace_watch(watch_id, markets=new_mkt)
                         toast = f"已移除 {emoji}{name}"
                 else:
                     current.add(market)
                     new_mkt = tuple(m for m in DEFAULT_MARKETS if m in current)
-                    watch_db.update_marketplace_watch(watch_id, markets=new_mkt)
+                    if watch_inbox is not None:
+                        watch_inbox.push("update_watch", {"watch_id": watch_id, "markets": list(new_mkt)})
+                    else:
+                        watch_db.update_marketplace_watch(watch_id, markets=new_mkt)
                     toast = f"已加入 {emoji}{name}"
                 result = _render_watch_edit_view(processor, watch_id)
                 if result:
