@@ -161,6 +161,66 @@ def search_mercari(
     return verified[:max_results]
 
 
+def search_mercari_sold(
+    query: str,
+    *,
+    max_results: int = 20,
+    timeout_ms: int = 45_000,
+) -> list[dict[str, object]]:
+    """Search Mercari sold listings and return matched items with URLs/prices.
+
+    Uses the same rendered-results parsing as ``search_mercari`` and keeps
+    detail-page verification enabled so the returned sold prices stay aligned
+    with the authoritative item-page meta tag.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise RuntimeError(
+            "playwright is not installed; run: pip install playwright && playwright install chromium"
+        ) from exc
+
+    price_max = 9_999_999
+    url = build_search_url(query, price_max=price_max, sold=True)
+    logger.info("Mercari sold search query=%s url=%s", query, url)
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(**_chromium_launch_options())
+        context = browser.new_context(
+            locale="ja-JP",
+            user_agent=_USER_AGENT,
+            viewport={"width": 1280, "height": 900},
+        )
+        page = context.new_page()
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            try:
+                page.wait_for_selector(
+                    'li[data-testid="item-cell"], mer-item-thumbnail, li[data-item-id]',
+                    timeout=15000,
+                )
+            except Exception:
+                logger.debug("Mercari sold: item selector timed out, trying JS scroll")
+                page.evaluate("window.scrollTo(0, 300)")
+                page.wait_for_timeout(2000)
+            html = page.content()
+        finally:
+            context.close()
+            browser.close()
+
+    raw_items = parse_search_html(html, max_results=max_results * 3)
+    matched = _filter_by_query(raw_items, query)
+    verified = _verify_candidates_via_detail_pages(matched, price_max=price_max)
+    logger.info(
+        "Mercari sold search raw=%d matched=%d verified=%d query=%s",
+        len(raw_items),
+        len(matched),
+        len(verified),
+        query,
+    )
+    return verified[:max_results]
+
+
 def fetch_avg_sold_price(
     query: str,
     *,

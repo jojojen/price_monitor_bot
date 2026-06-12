@@ -12,6 +12,7 @@ from market_monitor.mercari_search import (
     parse_detail_price,
     parse_search_html,
     search_mercari,
+    search_mercari_sold,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -187,3 +188,44 @@ def test_search_mercari_replaces_search_price_with_detail_price(monkeypatch) -> 
     results = search_mercari("デッキ", price_max=4500)
     matched = [r for r in results if r["item_id"] == "m13000897914"]
     assert matched and matched[0]["price_jpy"] == 1234
+
+
+def test_search_mercari_sold_returns_verified_items(monkeypatch) -> None:
+    fake_html = _load("mercari_search_eva_rei.html")
+
+    class _FakePage:
+        def goto(self, *_a, **_k): ...
+        def wait_for_selector(self, *_a, **_k): ...
+        def evaluate(self, *_a, **_k): ...
+        def wait_for_timeout(self, *_a, **_k): ...
+        def content(self) -> str:
+            return fake_html
+
+    class _FakeContext:
+        def new_page(self): return _FakePage()
+        def close(self): ...
+
+    class _FakeBrowser:
+        def new_context(self, **_k): return _FakeContext()
+        def close(self): ...
+
+    class _FakeChromium:
+        def launch(self, **_k): return _FakeBrowser()
+
+    class _FakePW:
+        chromium = _FakeChromium()
+        def __enter__(self): return self
+        def __exit__(self, *_): return False
+
+    monkeypatch.setattr("playwright.sync_api.sync_playwright", lambda: _FakePW())
+    monkeypatch.setattr(
+        mercari_search,
+        "fetch_item_detail_price",
+        lambda item_id, **_k: {"m67507032609": 2200, "m13000897914": 999, "m81947702369": 2888}.get(item_id),
+    )
+
+    results = search_mercari_sold("デッキ", max_results=2)
+
+    assert [item["item_id"] for item in results] == ["m67507032609", "m13000897914"]
+    assert results[0]["price_jpy"] == 2200
+    assert results[1]["url"].startswith("https://jp.mercari.com/item/")
