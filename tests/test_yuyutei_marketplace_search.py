@@ -7,6 +7,8 @@ import pytest
 
 from market_monitor.yuyutei_search import (
     YuyuteiMarketplaceSearchClient,
+    YuyuteiReferenceBand,
+    _parse_buy_listings,
     _parse_sell_listings,
     resolve_sell_code,
 )
@@ -191,3 +193,93 @@ def test_search_deduplicates_across_game_codes() -> None:
     item_ids = [r.item_id for r in results]
     assert len(item_ids) == len(set(item_ids))
     assert len(results) == 1
+
+
+# ── stock parsing (real yuyutei markup: 在庫 : ×  /  在庫 : N 点) ──────────────
+
+def _make_card_with_stock(*, title: str, price: str, href: str, zaiko_text: str) -> str:
+    return f"""
+    <div class="card-product">
+      <label class="cart_sell_zaiko">在庫 : {zaiko_text}</label>
+      <a href="{href}"><h4>{title}</h4></a>
+      <strong>{price}</strong>
+    </div>
+    """
+
+
+def test_parse_sell_skips_x_out_of_stock_and_reads_count() -> None:
+    page = _make_page(
+        _make_card_with_stock(title="OOS", price="¥14,800", href="/card/poc/sv08/1", zaiko_text="×")
+        + _make_card_with_stock(title="InStock", price="¥9,800", href="/card/poc/sv08/2", zaiko_text="3 点")
+    )
+    hits = _parse_sell_listings(page, game_code="poc")
+    titles = [h["title"] for h in hits]
+    assert "OOS" not in titles            # 在庫 : × must be dropped
+    assert "InStock" in titles
+    in_stock = next(h for h in hits if h["title"] == "InStock")
+    assert in_stock["stock_count"] == 3
+
+
+def test_parse_buy_keeps_all_cards_no_stock_gate() -> None:
+    page = _make_page(
+        _make_card(title="Buy A", price="¥10,000", href="/card/poc/sv08/1")
+        + _make_card(title="Buy B", price="¥14,000", href="/card/poc/sv08/2")
+    )
+    hits = _parse_buy_listings(page)
+    assert {h["title"] for h in hits} == {"Buy A", "Buy B"}
+
+
+def test_reference_band_combines_buy_and_in_stock_sell() -> None:
+    sell_page = _make_page(
+        _make_card_with_stock(title="Sell A", price="¥9,800", href="/card/poc/sv08/2", zaiko_text="3 点")
+        + _make_card_with_stock(title="Sell OOS", price="¥59,800", href="/card/poc/sv08/9", zaiko_text="×")
+    )
+    buy_page = _make_page(
+        _make_card(title="Buy A", price="¥6,000", href="/card/poc/sv08/2")
+        + _make_card(title="Buy B", price="¥8,000", href="/card/poc/sv08/3")
+    )
+    mock_http = MagicMock()
+    mock_http.get_text.side_effect = [sell_page, buy_page]
+
+    client = YuyuteiMarketplaceSearchClient(http_client=mock_http)
+    band = client.reference_band("test card", price_max=99999, source_options={"game_code": "poc"})
+
+    assert isinstance(band, YuyuteiReferenceBand)
+    assert band.sell_prices == (9800,)            # OOS sell excluded
+    assert set(band.buy_prices) == {6000, 8000}
+    assert band.sell_stock_total == 3
+    assert band.buy_reference == 7000             # median(6000, 8000)
+    assert band.sell_reference == 9800
+    # two requests: one /sell/, one /buy/, both fail-fast
+    assert mock_http.get_text.call_count == 2
+    for _, kwargs in mock_http.get_text.call_args_list:
+        assert kwargs.get("retries") == 1
+        assert kwargs.get("curl_fallback") is False
+
+
+def test_reference_band_exposes_min_max_ranges() -> None:
+    sell_page = _make_page(
+        _make_card_with_stock(title="Sell Lo", price="¥75,000", href="/card/poc/sv08/1", zaiko_text="3 点")
+        + _make_card_with_stock(title="Sell Hi", price="¥85,000", href="/card/poc/sv08/2", zaiko_text="1 点")
+    )
+    buy_page = _make_page(
+        _make_card(title="Buy Lo", price="¥50,000", href="/card/poc/sv08/1")
+        + _make_card(title="Buy Hi", price="¥64,000", href="/card/poc/sv08/3")
+    )
+    mock_http = MagicMock()
+    mock_http.get_text.side_effect = [sell_page, buy_page]
+
+    client = YuyuteiMarketplaceSearchClient(http_client=mock_http)
+    band = client.reference_band("test card", price_max=99999, source_options={"game_code": "poc"})
+
+    assert band is not None
+    assert band.buy_min == 50000 and band.buy_max == 64000
+    assert band.sell_min == 75000 and band.sell_max == 85000
+
+
+def test_reference_band_skips_non_tcg_query_without_network() -> None:
+    mock_http = MagicMock()
+    client = YuyuteiMarketplaceSearchClient(http_client=mock_http)
+    band = client.reference_band("初音ミク フィギュア", price_max=99999)
+    assert band is None
+    mock_http.get_text.assert_not_called()

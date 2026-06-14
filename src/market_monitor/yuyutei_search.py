@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import logging
 import re
+import statistics
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urljoin, urlparse, urlencode
 
@@ -72,6 +74,7 @@ def resolve_sell_code(value: str | None) -> str | None:
 
 
 _PRICE_DIGITS_RE = re.compile(r"(\d[\d,]*)")
+_STOCK_COUNT_RE = re.compile(r"(\d+)\s*点")
 
 
 def _parse_jpy(text: str) -> int | None:
@@ -86,17 +89,38 @@ def _parse_jpy(text: str) -> int | None:
         return None
 
 
-def _parse_sell_listings(html: str, *, game_code: str, base_url: str = YUYUTEI_BASE_URL) -> list[dict]:
-    """Parse yuyutei sell-search HTML and return raw dicts (title, price_jpy, url, item_id).
+def _parse_stock(card) -> tuple[bool, int | None]:
+    """Return ``(in_stock, stock_count)`` for a ``div.card-product`` element.
 
-    Skips cards where ``label.cart_sell_zaiko`` contains 「在庫なし」."""
+    Yuyutei marks per-card stock in ``label.cart_sell_zaiko`` as either
+    「在庫 : ×」(out of stock) or 「在庫 : N 点」(N units in stock). Some pages
+    (and the synthetic test fixtures) omit the label entirely for in-stock
+    cards. So: label absent → in stock (count unknown); 「×」/「在庫なし」/empty →
+    out of stock; 「N 点」→ in stock with count N. ``stock_count`` is ``None``
+    when the count can't be read."""
+    label = card.select_one("label.cart_sell_zaiko")
+    if label is None:
+        return True, None
+    text = label.get_text(" ", strip=True).replace("在庫 :", "").strip()
+    if not text or "×" in text or "在庫なし" in text:
+        return False, None
+    match = _STOCK_COUNT_RE.search(text)
+    return True, (int(match.group(1)) if match else None)
+
+
+def _parse_card_listings(
+    html: str, *, require_in_stock: bool, base_url: str = YUYUTEI_BASE_URL
+) -> list[dict]:
+    """Parse a yuyutei sell/buy search page into raw dicts
+    (item_id, title, price_jpy, url, stock_count). When ``require_in_stock`` is
+    set, out-of-stock cards are dropped — used for the *sell* side, where a
+    price with no stock is not a purchasable reference."""
     soup = BeautifulSoup(html, "html.parser")
     results: list[dict] = []
 
     for card in soup.select("div.card-product"):
-        # Skip out-of-stock cards
-        zaiko = card.select_one("label.cart_sell_zaiko")
-        if zaiko is not None and "在庫なし" in zaiko.get_text():
+        in_stock, stock_count = _parse_stock(card)
+        if require_in_stock and not in_stock:
             continue
 
         anchors = [a for a in card.select("a[href]") if "/card/" in a.get("href", "")]
@@ -122,9 +146,67 @@ def _parse_sell_listings(html: str, *, game_code: str, base_url: str = YUYUTEI_B
             "title": title,
             "price_jpy": price_jpy,
             "url": href,
+            "stock_count": stock_count,
         })
 
     return results
+
+
+def _parse_sell_listings(html: str, *, game_code: str, base_url: str = YUYUTEI_BASE_URL) -> list[dict]:
+    """Parse yuyutei *sell* (販売) search HTML → in-stock listings only.
+
+    Out-of-stock cards (在庫「×」/「在庫なし」) are skipped: a sell price with no
+    stock isn't a purchasable upper-bound reference. ``game_code`` is accepted
+    for call-site clarity but not needed by the parse itself."""
+    return _parse_card_listings(html, require_in_stock=True, base_url=base_url)
+
+
+def _parse_buy_listings(html: str, *, base_url: str = YUYUTEI_BASE_URL) -> list[dict]:
+    """Parse yuyutei *buy* (買取) search HTML. Buy is a standing offer (the shop
+    pays this to acquire the card), so there is no per-card stock to gate on."""
+    return _parse_card_listings(html, require_in_stock=False, base_url=base_url)
+
+
+@dataclass(frozen=True)
+class YuyuteiReferenceBand:
+    """Shop-price reference band for a query: 買取 (what the shop pays — the
+    lower / liquidation side) and in-stock 販売 (what the shop charges — the
+    upper / acquisition side). Kept separate from C2C active listings so shop
+    prices don't get folded into a Mercari/Rakuma median."""
+
+    game_code: str
+    buy_prices: tuple[int, ...]
+    sell_prices: tuple[int, ...]
+    sell_stock_total: int
+    sample_urls: tuple[str, ...]
+
+    @property
+    def has_data(self) -> bool:
+        return bool(self.buy_prices or self.sell_prices)
+
+    @property
+    def buy_reference(self) -> int | None:
+        return int(statistics.median(self.buy_prices)) if self.buy_prices else None
+
+    @property
+    def sell_reference(self) -> int | None:
+        return int(statistics.median(self.sell_prices)) if self.sell_prices else None
+
+    @property
+    def buy_min(self) -> int | None:
+        return min(self.buy_prices) if self.buy_prices else None
+
+    @property
+    def buy_max(self) -> int | None:
+        return max(self.buy_prices) if self.buy_prices else None
+
+    @property
+    def sell_min(self) -> int | None:
+        return min(self.sell_prices) if self.sell_prices else None
+
+    @property
+    def sell_max(self) -> int | None:
+        return max(self.sell_prices) if self.sell_prices else None
 
 
 class YuyuteiMarketplaceSearchClient:
@@ -213,8 +295,78 @@ class YuyuteiMarketplaceSearchClient:
                 price_jpy=h["price_jpy"],
                 url=h["url"],
                 thumbnail_url=None,
-                stock_count=None,
+                stock_count=h.get("stock_count"),
                 listing_kind="fixed_price",
             )
             for h in raw_hits[:max_results]
         ]
+
+    def _resolve_single_code(
+        self, query: str, source_options: Mapping[str, Any] | None
+    ) -> str | None:
+        """Resolve a query to one yuyutei sell code for the reference band — no
+        multi-category fan-out (which would re-introduce the rate-limit risk)."""
+        opts = dict(source_options or {})
+        if "game_code" in opts:
+            return resolve_sell_code(str(opts["game_code"])) or str(opts["game_code"]).strip().lower()
+        return resolve_sell_code(query)
+
+    def _fetch_band_side(self, url: str, *, require_in_stock: bool, timeout_ms: int) -> list[dict]:
+        try:
+            # Fail fast (no retry/curl) and rely on the shared per-host circuit
+            # breaker — same rate-limit discipline as the sell search.
+            html = self._http.get_text(
+                url, timeout_seconds=timeout_ms / 1000.0, retries=1, curl_fallback=False,
+            )
+        except Exception:
+            logger.warning("Yuyutei reference band: HTTP failed url=%s", url)
+            return []
+        return _parse_card_listings(html, require_in_stock=require_in_stock)
+
+    def reference_band(
+        self,
+        query: str,
+        *,
+        price_max: int,
+        timeout_ms: int = 30_000,
+        source_options: Mapping[str, Any] | None = None,
+    ) -> YuyuteiReferenceBand | None:
+        """Fetch the 買取 (buy) + in-stock 販売 (sell) reference band for a query.
+
+        Costs TWO requests (one /buy/, one /sell/) for a *single* resolved game
+        code — never a multi-category fan-out. Returns ``None`` when no TCG game
+        can be identified (so non-TCG queries skip Yuyutei entirely) or when
+        neither side yields data. Both fetches are fail-fast and protected by
+        the shared per-host circuit breaker, so a 429 on the first short-circuits
+        the second instead of amplifying the cooldown."""
+        if not query.strip() or price_max <= 0:
+            return None
+        code = self._resolve_single_code(query, source_options)
+        if not code:
+            logger.info("Yuyutei reference band: skipping query=%s (no identifiable TCG game)", query)
+            return None
+
+        params = urlencode({"search_word": query, "rare": "", "type": ""})
+        sell_hits = self._fetch_band_side(
+            f"{YUYUTEI_BASE_URL}/sell/{code}/s/search?{params}", require_in_stock=True, timeout_ms=timeout_ms,
+        )
+        buy_hits = self._fetch_band_side(
+            f"{YUYUTEI_BASE_URL}/buy/{code}/s/search?{params}", require_in_stock=False, timeout_ms=timeout_ms,
+        )
+
+        sell = [h for h in sell_hits if 0 < h["price_jpy"] <= price_max]
+        buy = [h for h in buy_hits if 0 < h["price_jpy"] <= price_max]
+        if not sell and not buy:
+            return None
+
+        sample_urls = tuple(
+            h["url"] for h in (*buy[:1], *sell[:1]) if h.get("url")
+        )
+        stock_total = sum(h["stock_count"] for h in sell if h.get("stock_count"))
+        return YuyuteiReferenceBand(
+            game_code=code,
+            buy_prices=tuple(h["price_jpy"] for h in buy),
+            sell_prices=tuple(h["price_jpy"] for h in sell),
+            sell_stock_total=stock_total,
+            sample_urls=sample_urls,
+        )
