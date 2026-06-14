@@ -8,6 +8,7 @@ import pytest
 from market_monitor.yuyutei_search import (
     YuyuteiMarketplaceSearchClient,
     _parse_sell_listings,
+    resolve_sell_code,
 )
 
 
@@ -130,6 +131,52 @@ def test_search_respects_game_code_override() -> None:
     assert mock_http.get_text.call_count == 1
     called_url = mock_http.get_text.call_args[0][0]
     assert "/sell/ygo/" in called_url
+
+
+@pytest.mark.parametrize(
+    "query,expected",
+    [
+        ("ポケモン ピカチュウex SAR", "poc"),
+        ("遊戯王 青眼の白龍", "ygo"),
+        ("ヴァイス 初音ミク", "ws"),
+        ("ユニオンアリーナ チェンソーマン", "ua"),
+        ("ワンピース ルフィ", "op"),
+        ("poc", "poc"),
+        ("ygo", "ygo"),
+        ("ピカチュウex SAR PSA10", None),
+        ("初音ミク フィギュア", None),
+        ("", None),
+    ],
+)
+def test_resolve_sell_code(query: str, expected: str | None) -> None:
+    assert resolve_sell_code(query) == expected
+
+
+def test_auto_mode_routes_to_single_code_when_game_word_present() -> None:
+    mock_http = MagicMock()
+    mock_http.get_text.return_value = FIXTURE_PAGE
+    client = YuyuteiMarketplaceSearchClient(http_client=mock_http)  # game_codes=None → auto
+    client.search("遊戯王 ブルーアイズ", price_max=99999)
+    assert mock_http.get_text.call_count == 1
+    assert "/sell/ygo/" in mock_http.get_text.call_args[0][0]
+
+
+def test_auto_mode_skips_when_no_game_identifiable() -> None:
+    mock_http = MagicMock()
+    client = YuyuteiMarketplaceSearchClient(http_client=mock_http)  # auto
+    results = client.search("ピカチュウex SAR PSA10", price_max=99999)
+    assert results == []
+    assert mock_http.get_text.call_count == 0
+
+
+def test_search_uses_fail_fast_http_options() -> None:
+    mock_http = MagicMock()
+    mock_http.get_text.return_value = FIXTURE_PAGE
+    client = YuyuteiMarketplaceSearchClient(http_client=mock_http, game_codes=("ua",))
+    client.search("test", price_max=99999)
+    _, kwargs = mock_http.get_text.call_args
+    assert kwargs.get("retries") == 1
+    assert kwargs.get("curl_fallback") is False
 
 
 def test_search_deduplicates_across_game_codes() -> None:

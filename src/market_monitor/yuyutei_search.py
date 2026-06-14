@@ -28,8 +28,48 @@ logger = logging.getLogger(__name__)
 YUYUTEI_BASE_URL = "https://yuyu-tei.jp"
 
 # Game codes supported in the sell path: /sell/{code}/s/search
+# poc = Pokémon  ygo = 遊戯王  ws = Weiss Schwarz  ua = Union Arena  op = One Piece
 DEFAULT_GAME_CODES: tuple[str, ...] = ("ygo", "ws", "ua", "op")
-# ygo = 遊戯王  ws = Weiss Schwarz  ua = Union Arena  op = One Piece Card Game
+KNOWN_SELL_CODES: frozenset[str] = frozenset({"poc", "ygo", "ws", "ua", "op"})
+
+# Adapter-level routing table: which yuyutei sell path a query belongs to, keyed
+# by the game *name* the user typed. This is the client's own URL-routing config
+# (like a base URL), NOT open-world content recognition — deciding that a bare
+# character name like「ピカチュウ」is Pokémon is left to upstream LLM callers, who
+# pass the resolved game via source_options["game_code"]. When neither a game
+# word nor an explicit code is present we skip Yuyutei rather than blindly
+# fanning out across every category and burning the host's rate limit.
+_GAME_WORD_TO_SELL_CODE: dict[str, str] = {
+    "pokemon": "poc", "ptcg": "poc", "ポケモン": "poc", "寶可夢": "poc",
+    "宝可梦": "poc", "寶可卡": "poc", "宝可卡": "poc",
+    "ws": "ws", "weiss": "ws", "ヴァイス": "ws",
+    "yugioh": "ygo", "ygo": "ygo", "遊戯王": "ygo", "遊戲王": "ygo", "游戏王": "ygo",
+    "ua": "ua", "unionarena": "ua", "ユニオンアリーナ": "ua",
+    "op": "op", "onepiece": "op", "optcg": "op", "opcg": "op",
+    "ワンピース": "op", "航海王": "op", "海賊王": "op",
+}
+_TOKEN_SPLIT_RE = re.compile(r"[\s/・,，、_\-]+")
+_CJK_GAME_WORDS = tuple(w for w in _GAME_WORD_TO_SELL_CODE if any(ord(c) > 0x3000 for c in w))
+
+
+def resolve_sell_code(value: str | None) -> str | None:
+    """Map a free-text query (or an explicit game token) to a single yuyutei
+    sell code, or ``None`` when no game can be identified. Reused for both the
+    auto-routing default and the ``source_options['game_code']`` override."""
+    if not value:
+        return None
+    raw = value.strip().lower()
+    if raw in KNOWN_SELL_CODES:
+        return raw
+    for token in _TOKEN_SPLIT_RE.split(raw):
+        code = _GAME_WORD_TO_SELL_CODE.get(token)
+        if code:
+            return code
+    for word in _CJK_GAME_WORDS:
+        if word in value:
+            return _GAME_WORD_TO_SELL_CODE[word]
+    return None
+
 
 _PRICE_DIGITS_RE = re.compile(r"(\d[\d,]*)")
 
@@ -94,14 +134,21 @@ class YuyuteiMarketplaceSearchClient:
     deduplicates, filters, sorts, and caps the combined result.
 
     ``source_options`` key recognised: ``"game_code"`` (str) — when set, only
-    that single game code is queried."""
+    that single game code is queried.
+
+    Routing: if ``game_codes`` is left at its default (``None``), each query is
+    routed to a *single* sell code inferred from the query text, and Yuyutei is
+    skipped entirely when no game can be identified — this avoids the previous
+    behaviour of firing one request per category (4–5×) per search, which
+    repeatedly tripped yuyu-tei.jp's IP rate limit. Callers that genuinely want
+    multi-category fan-out can still pass an explicit ``game_codes`` tuple."""
 
     source_name: str = "yuyutei"
 
     def __init__(
         self,
         http_client: HttpClient | None = None,
-        game_codes: tuple[str, ...] = DEFAULT_GAME_CODES,
+        game_codes: tuple[str, ...] | None = None,
     ) -> None:
         self._http = http_client or HttpClient()
         self._game_codes = game_codes
@@ -120,9 +167,19 @@ class YuyuteiMarketplaceSearchClient:
 
         opts = dict(source_options or {})
         if "game_code" in opts:
-            codes: tuple[str, ...] = (str(opts["game_code"]),)
-        else:
+            code = resolve_sell_code(str(opts["game_code"])) or str(opts["game_code"]).strip().lower()
+            codes: tuple[str, ...] = (code,)
+        elif self._game_codes is not None:
             codes = self._game_codes
+        else:
+            resolved = resolve_sell_code(query)
+            if resolved is None:
+                logger.info(
+                    "Yuyutei: skipping query=%s (no identifiable TCG game; not fanning out to avoid rate limit)",
+                    query,
+                )
+                return []
+            codes = (resolved,)
 
         params = urlencode({"search_word": query, "rare": "", "type": ""})
         seen_ids: set[str] = set()
@@ -131,7 +188,11 @@ class YuyuteiMarketplaceSearchClient:
         for code in codes:
             url = f"{YUYUTEI_BASE_URL}/sell/{code}/s/search?{params}"
             try:
-                html = self._http.get_text(url, timeout_seconds=timeout_ms / 1000.0)
+                # Fail fast: no 30s retry, no curl re-fetch — a 429 must not be
+                # amplified into extra requests that prolong the IP cooldown.
+                html = self._http.get_text(
+                    url, timeout_seconds=timeout_ms / 1000.0, retries=1, curl_fallback=False,
+                )
             except Exception:
                 logger.warning("YuyuteiMarketplaceSearchClient: HTTP failed code=%s url=%s", code, url)
                 continue

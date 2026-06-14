@@ -27,6 +27,7 @@ from urllib.parse import quote
 
 from bs4 import BeautifulSoup
 
+from .http import host_cooldown_remaining, note_http_error, note_http_success
 from .marketplace_search import MarketplaceListing
 
 logger = logging.getLogger(__name__)
@@ -65,12 +66,19 @@ def build_search_url(
 
 
 def _fetch_html(url: str, *, timeout_seconds: float) -> str | None:
+    remaining = host_cooldown_remaining(url)
+    if remaining > 0:
+        logger.warning("Rakuma fetch short-circuited (host rate-limited %.0fs) url=%s", remaining, url)
+        return None
     request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
     try:
         with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
             charset = response.headers.get_content_charset() or "utf-8"
-            return response.read().decode(charset, errors="replace")
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError):
+            text = response.read().decode(charset, errors="replace")
+        note_http_success(url)
+        return text
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as exc:
+        note_http_error(url, exc)
         logger.exception("Rakuma search fetch failed url=%s", url)
         return None
 

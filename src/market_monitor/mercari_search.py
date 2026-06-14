@@ -23,6 +23,8 @@ from urllib.parse import quote
 
 from bs4 import BeautifulSoup
 
+from .http import host_cooldown_remaining, note_http_error, note_http_success
+
 logger = logging.getLogger(__name__)
 
 MERCARI_SEARCH_BASE = "https://jp.mercari.com/search"
@@ -387,6 +389,10 @@ def fetch_item_detail_price(item_id: str, *, timeout: float = 15.0) -> int | Non
     Returns the price in JPY or None on any failure.
     """
     url = f"{MERCARI_ITEM_BASE}/{item_id}"
+    remaining = host_cooldown_remaining(url)
+    if remaining > 0:
+        logger.warning("Mercari detail fetch short-circuited (host rate-limited %.0fs) item=%s", remaining, item_id)
+        return None
     req = urllib.request.Request(
         url,
         headers={
@@ -400,7 +406,9 @@ def fetch_item_detail_price(item_id: str, *, timeout: float = 15.0) -> int | Non
                 logger.warning("Mercari detail fetch HTTP %s for %s", resp.status, item_id)
                 return None
             html = resp.read().decode("utf-8", errors="replace")
+        note_http_success(url)
     except (urllib.error.URLError, TimeoutError) as exc:
+        note_http_error(url, exc)
         logger.warning("Mercari detail fetch error for %s: %s", item_id, exc)
         return None
     return parse_detail_price(html)
@@ -419,6 +427,12 @@ def _verify_candidates_via_detail_pages(
 ) -> list[dict[str, object]]:
     verified: list[dict[str, object]] = []
     for item in candidates:
+        if host_cooldown_remaining(MERCARI_ITEM_BASE) > 0:
+            logger.warning(
+                "Mercari: detail verification aborted mid-batch — host rate-limited; keeping %d verified so far",
+                len(verified),
+            )
+            break
         item_id = str(item.get("item_id") or "")
         if not item_id:
             continue

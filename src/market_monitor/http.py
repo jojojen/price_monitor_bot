@@ -6,9 +6,10 @@ import socket
 import shutil
 import ssl
 import subprocess
+import threading
 import time
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 
 import truststore
@@ -22,6 +23,88 @@ _RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 _HTTP_MAX_RETRIES = 2
 _HTTP_RETRY_BASE_SEC = 1.5
 _HTTP_RETRY_AFTER_CAP_SEC = 30.0
+
+# ── Per-host circuit breaker ──────────────────────────────────────────────────
+# Once a host answers 429 (rate limited), every crawler sharing this process
+# short-circuits further requests to that host for a cooldown window instead of
+# continuing to poke it. Hammering a host that is already limiting you only
+# prolongs the IP cooldown; backing off lets it clear. State is process-global
+# (keyed by host) and shared across all HttpClient instances on purpose.
+_HOST_COOLDOWN_SEC = 300.0
+_circuit_lock = threading.Lock()
+_host_open_until: dict[str, float] = {}
+
+
+class HostRateLimitedError(Exception):
+    """Raised instead of issuing a request to a host whose circuit is open."""
+
+    def __init__(self, host: str, remaining_seconds: float) -> None:
+        self.host = host
+        self.remaining_seconds = remaining_seconds
+        super().__init__(f"circuit open for host={host} ({remaining_seconds:.0f}s remaining)")
+
+
+def _host_of(target: str) -> str:
+    return (urlparse(target).hostname or target).lower()
+
+
+def _circuit_remaining(host: str) -> float:
+    with _circuit_lock:
+        until = _host_open_until.get(host)
+    if until is None:
+        return 0.0
+    return max(0.0, until - time.monotonic())
+
+
+def _trip_circuit(host: str, cooldown_seconds: float) -> None:
+    until = time.monotonic() + cooldown_seconds
+    with _circuit_lock:
+        if until > _host_open_until.get(host, 0.0):
+            _host_open_until[host] = until
+    logger.warning(
+        "HTTP circuit OPEN host=%s cooldown=%.0fs — skipping further requests until it clears",
+        host, cooldown_seconds,
+    )
+
+
+def _clear_circuit(host: str) -> None:
+    with _circuit_lock:
+        _host_open_until.pop(host, None)
+
+
+def reset_circuit_breaker() -> None:
+    """Clear all open circuits (test/maintenance helper)."""
+    with _circuit_lock:
+        _host_open_until.clear()
+
+
+# Public helpers for call sites that fetch with their own ``urlopen`` (Mercari /
+# Rakuma / LLM store extractor) instead of ``HttpClient``, so they share the
+# same per-host circuit breaker and stop hammering a rate-limited host.
+def host_cooldown_remaining(url: str) -> float:
+    """Seconds left on this URL's host circuit (0.0 if closed). Check before
+    issuing a raw request and skip the fetch when > 0."""
+    return _circuit_remaining(_host_of(url))
+
+
+def note_http_success(url: str) -> None:
+    _clear_circuit(_host_of(url))
+
+
+def note_http_error(url: str, exc: BaseException) -> None:
+    """Trip the host circuit when a raw fetch hit HTTP 429."""
+    if isinstance(exc, HTTPError) and exc.code == 429:
+        _trip_circuit(_host_of(url), _cooldown_for_429(exc))
+
+
+def _cooldown_for_429(exc: HTTPError) -> float:
+    raw = exc.headers.get("Retry-After") if exc.headers else None
+    if raw:
+        try:
+            return max(_HOST_COOLDOWN_SEC, float(raw))
+        except ValueError:
+            pass
+    return _HOST_COOLDOWN_SEC
 
 
 def _is_retryable(exc: Exception) -> bool:
@@ -63,7 +146,14 @@ class HttpClient:
         encoding: str | None = "utf-8",
         headers: dict[str, str] | None = None,
         timeout_seconds: int | None = None,
+        retries: int | None = None,
+        curl_fallback: bool = True,
     ) -> str:
+        """Fetch text. ``retries`` caps urllib attempts (default
+        ``_HTTP_MAX_RETRIES``); pass ``retries=1`` + ``curl_fallback=False`` to
+        fail fast and avoid amplifying load against a rate-limited host (a 429
+        otherwise triggers a 30s back-off retry **and** a curl re-fetch, turning
+        one polite request into three and prolonging the IP cooldown)."""
         target = url
         if params:
             query = urlencode(params, doseq=True)
@@ -83,9 +173,15 @@ class HttpClient:
             headers=request_headers,
         )
         effective_timeout = timeout_seconds if timeout_seconds is not None else self.timeout_seconds
+        max_attempts = retries if retries is not None else _HTTP_MAX_RETRIES
+        host = _host_of(target)
+        remaining = _circuit_remaining(host)
+        if remaining > 0:
+            logger.warning("HTTP GET short-circuited host=%s cooldown_remaining=%.0fs target=%s", host, remaining, target)
+            raise HostRateLimitedError(host, remaining)
         logger.debug("HTTP GET target=%s timeout_seconds=%s", target, effective_timeout)
         last_exc: Exception | None = None
-        for attempt in range(1, _HTTP_MAX_RETRIES + 1):
+        for attempt in range(1, max_attempts + 1):
             try:
                 with urlopen(request, timeout=effective_timeout, context=self.ssl_context) as response:
                     payload = response.read()
@@ -98,21 +194,26 @@ class HttpClient:
                         len(payload),
                         selected_encoding,
                     )
+                    _clear_circuit(host)
                     return text
             except _TRANSIENT_HTTP_EXCEPTIONS as exc:
                 last_exc = exc
-                if not _is_retryable(exc) or attempt == _HTTP_MAX_RETRIES:
+                if isinstance(exc, HTTPError) and exc.code == 429:
+                    _trip_circuit(host, _cooldown_for_429(exc))
+                if not _is_retryable(exc) or attempt == max_attempts:
                     break
                 delay = _retry_delay_seconds(exc, attempt)
                 logger.warning(
                     "HTTP GET transient error attempt=%d/%d target=%s status=%s; retrying in %.1fs",
-                    attempt, _HTTP_MAX_RETRIES, target,
+                    attempt, max_attempts, target,
                     exc.code if isinstance(exc, HTTPError) else type(exc).__name__,
                     delay,
                 )
                 time.sleep(delay)
 
         assert last_exc is not None
+        if not curl_fallback:
+            raise last_exc
         if isinstance(last_exc, HTTPError):
             logger.warning("HTTP GET failed target=%s status=%s; trying curl fallback", target, last_exc.code)
         elif isinstance(last_exc, URLError):
@@ -152,6 +253,11 @@ class HttpClient:
 
         request = Request(target, headers=request_headers)
         effective_timeout = timeout_seconds if timeout_seconds is not None else self.timeout_seconds
+        host = _host_of(target)
+        remaining = _circuit_remaining(host)
+        if remaining > 0:
+            logger.warning("HTTP GET (bytes) short-circuited host=%s cooldown_remaining=%.0fs target=%s", host, remaining, target)
+            raise HostRateLimitedError(host, remaining)
         logger.debug("HTTP GET (bytes) target=%s timeout_seconds=%s", target, effective_timeout)
         last_exc: Exception | None = None
         for attempt in range(1, _HTTP_MAX_RETRIES + 1):
@@ -164,9 +270,12 @@ class HttpClient:
                         getattr(response, "status", "unknown"),
                         len(payload),
                     )
+                    _clear_circuit(host)
                     return payload
             except _TRANSIENT_HTTP_EXCEPTIONS as exc:
                 last_exc = exc
+                if isinstance(exc, HTTPError) and exc.code == 429:
+                    _trip_circuit(host, _cooldown_for_429(exc))
                 if not _is_retryable(exc) or attempt == _HTTP_MAX_RETRIES:
                     break
                 delay = _retry_delay_seconds(exc, attempt)
