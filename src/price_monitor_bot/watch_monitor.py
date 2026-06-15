@@ -81,6 +81,15 @@ class _SourceBreaker:
             )
 
 
+# Per-source minimum seconds between polls of the *same* watch, overriding the
+# global tick interval. Yuyu亭 is a fixed-price shop (販売/買取 牌価 move on the
+# order of days, not minutes), so polling it on the 60s C2C cadence only burns
+# requests and gets the bot's IP rate-limited (429). Once a day is plenty and
+# loses no real signal. C2C auction sources (mercari/rakuma) stay at the tick
+# interval (absent here → 0).
+_DEFAULT_SOURCE_MIN_INTERVAL_SECONDS: dict[str, int] = {"yuyutei": 86_400}
+
+
 class MarketplaceWatchMonitor:
     def __init__(
         self,
@@ -91,6 +100,7 @@ class MarketplaceWatchMonitor:
         snapshot_fn: SnapshotFn | None = None,
         fair_value_fn: FairValueFn | None = None,
         interval_seconds: int = 60,
+        source_min_interval_seconds: Mapping[str, int] | None = None,
     ) -> None:
         self._db = MonitorDatabase(db_path)
         self._clients = dict(clients)
@@ -98,6 +108,14 @@ class MarketplaceWatchMonitor:
         self._snapshot_fn = snapshot_fn
         self._fair_value_fn = fair_value_fn
         self._interval = interval_seconds
+        self._source_min_interval = dict(
+            _DEFAULT_SOURCE_MIN_INTERVAL_SECONDS
+            if source_min_interval_seconds is None
+            else source_min_interval_seconds
+        )
+        # (watch_id, market) -> monotonic time of last poll attempt. In-memory:
+        # a restart polls each throttled source once (fresh data) then waits.
+        self._last_polled: dict[tuple[str, str], float] = {}
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._breakers: dict[str, _SourceBreaker] = {}
@@ -179,6 +197,9 @@ class MarketplaceWatchMonitor:
                 "(watch_id=%s query=%s) — skipping",
                 market, watch.watch_id, watch.query,
             )
+            return False
+
+        if self._throttled(watch.watch_id, market):
             return False
 
         breaker = self._breakers.setdefault(market, _SourceBreaker())
@@ -279,6 +300,28 @@ class MarketplaceWatchMonitor:
                         market, watch.watch_id,
                     )
         return True
+
+    def _throttled(self, watch_id: str, market: str) -> bool:
+        """True when ``market`` was polled for this watch within its per-source
+        minimum interval (skip it this tick). Sources without an override
+        (mercari/rakuma) are never throttled here — they run every tick. The
+        poll time is recorded on the attempt, so a 429/timeout still defers the
+        next try (never amplify a rate-limited host)."""
+        min_iv = self._source_min_interval.get(market, 0)
+        if min_iv <= 0:
+            return False
+        key = (watch_id, market)
+        now = time.monotonic()
+        last = self._last_polled.get(key)
+        if last is not None and (now - last) < min_iv:
+            logger.debug(
+                "MarketplaceWatchMonitor: throttled market=%s watch_id=%s "
+                "(%.0fs since last < %ds min) — skipping",
+                market, watch_id, now - last, min_iv,
+            )
+            return True
+        self._last_polled[key] = now
+        return False
 
     def _fair_value_for(self, query: str) -> float | None:
         """Best-effort 二手均價 for ``query``; never raises (degrades to None)."""

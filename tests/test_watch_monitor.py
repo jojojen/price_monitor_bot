@@ -8,8 +8,11 @@ No Playwright / network — sold-price averages are passed in directly.
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 from market_monitor.storage import MarketplaceWatch
 from price_monitor_bot.watch_monitor import (
+    MarketplaceWatchMonitor,
     _fair_value_verdict,
     _format_notification,
 )
@@ -111,3 +114,53 @@ def test_notification_verdict_per_item() -> None:
     )
     assert "划算" in text
     assert "偏貴" in text
+
+
+# ── _throttled per-source cadence ─────────────────────────────────────────────
+
+
+def _monitor(tmp_path, **kwargs) -> MarketplaceWatchMonitor:
+    return MarketplaceWatchMonitor(
+        db_path=tmp_path / "watch.sqlite3",
+        clients={},
+        notify_fn=MagicMock(),
+        **kwargs,
+    )
+
+
+def test_throttle_defaults_yuyutei_to_daily(tmp_path) -> None:
+    mon = _monitor(tmp_path)
+    # First poll attempt records the time and is allowed through.
+    assert mon._throttled("w1", "yuyutei") is False
+    # A second attempt in the same tick is within 24h → skipped.
+    assert mon._throttled("w1", "yuyutei") is True
+
+
+def test_throttle_never_blocks_c2c_sources(tmp_path) -> None:
+    mon = _monitor(tmp_path)
+    for _ in range(5):
+        assert mon._throttled("w1", "mercari") is False
+        assert mon._throttled("w1", "rakuma") is False
+
+
+def test_throttle_is_per_watch_and_market(tmp_path) -> None:
+    mon = _monitor(tmp_path)
+    assert mon._throttled("w1", "yuyutei") is False
+    # Different watch → independent clock, still allowed.
+    assert mon._throttled("w2", "yuyutei") is False
+    # Same (watch, market) again → throttled.
+    assert mon._throttled("w1", "yuyutei") is True
+
+
+def test_throttle_records_attempt_even_on_failure_path(tmp_path) -> None:
+    # The time is stored on the attempt (not on success), so a 429/timeout
+    # still defers the next try — never amplify a rate-limited host.
+    mon = _monitor(tmp_path)
+    assert mon._throttled("w1", "yuyutei") is False
+    assert ("w1", "yuyutei") in mon._last_polled
+
+
+def test_throttle_override_disables_with_zero(tmp_path) -> None:
+    mon = _monitor(tmp_path, source_min_interval_seconds={})
+    for _ in range(3):
+        assert mon._throttled("w1", "yuyutei") is False
