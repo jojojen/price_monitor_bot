@@ -32,6 +32,7 @@ from price_monitor_bot.bot import (
     TelegramReputationQuery,
     TelegramReputationDelivery,
     TelegramTextIntentOption,
+    _build_text_intent_candidates,
     _drain_pending_updates,
     _is_conflict_error,
     build_processing_ack,
@@ -1389,6 +1390,150 @@ def test_handle_telegram_message_runs_selected_text_option_after_clarification()
     assert research_calls == ["ありがとう"]
     assert "web:ありがとう" in replies[-1]
     # Pending state must be consumed after a successful selection.
+    assert processor.get_pending_text_clarification("123") is None
+
+
+_MERCARI_ITEM_URL = "https://jp.mercari.com/item/m68332847288"
+_MERCARI_SHOPS_URL = "https://jp.mercari.com/shops/product/2JPEa5BQcDaCwxJamae4fp"
+
+
+def test_build_text_intent_candidates_offers_research_and_snapshot_for_mercari_product_url() -> None:
+    # The router judged a bare product link ambiguous (low confidence). The
+    # clarification builder must surface exactly the two product reads — deep
+    # research vs seller reputation — not the generic candidate spread.
+    top = TelegramNaturalLanguageIntent(
+        intent="product_research", query_url=_MERCARI_ITEM_URL, confidence=0.4
+    )
+    options = _build_text_intent_candidates(_MERCARI_ITEM_URL, top)
+
+    assert [opt.intent.intent for opt in options] == [
+        "product_research",
+        "reputation_snapshot",
+    ]
+    assert all(opt.intent.query_url == _MERCARI_ITEM_URL for opt in options)
+    assert "深度商品研究" in options[0].prompt
+    assert "信譽快照" in options[1].prompt
+
+
+def test_build_text_intent_candidates_shops_url_also_gets_the_pair() -> None:
+    top = TelegramNaturalLanguageIntent(
+        intent="reputation_snapshot", query_url=_MERCARI_SHOPS_URL, confidence=0.45
+    )
+    options = _build_text_intent_candidates(_MERCARI_SHOPS_URL, top)
+
+    assert [opt.intent.intent for opt in options] == [
+        "product_research",
+        "reputation_snapshot",
+    ]
+
+
+def test_build_text_intent_candidates_pair_independent_of_top_intent_guess() -> None:
+    # Live: qwen3:14b labels a bare Mercari URL `add_watch` @0.5 (below the
+    # ambiguity threshold). The URL still reads as research-vs-snapshot, so the
+    # builder offers that pair regardless of the router's low-confidence guess.
+    top = TelegramNaturalLanguageIntent(intent="add_watch", confidence=0.5)
+    options = _build_text_intent_candidates(_MERCARI_ITEM_URL, top)
+
+    assert [opt.intent.intent for opt in options] == [
+        "product_research",
+        "reputation_snapshot",
+    ]
+    assert all(opt.intent.query_url == _MERCARI_ITEM_URL for opt in options)
+
+
+def test_build_text_intent_candidates_non_mercari_url_keeps_generic_spread() -> None:
+    # A plain article URL is NOT a product page, so the research/snapshot pair
+    # must not be forced — the generic reputation/web_research spread applies.
+    text = "https://example.com/some-article"
+    top = TelegramNaturalLanguageIntent(intent="unknown", confidence=0.1)
+    options = _build_text_intent_candidates(text, top)
+
+    kinds = [opt.intent.intent for opt in options]
+    assert "product_research" not in kinds
+    assert "reputation_snapshot" in kinds
+
+
+def test_bare_mercari_product_url_offers_two_button_choice() -> None:
+    # End-to-end: a bare product URL the LLM marks ambiguous (confidence < 0.55)
+    # must produce the 2-option clarification, NOT silently run one command.
+    client = FakeTelegramClient()
+    processor = _make_clarifying_processor(
+        TelegramNaturalLanguageIntent(
+            intent="product_research", query_url=_MERCARI_ITEM_URL, confidence=0.4
+        ),
+    )
+
+    replies = handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: "unused",
+        message={"chat": {"id": "123"}, "text": _MERCARI_ITEM_URL},
+    )
+
+    assert len(replies) == 2
+    assert replies[0] == TEXT_INTAKE_ACK
+    menu = replies[1]
+    assert "請點按鈕" in menu
+    assert "深度商品研究" in menu
+    assert "信譽快照" in menu
+    pending = processor.get_pending_text_clarification("123")
+    assert pending is not None
+    assert [opt.intent.intent for opt in pending.options] == [
+        "product_research",
+        "reputation_snapshot",
+    ]
+
+
+def test_selecting_research_option_dispatches_to_research_command() -> None:
+    # Picking the research option must build a background plan that runs the
+    # injected /research command with the product URL and the chat id.
+    client = FakeTelegramClient()
+    research_calls: list[tuple[str, str]] = []
+
+    def research_handler(remainder: str, chat_id: str) -> str:
+        research_calls.append((remainder, chat_id))
+        return f"研究報告：{remainder}"
+
+    processor = TelegramCommandProcessor(
+        allowed_chat_ids=frozenset({"123"}),
+        lookup_renderer=lambda q: "unused",
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        natural_language_router=StubNaturalLanguageRouter(
+            TelegramNaturalLanguageIntent(
+                intent="product_research", query_url=_MERCARI_ITEM_URL, confidence=0.4
+            )
+        ),
+        command_handlers={
+            "/research": RegisteredCommand(
+                research_handler, ack="收到，開始研究…", background=True
+            )
+        },
+    )
+
+    handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: "unused",
+        message={"chat": {"id": "123"}, "text": _MERCARI_ITEM_URL},
+    )
+    pending = processor.get_pending_text_clarification("123")
+    assert pending is not None
+    research_option = next(
+        opt for opt in pending.options if opt.intent.intent == "product_research"
+    )
+
+    # Research is slow → background plan: ack is sent, the factory deferred.
+    plan = processor.build_pending_text_reply_plan(
+        chat_id="123", text=str(research_option.option_number)
+    )
+    assert plan is not None
+    assert plan.run_in_background is True
+    assert "收到，開始研究…" in plan.ack
+    assert research_calls == []  # not run until the factory executes
+    assert plan.execute() == f"研究報告：{_MERCARI_ITEM_URL}"
+    assert research_calls == [(_MERCARI_ITEM_URL, "123")]
+    # Selecting an option consumes the pending clarification.
     assert processor.get_pending_text_clarification("123") is None
 
 

@@ -418,7 +418,7 @@ class TelegramNaturalLanguageRouter:
         tool_spec_block = f"Tool spec:\n{self.tool_spec}\n\n" if self.tool_spec else ""
         return (
             "You route Telegram messages for a trading-card price assistant and must return only JSON.\n"
-            "Allowed intents: lookup_card, trend_board, add_watch, list_watches, remove_watch, update_watch_price, reputation_snapshot, "
+            "Allowed intents: lookup_card, trend_board, add_watch, list_watches, remove_watch, update_watch_price, reputation_snapshot, product_research, "
             "web_research, opportunity_remove, sns_add_account, sns_add_keyword, sns_list, sns_delete, sns_buzz, sns_bulk_add_filter, sns_bulk_remove_filter, sns_bulk_update_schedule, sns_clear_filter, "
             "help, status, tools, scan_help, unknown.\n"
             + tool_spec_block +
@@ -431,8 +431,11 @@ class TelegramNaturalLanguageRouter:
             "Use list_watches when the user wants to see the MERCARI watchlist / tracked items (no @ handle, no SNS context).\n"
             "Use remove_watch when the user wants to stop tracking a MERCARI watch by hex ID (e.g. abc12345). Set watch_id.\n"
             "Use update_watch_price when the user wants to change the price threshold of an existing Mercari watch. Set watch_id and watch_price_threshold.\n"
-            "Use reputation_snapshot when the user wants to check a seller's reputation/trust/credit or take a snapshot of a URL.\n"
+            "Use reputation_snapshot when the user wants to check a seller's reputation/trust/credit or take a snapshot/proof of a URL.\n"
             "  Set query_url to the URL found in the message (Mercari item or profile URL).\n"
+            "Use product_research when the user wants a deep investment/market analysis of one specific listed product "
+            "(appreciation potential, fair price, liquidity) from a marketplace product URL.\n"
+            "  Set query_url to the product URL found in the message.\n"
             "Use web_research when the user asks about price direction, market sentiment, recent news, "
             "or any why/how/explanatory question that needs fetching and synthesising external sources "
             "(e.g. '寶可夢卡是不是在跌', 'why are pokemon cards popular', 'pokemon 市場最近怎麼了').\n"
@@ -489,6 +492,7 @@ class TelegramNaturalLanguageRouter:
             "- A bulk-selecting phrase (每個/所有/全部 OR 'domain 有 <X>') + filter hint + REMOVE verb + a keyword → sns_bulk_remove_filter. NEVER route to sns_bulk_add_filter when a REMOVE verb is present — even if a keyword-like number (e.g. '720分鐘') appears, that's the keyword the user wants OUT, not added.\n"
             "- A bulk-selecting phrase + schedule hint (頻率/排程/輪詢) + integer minutes → sns_bulk_update_schedule. When BOTH filter-keyword signals AND schedule signals appear in the same message, prefer sns_bulk_update_schedule (schedule requires an integer parameter; '改成 N 分鐘' for a domain is unambiguously schedule).\n"
             "- '拿掉/清除/清空 @X 的 filter/篩選/關鍵字' → sns_clear_filter (clears include_keywords only). '取消追蹤/停止追蹤/刪除追蹤/unfollow @X' → sns_delete (removes the whole rule).\n"
+            "- A bare marketplace product URL (e.g. a Mercari item/shops product link) with NO wording that says whether the user wants seller reputation or investment analysis is genuinely ambiguous between reputation_snapshot and product_research: return confidence below 0.5 with query_url set, so the caller can ask the user which one. Only commit confidently when the message clearly signals one (e.g. '信譽/credit/賣家可靠嗎' → reputation_snapshot; '增值/值不值得買/行情/這個能賺嗎' → product_research).\n"
             "- If the message could plausibly match more than one of the listed intents, return confidence below 0.5 instead of picking confidently. Honest uncertainty beats a confident wrong guess.\n"
             f'Game must be one of "{supported_game_hint()}" or null.\n'
             "Infer pokemon for wording like Pokemon, PTCG, 寶可夢, 寶可卡.\n"
@@ -516,6 +520,10 @@ class TelegramNaturalLanguageRouter:
             '- "取消追蹤 abc12345" -> remove_watch, watch_id="abc12345"\n'
             '- "把 abc12345 改成 4萬" -> update_watch_price, watch_id="abc12345", watch_price_threshold=40000\n'
             '- "查詢信用 https://jp.mercari.com/item/m12345" -> reputation_snapshot, query_url="https://jp.mercari.com/item/m12345"\n'
+            '- "這個賣家可靠嗎 https://jp.mercari.com/item/m12345" -> reputation_snapshot, query_url="https://jp.mercari.com/item/m12345"\n'
+            '- "這個值不值得買 https://jp.mercari.com/item/m12345" -> product_research, query_url="https://jp.mercari.com/item/m12345"\n'
+            '- "研究 https://jp.mercari.com/item/m12345"（未說信譽或增值，模稜兩可）-> confidence<0.5, query_url="https://jp.mercari.com/item/m12345"\n'
+            '- "https://jp.mercari.com/shops/product/abc123"（只貼連結）-> confidence<0.5, query_url="https://jp.mercari.com/shops/product/abc123"\n'
             '- "why pokemon Pikachu cards are so popular?" -> web_research, research_query="why Pokemon Pikachu cards are popular"\n'
             '- "為什麼噴火龍寶可夢卡那麼有人氣" -> web_research, research_query="為什麼 噴火龍 寶可夢卡 人氣"\n'
             '- "幫我查寶可夢卡現在是不是在跌" -> web_research, research_query="Pokemon TCG card market is dropping recent trend"\n'
@@ -1057,7 +1065,7 @@ def _load_json_fragment(value: str) -> object:
 _ALLOWED_INTENTS = frozenset({
     "lookup_card", "trend_board",
     "add_watch", "list_watches", "remove_watch", "update_watch_price",
-    "reputation_snapshot", "web_research", "opportunity_remove",
+    "reputation_snapshot", "product_research", "web_research", "opportunity_remove",
     "sns_add_account", "sns_add_keyword", "sns_list", "sns_delete", "sns_buzz",
     "sns_bulk_add_filter", "sns_bulk_remove_filter", "sns_bulk_update_schedule",
     "sns_clear_filter",

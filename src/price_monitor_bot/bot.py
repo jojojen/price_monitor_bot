@@ -76,6 +76,20 @@ PHOTO_SCAN_COMMANDS = {"/scan", "/image", "/photo"}
 REPUTATION_SNAPSHOT_COMMANDS = {"/snapshot", "/proof", "/repcheck", "/reputation"}
 WEB_RESEARCH_COMMANDS = {"/search", "/research", "/web"}
 WEB_FETCH_COMMANDS = {"/fetch", "/read"}
+
+# Recognises a Mercari product URL (item or Shops). This is NOT used to route
+# intent — the LLM router decides that. It only lets the clarification builder
+# know that "deep product research" is a plausible button to offer when the
+# router has already judged a product link ambiguous (low confidence).
+_MERCARI_PRODUCT_URL_RE = re.compile(
+    r"https?://(?:jp\.|www\.)?mercari\.com/"
+    r"(?:item/m\d+|shops/product/[A-Za-z0-9]+)(?:[/?#]\S*)?",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_mercari_product_url(url: str) -> bool:
+    return bool(_MERCARI_PRODUCT_URL_RE.match(url or ""))
 WATCH_COMMANDS = {"/watch"}
 WATCHLIST_COMMANDS = {"/watchlist", "/watches"}
 UNWATCH_COMMANDS = {"/unwatch", "/stopwatch"}
@@ -745,6 +759,7 @@ class TelegramCommandProcessor:
         research_renderer: ResearchRenderer | None = None,
         fetch_renderer: FetchRenderer | None = None,
         natural_language_router: TelegramNaturalLanguageRouter | None = None,
+        intent_fast_path: "object | None" = None,
         allowed_chat_ids: frozenset[str] | None = None,
         status_renderer: Callable[[], str] | None = None,
         watch_db: MonitorDatabase | None = None,
@@ -766,6 +781,7 @@ class TelegramCommandProcessor:
         self._research_renderer = research_renderer
         self._fetch_renderer = fetch_renderer
         self._natural_language_router = natural_language_router
+        self._intent_fast_path = intent_fast_path
         self._allowed_chat_ids: frozenset[str] = allowed_chat_ids or frozenset()
         self._status_renderer = status_renderer
         self._watch_db = watch_db
@@ -992,6 +1008,7 @@ class TelegramCommandProcessor:
                     reply=plan.reply,
                     reply_factory=plan.reply_factory,
                     reputation_delivery_factory=plan.reputation_delivery_factory,
+                    run_in_background=plan.run_in_background,
                 )
             return TelegramTextReplyPlan(
                 ack=None,
@@ -1637,6 +1654,24 @@ class TelegramCommandProcessor:
                 reply=None,
                 reply_factory=lambda wid=wid, p=p: self._handle_set_price(f"{wid} {p}"),
             )
+        if intent.intent == "product_research":
+            url = intent.query_url
+            spec = self._command_registry.get("/research")
+            if not url or spec is None:
+                return TelegramTextReplyPlan(
+                    ack=None,
+                    reply="商品研究功能未啟用，請改用 /snapshot，或稍後再試。",
+                )
+            logger.info(
+                "Telegram natural-language routed intent=product_research query_url=%s",
+                trim_for_log(url, limit=240),
+            )
+            return TelegramTextReplyPlan(
+                ack=spec.ack or "收到，正在進行深度商品研究（會分階段回報進度）…",
+                reply=None,
+                reply_factory=lambda u=url, c=chat_id: spec.handler(u, str(c)),
+                run_in_background=True,
+            )
         if intent.intent == "reputation_snapshot":
             if not intent.query_url:
                 return TelegramTextReplyPlan(
@@ -2037,6 +2072,24 @@ class TelegramCommandProcessor:
         )
 
     def _route_natural_language(self, text: str) -> TelegramNaturalLanguageIntent | None:
+        # Fast-path: an embedding match short-circuits zero-arg commands
+        # (list/info) in ~130 ms, skipping the ~50 s LLM router. It only ever
+        # returns confident zero-arg intents; anything slot-bearing or
+        # ambiguous returns None so the LLM router below handles it unchanged.
+        if self._intent_fast_path is not None:
+            try:
+                fast_intent = self._intent_fast_path.route(text)
+            except Exception:  # noqa: BLE001 - fast-path must never break routing
+                logger.exception("Telegram intent fast-path failed, falling through to LLM router")
+                fast_intent = None
+            if fast_intent is not None:
+                logger.info(
+                    "Telegram intent fast-path routed intent=%s confidence=%s",
+                    fast_intent.intent,
+                    fast_intent.confidence,
+                )
+                return fast_intent
+
         llm_intent: TelegramNaturalLanguageIntent | None = None
         if self._natural_language_router is not None:
             try:
@@ -2743,6 +2796,7 @@ def run_telegram_polling(
     research_renderer: ResearchRenderer | None = None,
     fetch_renderer: FetchRenderer | None = None,
     natural_language_router: TelegramNaturalLanguageRouter | None = None,
+    intent_fast_path: "object | None" = None,
     ssl_context: ssl.SSLContext | None = None,
     allowed_chat_ids: frozenset[str] | None = None,
     status_renderer: Callable[[], str] | None = None,
@@ -2789,6 +2843,7 @@ def run_telegram_polling(
         research_renderer=research_renderer,
         fetch_renderer=fetch_renderer,
         natural_language_router=natural_language_router,
+        intent_fast_path=intent_fast_path,
         allowed_chat_ids=allowed_chat_ids,
         status_renderer=status_renderer,
         watch_db=watch_db,
@@ -3916,6 +3971,35 @@ def _build_text_intent_candidates(
 
     lowered = text.lower()
 
+    # A bare marketplace product URL the router judged ambiguous reads exactly
+    # two ways: investment research (/research) vs seller reputation (/snapshot).
+    # Surface just that clean pair instead of the generic candidate spread.
+    product_url_match = re.search(r"https?://\S+", text)
+    if product_url_match is not None and _looks_like_mercari_product_url(product_url_match.group(0)):
+        url = product_url_match.group(0)
+        research_guess = TelegramNaturalLanguageIntent(
+            intent="product_research", query_url=url, confidence=0.5
+        )
+        reputation_guess = TelegramNaturalLanguageIntent(
+            intent="reputation_snapshot", query_url=url, confidence=0.5
+        )
+        research_prompt = _describe_intent_for_clarification(research_guess, text)
+        reputation_prompt = _describe_intent_for_clarification(reputation_guess, text)
+        if research_prompt is not None:
+            add("product_research", research_prompt, research_guess)
+        if reputation_prompt is not None:
+            add("reputation_snapshot", reputation_prompt, reputation_guess)
+        if raw_candidates:
+            return tuple(
+                TelegramTextIntentOption(
+                    option_number=index + 1,
+                    action_key=key,
+                    prompt=prompt,
+                    intent=intent,
+                )
+                for index, (key, prompt, intent) in enumerate(raw_candidates)
+            )
+
     if top_intent is not None and top_intent.intent != "unknown":
         prompt = _describe_intent_for_clarification(top_intent, text)
         if prompt is not None:
@@ -4025,6 +4109,9 @@ def _describe_intent_for_clarification(
         return f"取消 Mercari 追蹤 {trim_for_log(target, limit=40)} (相當於 /unwatch)"
     if kind == "update_watch_price":
         return f"更新 Mercari 追蹤 {intent.watch_id} 的目標價 (相當於 /setprice)"
+    if kind == "product_research":
+        url = intent.query_url or fallback
+        return f"深度商品研究：增值/市價/流動性 {trim_for_log(url, limit=40)} (相當於 /research)"
     if kind == "reputation_snapshot":
         url = intent.query_url or fallback
         return f"建立賣家信譽快照：{trim_for_log(url, limit=40)} (相當於 /snapshot)"
