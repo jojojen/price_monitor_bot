@@ -229,3 +229,46 @@ def test_search_mercari_sold_returns_verified_items(monkeypatch) -> None:
     assert [item["item_id"] for item in results] == ["m67507032609", "m13000897914"]
     assert results[0]["price_jpy"] == 2200
     assert results[1]["url"].startswith("https://jp.mercari.com/item/")
+
+
+@pytest.fixture
+def _reset_title_matcher():
+    """Ensure module-level matcher is cleared after each test using it."""
+    mercari_search.set_title_matcher(None)
+    try:
+        yield
+    finally:
+        mercari_search.set_title_matcher(None)
+
+
+def test_filter_by_query_delegates_to_registered_matcher(_reset_title_matcher) -> None:
+    items = [{"item_id": "a", "title": "foo"}, {"item_id": "b", "title": "bar"}]
+    calls: list[tuple[str, list]] = []
+
+    def fake_matcher(query, batch):
+        calls.append((query, batch))
+        return [batch[1]]  # keep only the second, ignoring lexical tokens
+
+    mercari_search.set_title_matcher(fake_matcher)
+
+    result = mercari_search._filter_by_query(items, "nonmatching query tokens")
+
+    assert result == [items[1]]
+    assert calls == [("nonmatching query tokens", items)]
+
+
+def test_filter_by_query_falls_back_to_lexical_when_matcher_raises(_reset_title_matcher) -> None:
+    items = [
+        {"item_id": "a", "title": "world card SP"},
+        {"item_id": "b", "title": "unrelated"},
+    ]
+
+    def boom(query, batch):
+        raise RuntimeError("embedder exploded")
+
+    mercari_search.set_title_matcher(boom)
+
+    result = mercari_search._filter_by_query(items, "world SP")
+
+    # Lexical AND-substring filter keeps only the item containing every token.
+    assert result == [items[0]]

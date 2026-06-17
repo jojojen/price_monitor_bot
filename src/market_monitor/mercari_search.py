@@ -18,7 +18,7 @@ import re
 import shutil
 import urllib.error
 import urllib.request
-from typing import Any
+from typing import Any, Callable, Optional
 from urllib.parse import quote
 
 from bs4 import BeautifulSoup
@@ -26,6 +26,22 @@ from bs4 import BeautifulSoup
 from .http import host_cooldown_remaining, note_http_error, note_http_success
 
 logger = logging.getLogger(__name__)
+
+# A registered matcher decides which raw search items refer to the queried
+# product. It receives (query, raw_items) and returns the kept items. The
+# default is the lexical token filter below; aka_no_claw registers a bge-m3
+# semantic matcher (set_title_matcher) so the same card under a different
+# spelling — e.g. ヴァイス vs ヴァイスシュヴァルツ — is no longer discarded.
+TitleMatcher = Callable[[str, "list[dict[str, object]]"], "list[dict[str, object]]"]
+_title_matcher: "Optional[TitleMatcher]" = None
+
+
+def set_title_matcher(matcher: "Optional[TitleMatcher]") -> None:
+    """Register (or clear, with ``None``) the semantic title matcher used by
+    every Mercari search filter. Lives at module scope because the active,
+    sold, and sold-average scrapes all funnel through ``_filter_by_query``."""
+    global _title_matcher
+    _title_matcher = matcher
 
 MERCARI_SEARCH_BASE = "https://jp.mercari.com/search"
 MERCARI_ITEM_BASE = "https://jp.mercari.com/item"
@@ -505,6 +521,19 @@ def _query_tokens(query: str) -> list[str]:
 
 
 def _filter_by_query(items: list[dict[str, object]], query: str) -> list[dict[str, object]]:
+    matcher = _title_matcher
+    if matcher is not None:
+        try:
+            return matcher(query, items)
+        except Exception:
+            logger.warning(
+                "Mercari: semantic title matcher failed; falling back to lexical token filter",
+                exc_info=True,
+            )
+    return _lexical_filter_by_query(items, query)
+
+
+def _lexical_filter_by_query(items: list[dict[str, object]], query: str) -> list[dict[str, object]]:
     tokens = _query_tokens(query)
     if not tokens:
         return items
