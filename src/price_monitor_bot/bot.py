@@ -11,7 +11,7 @@ import tempfile
 import time
 import threading
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
@@ -519,6 +519,16 @@ def _build_photo_intent_options(*, parsed_game: str | None, item_kind: str | Non
                 synthetic_caption=caption,
             )
         )
+    # Always offer image OCR + Traditional-Chinese translation, so non-card
+    # screenshots (the renderer routes this synthetic caption to the translator).
+    options.append(
+        TelegramPhotoIntentOption(
+            option_number=len(options) + 1,
+            action_key="ocr_translate",
+            prompt="要我把這張圖上的文字翻成繁體中文嗎？",
+            synthetic_caption="翻譯",
+        )
+    )
     return tuple(options)
 
 
@@ -760,6 +770,7 @@ class TelegramCommandProcessor:
         fetch_renderer: FetchRenderer | None = None,
         natural_language_router: TelegramNaturalLanguageRouter | None = None,
         intent_fast_path: "object | None" = None,
+        image_translate_recognizer: "Callable[[str | None], bool] | None" = None,
         allowed_chat_ids: frozenset[str] | None = None,
         status_renderer: Callable[[], str] | None = None,
         watch_db: MonitorDatabase | None = None,
@@ -782,6 +793,7 @@ class TelegramCommandProcessor:
         self._fetch_renderer = fetch_renderer
         self._natural_language_router = natural_language_router
         self._intent_fast_path = intent_fast_path
+        self._image_translate_recognizer = image_translate_recognizer
         self._allowed_chat_ids: frozenset[str] = allowed_chat_ids or frozenset()
         self._status_renderer = status_renderer
         self._watch_db = watch_db
@@ -2140,6 +2152,24 @@ class TelegramCommandProcessor:
             return fallback_intent
         return None
 
+    def caption_requests_image_translation(self, caption: "str | None") -> bool:
+        """Decide whether a photo caption is asking to OCR + translate the image.
+
+        Prefers the injected embedding recognizer (open-world semantic match, so
+        「這張圖寫什麼」counts even without a literal keyword); falls back to the
+        keyword check only when no recognizer is wired or it errors out."""
+        if not caption or not caption.strip():
+            return False
+        recognizer = self._image_translate_recognizer
+        if recognizer is not None:
+            try:
+                return bool(recognizer(caption))
+            except Exception:
+                logger.exception(
+                    "image-translate caption recognizer failed; falling back to keyword"
+                )
+        return _caption_requests_image_translation(caption)
+
     def _status_text(self) -> str:
         if self._status_renderer is not None:
             return self._status_renderer()
@@ -2797,6 +2827,7 @@ def run_telegram_polling(
     fetch_renderer: FetchRenderer | None = None,
     natural_language_router: TelegramNaturalLanguageRouter | None = None,
     intent_fast_path: "object | None" = None,
+    image_translate_recognizer: "Callable[[str | None], bool] | None" = None,
     ssl_context: ssl.SSLContext | None = None,
     allowed_chat_ids: frozenset[str] | None = None,
     status_renderer: Callable[[], str] | None = None,
@@ -2844,6 +2875,7 @@ def run_telegram_polling(
         fetch_renderer=fetch_renderer,
         natural_language_router=natural_language_router,
         intent_fast_path=intent_fast_path,
+        image_translate_recognizer=image_translate_recognizer,
         allowed_chat_ids=allowed_chat_ids,
         status_renderer=status_renderer,
         watch_db=watch_db,
@@ -3571,7 +3603,12 @@ def handle_telegram_message(
     # (vision/OCR/LLM calls), so let the user know we've received their
     # message before we start the real work.
     if has_photo:
-        intake_ack = "已收到圖片，開始解讀使用者意圖"
+        _photo_caption = message.get("caption")
+        _photo_caption = _photo_caption if isinstance(_photo_caption, str) else None
+        if processor.caption_requests_image_translation(_photo_caption):
+            intake_ack = "已理解為：圖片文字翻譯，正在 OCR 並翻成繁體中文…（約 1–2 分鐘）"
+        else:
+            intake_ack = "已收到圖片，開始解讀使用者意圖"
     elif text_value is not None:
         intake_ack = "已收到訊息，開始解讀使用者意圖"
     else:
@@ -3771,7 +3808,13 @@ def _handle_photo_message(
             item_kind_hint=None,
             file_id=file_id,
         )
-        if _caption_requests_direct_photo_lookup(caption_text):
+        wants_translate = processor.caption_requests_image_translation(caption_text)
+        if _caption_requests_direct_photo_lookup(caption_text) or wants_translate:
+            if wants_translate:
+                # Canonicalize to the「翻譯」token the renderer routes on, so an
+                # embedding-recognized caption ("這張圖寫什麼") reaches the
+                # translate branch even though it carries no literal keyword.
+                query = replace(query, caption="翻譯")
             raw_reply = photo_renderer(query)
             reply = _coerce_photo_lookup_reply(raw_reply)
             installed_pending = False
@@ -4216,6 +4259,15 @@ def _caption_requests_direct_photo_lookup(caption: str | None) -> bool:
     if any(lowered.startswith(prefix) for prefix in PHOTO_SCAN_COMMANDS):
         return True
     return _text_requests_price_lookup(lowered)
+
+
+def _caption_requests_image_translation(caption: str | None) -> bool:
+    if caption is None:
+        return False
+    lowered = caption.strip().lower()
+    if not lowered:
+        return False
+    return any(token in lowered for token in ("翻譯", "翻訳", "translate", "ocr"))
 
 
 def _text_requests_price_lookup(content: str) -> bool:
