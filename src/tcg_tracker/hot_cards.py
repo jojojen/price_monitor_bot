@@ -14,6 +14,7 @@ from urllib.parse import urlencode, urljoin
 from bs4 import BeautifulSoup
 from bs4.element import Tag
 
+from market_monitor import browser_stealth as bs
 from market_monitor.http import HttpClient
 from market_monitor.models import MarketOffer
 from market_monitor.normalize import normalize_card_number, normalize_text
@@ -43,11 +44,7 @@ BUY_SIGNAL_CANDIDATE_LIMIT = 24
 BUY_SIGNAL_CACHE_TTL_SECONDS = 30 * 60
 
 CARDRUSH_BROWSER_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/135.0.0.0 Safari/537.36"
-    ),
+    "User-Agent": bs.MAC_CHROME_UA,
     "Accept": (
         "text/html,application/xhtml+xml,application/xml;q=0.9,"
         "image/avif,image/webp,image/apng,*/*;q=0.8"

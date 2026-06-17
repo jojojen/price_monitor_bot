@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from typing import Protocol
 
+from market_monitor import browser_stealth as bs
 from market_monitor.http import HttpClient
 from market_monitor.normalize import normalize_card_number, normalize_text
 from market_monitor.models import DomainTrust, FairValueEstimate, MarketOffer, TrackedItem, WatchRule
@@ -25,7 +26,7 @@ from .yuyutei import YuyuteiClient
 
 logger = logging.getLogger(__name__)
 _TRANSIENT_SOURCE_EXCEPTIONS = (TimeoutError, socket.timeout)
-_DEFAULT_USER_AGENT = "OpenClawPriceMonitor/0.1 (+https://local-dev)"
+_DEFAULT_USER_AGENT = bs.MAC_CHROME_UA
 _DEFAULT_LOG_RAW_RESULT_LIMIT = 20
 
 # Tiered-lookup defaults. Tier 1 = authoritative sources whose result blocks

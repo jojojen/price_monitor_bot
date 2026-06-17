@@ -14,6 +14,8 @@ from urllib.request import Request, urlopen
 
 import truststore
 
+from . import browser_stealth as bs
+
 logger = logging.getLogger(__name__)
 _TRANSIENT_HTTP_EXCEPTIONS = (HTTPError, URLError, TimeoutError, socket.timeout)
 
@@ -134,7 +136,9 @@ class HttpClient:
         timeout_seconds: int = 20,
         ssl_context: ssl.SSLContext | None = None,
     ) -> None:
-        self.user_agent = user_agent or "OpenClawPriceMonitor/0.1 (+https://local-dev)"
+        # Default to the shared human macOS-Chrome UA — a CLI-looking UA invites
+        # marketplace blocks/429s (e.g. yuyu-tei). Callers may still override.
+        self.user_agent = user_agent or bs.MAC_CHROME_UA
         self.timeout_seconds = timeout_seconds
         self.ssl_context = ssl_context or truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 
@@ -160,11 +164,8 @@ class HttpClient:
             separator = "&" if "?" in url else "?"
             target = f"{url}{separator}{query}"
 
-        request_headers = {
-            "User-Agent": self.user_agent,
-            "Accept-Language": "ja-JP,ja;q=0.9",
-            "Cache-Control": "no-cache",
-        }
+        request_headers = bs.http_headers({"Cache-Control": "no-cache"})
+        request_headers["User-Agent"] = self.user_agent
         if headers:
             request_headers.update(headers)
 
@@ -243,11 +244,8 @@ class HttpClient:
             separator = "&" if "?" in url else "?"
             target = f"{url}{separator}{query}"
 
-        request_headers = {
-            "User-Agent": self.user_agent,
-            "Accept-Language": "ja-JP,ja;q=0.9",
-            "Cache-Control": "no-cache",
-        }
+        request_headers = bs.http_headers({"Cache-Control": "no-cache"})
+        request_headers["User-Agent"] = self.user_agent
         if headers:
             request_headers.update(headers)
 

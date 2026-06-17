@@ -13,9 +13,7 @@ Two-stage pricing:
 from __future__ import annotations
 
 import logging
-import os
 import re
-import shutil
 import urllib.error
 import urllib.request
 from typing import Any, Callable, Optional
@@ -23,6 +21,7 @@ from urllib.parse import quote
 
 from bs4 import BeautifulSoup
 
+from . import browser_stealth as bs
 from .http import host_cooldown_remaining, note_http_error, note_http_success
 
 logger = logging.getLogger(__name__)
@@ -46,11 +45,6 @@ def set_title_matcher(matcher: "Optional[TitleMatcher]") -> None:
 MERCARI_SEARCH_BASE = "https://jp.mercari.com/search"
 MERCARI_ITEM_BASE = "https://jp.mercari.com/item"
 
-_USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
 
 _INSTALLMENT_MARKERS = ("月々", "分割", "/月", "～", "〜")
 
@@ -137,12 +131,8 @@ def search_mercari(
     )
 
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(**_chromium_launch_options())
-        context = browser.new_context(
-            locale="ja-JP",
-            user_agent=_USER_AGENT,
-            viewport={"width": 1280, "height": 900},
-        )
+        browser = bs.launch_stealth_chromium(playwright, headless=True, logger=logger)
+        context = bs.new_stealth_context(browser)
         page = context.new_page()
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
@@ -156,6 +146,7 @@ def search_mercari(
                 page.evaluate("window.scrollTo(0, 300)")
                 page.wait_for_timeout(2000)
 
+            bs.humanize(page)
             html = page.content()
         finally:
             context.close()
@@ -203,12 +194,8 @@ def search_mercari_sold(
     logger.info("Mercari sold search query=%s url=%s", query, url)
 
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(**_chromium_launch_options())
-        context = browser.new_context(
-            locale="ja-JP",
-            user_agent=_USER_AGENT,
-            viewport={"width": 1280, "height": 900},
-        )
+        browser = bs.launch_stealth_chromium(playwright, headless=True, logger=logger)
+        context = bs.new_stealth_context(browser)
         page = context.new_page()
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
@@ -221,6 +208,7 @@ def search_mercari_sold(
                 logger.debug("Mercari sold: item selector timed out, trying JS scroll")
                 page.evaluate("window.scrollTo(0, 300)")
                 page.wait_for_timeout(2000)
+            bs.humanize(page)
             html = page.content()
         finally:
             context.close()
@@ -272,12 +260,8 @@ def fetch_avg_sold_price(
     )
 
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(**_chromium_launch_options())
-        context = browser.new_context(
-            locale="ja-JP",
-            user_agent=_USER_AGENT,
-            viewport={"width": 1280, "height": 900},
-        )
+        browser = bs.launch_stealth_chromium(playwright, headless=True, logger=logger)
+        context = bs.new_stealth_context(browser)
         page = context.new_page()
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
@@ -290,6 +274,7 @@ def fetch_avg_sold_price(
                 logger.debug("Mercari sold: item selector timed out, trying JS scroll")
                 page.evaluate("window.scrollTo(0, 300)")
                 page.wait_for_timeout(2000)
+            bs.humanize(page)
             html = page.content()
         finally:
             context.close()
@@ -409,13 +394,7 @@ def fetch_item_detail_price(item_id: str, *, timeout: float = 15.0) -> int | Non
     if remaining > 0:
         logger.warning("Mercari detail fetch short-circuited (host rate-limited %.0fs) item=%s", remaining, item_id)
         return None
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": _USER_AGENT,
-            "Accept-Language": "ja-JP,ja;q=0.9",
-        },
-    )
+    req = urllib.request.Request(url, headers=bs.http_headers())
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             if resp.status != 200:
@@ -482,25 +461,6 @@ def _verify_candidates_via_detail_pages(
 
 
 # ── Relevance filter ──────────────────────────────────────────────────────────
-
-def _chromium_launch_options() -> dict[str, object]:
-    options: dict[str, object] = {"headless": True}
-    executable_path = _resolve_chromium_executable()
-    if executable_path:
-        options["executable_path"] = executable_path
-    return options
-
-
-def _resolve_chromium_executable() -> str | None:
-    configured = os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH")
-    if configured:
-        return configured
-    for candidate in ("chromium", "chromium-browser", "google-chrome-stable"):
-        resolved = shutil.which(candidate)
-        if resolved:
-            return resolved
-    return None
-
 
 def _normalise(text: str) -> str:
     return (

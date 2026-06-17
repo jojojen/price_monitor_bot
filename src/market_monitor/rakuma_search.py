@@ -27,6 +27,7 @@ from urllib.parse import quote
 
 from bs4 import BeautifulSoup
 
+from . import browser_stealth as bs
 from .http import host_cooldown_remaining, note_http_error, note_http_success
 from .marketplace_search import MarketplaceListing
 
@@ -34,12 +35,6 @@ logger = logging.getLogger(__name__)
 
 RAKUMA_SEARCH_BASE = "https://fril.jp/s"
 RAKUMA_ITEM_PATH_PREFIX = "/item/"
-
-_USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
 
 _PRICE_RE = re.compile(r"(\d[\d,]*)")
 # Rakuma item URLs look like https://fril.jp/<slug>/item/<id> OR
@@ -70,7 +65,7 @@ def _fetch_html(url: str, *, timeout_seconds: float) -> str | None:
     if remaining > 0:
         logger.warning("Rakuma fetch short-circuited (host rate-limited %.0fs) url=%s", remaining, url)
         return None
-    request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
+    request = urllib.request.Request(url, headers=bs.http_headers())
     try:
         with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
             charset = response.headers.get_content_charset() or "utf-8"
