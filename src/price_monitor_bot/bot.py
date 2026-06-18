@@ -579,7 +579,7 @@ def _describe_photo_analysis_context(*, parsed_game: str | None, parsed_item_kin
     if parsed_game:
         item_label = "卡盒" if parsed_item_kind == "sealed_box" else "卡片"
         return f"我先看了一下，這張圖看起來比較像「{_display_game_name(parsed_game)}{item_label}」，但我還不想先亂猜你的意圖。"
-    return "我先看了一下這張圖，但我還不想先亂猜你的意圖。"
+    return "請選擇你想要我對這張圖做什麼："
 
 
 def _display_game_name(game: str) -> str:
