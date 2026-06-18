@@ -257,6 +257,25 @@ def test_reference_band_combines_buy_and_in_stock_sell() -> None:
         assert kwargs.get("curl_fallback") is False
 
 
+def test_reference_band_carries_matched_titles() -> None:
+    sell_page = _make_page(
+        _make_card_with_stock(title="リザードンex SAR 200/165", price="¥9,800", href="/card/poc/sv08/2", zaiko_text="3 点")
+        + _make_card_with_stock(title="Sell OOS", price="¥59,800", href="/card/poc/sv08/9", zaiko_text="×")
+    )
+    buy_page = _make_page(
+        _make_card(title="買取タイトル B", price="¥6,000", href="/card/poc/sv08/3")
+    )
+    mock_http = MagicMock()
+    mock_http.get_text.side_effect = [sell_page, buy_page]
+
+    client = YuyuteiMarketplaceSearchClient(http_client=mock_http)
+    band = client.reference_band("test card", price_max=99999, source_options={"game_code": "poc"})
+
+    assert band is not None
+    # Verbatim titles carried for cache enrichment; in-stock sell first, OOS excluded.
+    assert band.sample_titles == ("リザードンex SAR 200/165", "買取タイトル B")
+
+
 def test_reference_band_exposes_min_max_ranges() -> None:
     sell_page = _make_page(
         _make_card_with_stock(title="Sell Lo", price="¥75,000", href="/card/poc/sv08/1", zaiko_text="3 点")

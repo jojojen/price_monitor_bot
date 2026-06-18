@@ -179,6 +179,10 @@ class YuyuteiReferenceBand:
     sell_prices: tuple[int, ...]
     sell_stock_total: int
     sample_urls: tuple[str, ...]
+    # Verbatim matched-listing titles (e.g. "リザードンex SAR 200/165"). They carry
+    # the card number / rarity / set / box name already fetched on this band, so a
+    # caller can record the item's real identity without any extra request.
+    sample_titles: tuple[str, ...] = ()
 
     @property
     def has_data(self) -> bool:
@@ -363,10 +367,24 @@ class YuyuteiMarketplaceSearchClient:
             h["url"] for h in (*buy[:1], *sell[:1]) if h.get("url")
         )
         stock_total = sum(h["stock_count"] for h in sell if h.get("stock_count"))
+        # Carry a few verbatim matched titles (sell/在庫あり first — the purchasable
+        # side — then buy) so a caller can record the item's real identity. Deduped
+        # and capped; this is already-parsed data, no extra request.
+        seen_titles: set[str] = set()
+        sample_titles: list[str] = []
+        for h in (*sell, *buy):
+            title = (h.get("title") or "").strip()
+            if not title or title in seen_titles:
+                continue
+            seen_titles.add(title)
+            sample_titles.append(title)
+            if len(sample_titles) >= 8:
+                break
         return YuyuteiReferenceBand(
             game_code=code,
             buy_prices=tuple(h["price_jpy"] for h in buy),
             sell_prices=tuple(h["price_jpy"] for h in sell),
             sell_stock_total=stock_total,
             sample_urls=sample_urls,
+            sample_titles=tuple(sample_titles),
         )
