@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import logging
+import os
 import random
+import re
 import socket
 import shutil
 import ssl
 import subprocess
+import tempfile
 import threading
 import time
+from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
@@ -26,15 +30,27 @@ _HTTP_MAX_RETRIES = 2
 _HTTP_RETRY_BASE_SEC = 1.5
 _HTTP_RETRY_AFTER_CAP_SEC = 30.0
 
-# ── Per-host circuit breaker ──────────────────────────────────────────────────
-# Once a host answers 429 (rate limited), every crawler sharing this process
-# short-circuits further requests to that host for a cooldown window instead of
-# continuing to poke it. Hammering a host that is already limiting you only
-# prolongs the IP cooldown; backing off lets it clear. State is process-global
-# (keyed by host) and shared across all HttpClient instances on purpose.
+# ── Per-host circuit breaker (cross-process) ──────────────────────────────────
+# Once a host answers 429 (rate limited), every crawler short-circuits further
+# requests to that host for a cooldown window instead of continuing to poke it.
+# Hammering a host that is already limiting you only prolongs the IP cooldown;
+# backing off lets it clear.
+#
+# The cooldown is shared TWO ways: in-process (a monotonic deadline per host,
+# across all HttpClient instances) AND cross-process (a wall-clock expiry written
+# to a tempdir marker file per host). OpenClaw runs several independent processes
+# on one machine — the opportunity-agent, the Telegram /research worker, scrape
+# subprocesses — each with its own memory. A monotonic deadline can't be shared
+# across processes (the clock origins differ), so the file carries a wall-clock
+# expiry that any peer process reads before it fires its own request. This is the
+# fix for the yuyu-tei rate-limit amplification: a background 429 now makes the
+# foreground /research back off instead of discovering the limit the hard way.
 _HOST_COOLDOWN_SEC = 300.0
 _circuit_lock = threading.Lock()
 _host_open_until: dict[str, float] = {}
+# Marker files this process has written, so reset_circuit_breaker() can clean up
+# after tests without disturbing cooldowns owned by other live processes.
+_circuit_files_written: set[str] = set()
 
 
 class HostRateLimitedError(Exception):
@@ -50,12 +66,49 @@ def _host_of(target: str) -> str:
     return (urlparse(target).hostname or target).lower()
 
 
+def _circuit_file_path(host: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", host) or "unknown"
+    return Path(tempfile.gettempdir()) / f"openclaw_circuit_{safe}"
+
+
+def _read_file_cooldown(host: str) -> float:
+    """Seconds left on this host's cross-process marker (0.0 if none/expired)."""
+    path = _circuit_file_path(host)
+    try:
+        raw = path.read_text().strip()
+    except OSError:
+        return 0.0
+    try:
+        expiry = float(raw)
+    except ValueError:
+        # Legacy/empty marker (older code touched the file): treat mtime as the
+        # start of a default-length window so a stale signal still backs us off.
+        try:
+            expiry = path.stat().st_mtime + _HOST_COOLDOWN_SEC
+        except OSError:
+            return 0.0
+    return max(0.0, expiry - time.time())
+
+
+def _write_file_cooldown(host: str, cooldown_seconds: float) -> None:
+    """Persist a wall-clock expiry so peer processes back off too. Never shortens
+    a longer cooldown another process already wrote (bias toward backing off)."""
+    path = _circuit_file_path(host)
+    if _read_file_cooldown(host) >= cooldown_seconds:
+        _circuit_files_written.add(str(path))
+        return
+    try:
+        path.write_text(str(time.time() + cooldown_seconds))
+        _circuit_files_written.add(str(path))
+    except OSError:
+        pass
+
+
 def _circuit_remaining(host: str) -> float:
     with _circuit_lock:
         until = _host_open_until.get(host)
-    if until is None:
-        return 0.0
-    return max(0.0, until - time.monotonic())
+    in_process = max(0.0, until - time.monotonic()) if until is not None else 0.0
+    return max(in_process, _read_file_cooldown(host))
 
 
 def _trip_circuit(host: str, cooldown_seconds: float) -> None:
@@ -63,21 +116,40 @@ def _trip_circuit(host: str, cooldown_seconds: float) -> None:
     with _circuit_lock:
         if until > _host_open_until.get(host, 0.0):
             _host_open_until[host] = until
+    _write_file_cooldown(host, cooldown_seconds)
     logger.warning(
-        "HTTP circuit OPEN host=%s cooldown=%.0fs — skipping further requests until it clears",
+        "HTTP circuit OPEN host=%s cooldown=%.0fs (persisted cross-process) — "
+        "skipping further requests until it clears",
         host, cooldown_seconds,
     )
 
 
 def _clear_circuit(host: str) -> None:
+    # Only clears the in-process deadline. The cross-process marker is left to
+    # expire on its own: a single success here must not wipe a backoff a peer
+    # process set from a 429, or we'd start amplifying the rate limit again.
     with _circuit_lock:
         _host_open_until.pop(host, None)
 
 
+def trip_host_cooldown(url: str, cooldown_seconds: float | None = None) -> None:
+    """Open a host's circuit from outside ``HttpClient`` — e.g. a scrape
+    subprocess that received a 429 through a different fetch path — persisting it
+    cross-process so peer processes (the foreground /research worker) back off."""
+    _trip_circuit(_host_of(url), cooldown_seconds or _HOST_COOLDOWN_SEC)
+
+
 def reset_circuit_breaker() -> None:
-    """Clear all open circuits (test/maintenance helper)."""
+    """Clear all open circuits (test/maintenance helper). Removes only marker
+    files this process wrote, leaving peer-owned cooldowns intact."""
     with _circuit_lock:
         _host_open_until.clear()
+    for marker in list(_circuit_files_written):
+        try:
+            os.unlink(marker)
+        except OSError:
+            pass
+    _circuit_files_written.clear()
 
 
 # Public helpers for call sites that fetch with their own ``urlopen`` (Mercari /

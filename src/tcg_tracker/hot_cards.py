@@ -42,6 +42,12 @@ SOCIAL_QUERY_CANDIDATE_LIMIT = 4
 SOCIAL_CACHE_TTL_SECONDS = 15 * 60
 BUY_SIGNAL_CANDIDATE_LIMIT = 24
 BUY_SIGNAL_CACHE_TTL_SECONDS = 30 * 60
+# Each buy-signal lookup hits yuyu-tei several times (sell+buy per search term).
+# A wide pool fires dozens of concurrent requests before the first 429 can trip
+# the shared per-host circuit breaker, which is exactly what gets the IP limited.
+# Keep concurrency low so an early 429 opens the circuit and the remaining
+# lookups short-circuit instead of piling on.
+BUY_SIGNAL_LOOKUP_WORKERS = 3
 
 CARDRUSH_BROWSER_HEADERS = {
     "User-Agent": bs.MAC_CHROME_UA,
@@ -452,7 +458,7 @@ class TcgHotCardService:
                 logger.warning("Buy signal parallel lookup failed title=%s error=%s", best_item.title, exc)
                 aggregate["buy_signal"] = None
 
-        with ThreadPoolExecutor(max_workers=10) as executor:
+        with ThreadPoolExecutor(max_workers=BUY_SIGNAL_LOOKUP_WORKERS) as executor:
             list(executor.map(_fetch_buy_signal, ranked))
 
         ranked = [
