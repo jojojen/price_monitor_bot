@@ -455,12 +455,20 @@ def default_fair_value_fn() -> FairValueFn:
 def default_marketplace_clients() -> dict[str, MarketplaceSearchClient]:
     """The standard set of clients shipped with the bot. Future sources are
     added here so callers don't need to know which clients exist."""
+    from market_monitor.host_budget import (
+        PRIORITY_BACKGROUND_ENRICHMENT,
+        REQUESTER_HOT_CARDS,
+    )
     from market_monitor.rakuma_search import RakumaSearchClient
     from market_monitor.yuyutei_search import YuyuteiMarketplaceSearchClient
     return {
         "mercari": MercariSearchClient(),
         "rakuma": RakumaSearchClient(),
-        "yuyutei": YuyuteiMarketplaceSearchClient(),
+        # Watch/hot-card monitoring is background work — tag it so diagnostics
+        # attribute its requests correctly and manual /research outranks it.
+        "yuyutei": YuyuteiMarketplaceSearchClient(
+            requester=REQUESTER_HOT_CARDS, priority=PRIORITY_BACKGROUND_ENRICHMENT,
+        ),
     }
 
 

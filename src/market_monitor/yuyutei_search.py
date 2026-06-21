@@ -248,6 +248,10 @@ class YuyuteiMarketplaceSearchClient:
         # of background enrichment.
         self._requester = requester
         self._priority = priority
+        # Set when the last fetch was declined by the shared host budget BEFORE
+        # any network call (cooldown / concurrency). Lets callers distinguish a
+        # pre-network skip from a genuine "no data" empty result (#24/#25 D5).
+        self.last_budget_skip: HostRateLimitedError | None = None
 
     def search(
         self,
@@ -258,6 +262,7 @@ class YuyuteiMarketplaceSearchClient:
         timeout_ms: int = 30_000,
         source_options: Mapping[str, Any] | None = None,
     ) -> list[MarketplaceListing]:
+        self.last_budget_skip = None
         if not query.strip() or price_max <= 0:
             return []
 
@@ -297,6 +302,7 @@ class YuyuteiMarketplaceSearchClient:
                     "YuyuteiMarketplaceSearchClient: budget skip code=%s decision=%s reason=%s",
                     code, exc.decision, exc.reason,
                 )
+                self.last_budget_skip = exc
                 continue
             except Exception:
                 logger.warning("YuyuteiMarketplaceSearchClient: HTTP failed code=%s url=%s", code, url)
@@ -347,6 +353,7 @@ class YuyuteiMarketplaceSearchClient:
                 "Yuyutei reference band: budget skip decision=%s reason=%s",
                 exc.decision, exc.reason,
             )
+            self.last_budget_skip = exc
             return []
         except Exception:
             logger.warning("Yuyutei reference band: HTTP failed url=%s", url)
@@ -369,6 +376,7 @@ class YuyuteiMarketplaceSearchClient:
         neither side yields data. Both fetches are fail-fast and protected by
         the shared per-host circuit breaker, so a 429 on the first short-circuits
         the second instead of amplifying the cooldown."""
+        self.last_budget_skip = None
         if not query.strip() or price_max <= 0:
             return None
         code = self._resolve_single_code(query, source_options)

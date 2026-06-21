@@ -321,6 +321,16 @@ class HttpClient:
             assert last_exc is not None
             if not curl_fallback:
                 raise last_exc
+            # host cooldown > everything: if this error just opened the host's
+            # cooldown (e.g. a live 429), do NOT amplify with a curl re-fetch —
+            # one 429 must not spawn another request to a host we've decided is
+            # rate-limited (#24/#25 review).
+            if _circuit_remaining(host) > 0:
+                logger.warning(
+                    "HTTP GET host=%s cooldown open after error — skipping curl fallback (no amplification)",
+                    host,
+                )
+                raise last_exc
             if isinstance(last_exc, HTTPError):
                 logger.warning("HTTP GET failed target=%s status=%s; trying curl fallback", target, last_exc.code)
             elif isinstance(last_exc, URLError):
@@ -409,6 +419,13 @@ class HttpClient:
                     time.sleep(delay)
 
             assert last_exc is not None
+            # host cooldown > everything: don't amplify a 429 with a curl re-fetch.
+            if _circuit_remaining(host) > 0:
+                logger.warning(
+                    "HTTP GET (bytes) host=%s cooldown open after error — skipping curl fallback (no amplification)",
+                    host,
+                )
+                raise last_exc
             if isinstance(last_exc, HTTPError):
                 logger.warning("HTTP GET (bytes) failed target=%s status=%s; trying curl fallback", target, last_exc.code)
             else:
