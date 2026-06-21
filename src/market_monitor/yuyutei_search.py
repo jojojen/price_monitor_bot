@@ -22,7 +22,8 @@ from urllib.parse import urljoin, urlparse, urlencode
 
 from bs4 import BeautifulSoup
 
-from .http import HttpClient
+from .host_budget import DEFAULT_PRIORITY, REQUESTER_RESEARCH
+from .http import HostRateLimitedError, HttpClient
 from .marketplace_search import MarketplaceListing
 
 logger = logging.getLogger(__name__)
@@ -235,9 +236,18 @@ class YuyuteiMarketplaceSearchClient:
         self,
         http_client: HttpClient | None = None,
         game_codes: tuple[str, ...] | None = None,
+        *,
+        requester: str = REQUESTER_RESEARCH,
+        priority: str = DEFAULT_PRIORITY,
     ) -> None:
         self._http = http_client or HttpClient()
         self._game_codes = game_codes
+        # Host-budget identity (#24). Defaults to the lowest (background)
+        # priority; the /research command constructs this client with the manual
+        # priority so user-driven lookups can claim Yuyutei's single slot ahead
+        # of background enrichment.
+        self._requester = requester
+        self._priority = priority
 
     def search(
         self,
@@ -278,7 +288,16 @@ class YuyuteiMarketplaceSearchClient:
                 # amplified into extra requests that prolong the IP cooldown.
                 html = self._http.get_text(
                     url, timeout_seconds=timeout_ms / 1000.0, retries=1, curl_fallback=False,
+                    requester=self._requester, priority=self._priority,
                 )
+            except HostRateLimitedError as exc:
+                # Pre-network budget skip (cooldown / concurrency) — distinct from
+                # a live 429, so the cause is legible in logs (#25 D5).
+                logger.warning(
+                    "YuyuteiMarketplaceSearchClient: budget skip code=%s decision=%s reason=%s",
+                    code, exc.decision, exc.reason,
+                )
+                continue
             except Exception:
                 logger.warning("YuyuteiMarketplaceSearchClient: HTTP failed code=%s url=%s", code, url)
                 continue
@@ -321,7 +340,14 @@ class YuyuteiMarketplaceSearchClient:
             # breaker — same rate-limit discipline as the sell search.
             html = self._http.get_text(
                 url, timeout_seconds=timeout_ms / 1000.0, retries=1, curl_fallback=False,
+                requester=self._requester, priority=self._priority,
             )
+        except HostRateLimitedError as exc:
+            logger.warning(
+                "Yuyutei reference band: budget skip decision=%s reason=%s",
+                exc.decision, exc.reason,
+            )
+            return []
         except Exception:
             logger.warning("Yuyutei reference band: HTTP failed url=%s", url)
             return []
