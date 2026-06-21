@@ -48,10 +48,15 @@ def build_list_view(
     mode: str,
     list_title: str,
     empty_message: str,
+    read_mode_row_buttons: bool = False,
 ) -> tuple[str, dict[str, object] | None, int]:
     """Render a paginated list view. Returns ``(text, reply_markup, clamped_page)``.
 
     ``clamped_page`` is ``page`` snapped into ``[0, total_pages)``.
+
+    When ``read_mode_row_buttons`` is set, each visible row's ``extra_buttons``
+    (and its ``label_button``, if any) are also emitted in read mode — used by
+    views that want a per-row action (e.g. ▶️ play) without entering edit mode.
     """
     if not items:
         return empty_message, None, 0
@@ -78,6 +83,12 @@ def build_list_view(
             }]
             row_buttons.extend(row.extra_buttons)
             keyboard.append(row_buttons)
+    elif read_mode_row_buttons:
+        for row in visible:
+            if row.label_button is not None:
+                keyboard.append([row.label_button])
+            if row.extra_buttons:
+                keyboard.append(list(row.extra_buttons))
 
     nav: list[dict[str, object]] = []
     if clamped > 0:
