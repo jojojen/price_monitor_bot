@@ -228,7 +228,7 @@ def test_lookup_continues_when_one_source_times_out(tmp_path, caplog) -> None:
 
     assert len(result.offers) == 1
     assert result.offers[0].source == "cardrush_pokemon"
-    assert "Source client timed out" in caplog.text
+    assert "Source client transient failure" in caplog.text
     assert "Traceback" not in caplog.text
 
 

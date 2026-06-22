@@ -15,6 +15,7 @@ import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from .log_utils import log_network_failure
 from .official_store_base import (
     COMING_SOON,
     LOTTERY_OPEN,
@@ -70,8 +71,8 @@ class BandaiOnepiecePreorderCrawler:
             try:
                 listings = self._fetch_page(url, timeout_seconds=timeout_seconds)
                 results.extend(listings)
-            except Exception:
-                logger.exception("BandaiOnepiecePreorderCrawler: failed url=%s", url)
+            except Exception as exc:
+                log_network_failure(logger, exc, "BandaiOnepiecePreorderCrawler: failed url=%s", url)
         seen: set[str] = set()
         deduped = []
         for r in results:

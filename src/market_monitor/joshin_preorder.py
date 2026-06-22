@@ -16,6 +16,7 @@ import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from .log_utils import log_network_failure
 from .official_store_base import (
     LOTTERY_OPEN,
     PREORDER_OPEN,
@@ -64,8 +65,8 @@ class JoshinPreorderCrawler:
             try:
                 listings = self._fetch_page(url, timeout_seconds=timeout_seconds)
                 results.extend(listings)
-            except Exception:
-                logger.exception("JoshinPreorderCrawler: failed to fetch url=%s", url)
+            except Exception as exc:
+                log_network_failure(logger, exc, "JoshinPreorderCrawler: failed to fetch url=%s", url)
         seen: set[str] = set()
         deduped = []
         for item in results:

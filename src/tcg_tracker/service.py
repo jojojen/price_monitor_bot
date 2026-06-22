@@ -11,6 +11,7 @@ from typing import Protocol
 
 from market_monitor import browser_stealth as bs
 from market_monitor.http import HttpClient
+from market_monitor.log_utils import is_transient_network_error
 from market_monitor.normalize import normalize_card_number, normalize_text
 from market_monitor.models import DomainTrust, FairValueEstimate, MarketOffer, TrackedItem, WatchRule
 from market_monitor.pricing import FairValueCalculator
@@ -205,7 +206,8 @@ class TcgPriceService:
             except _TRANSIENT_SOURCE_EXCEPTIONS as exc:
                 return client_name, None, ("transient", exc, time.perf_counter() - start)
             except Exception as exc:
-                return client_name, None, ("fatal", exc, time.perf_counter() - start)
+                kind = "transient" if is_transient_network_error(exc) else "fatal"
+                return client_name, None, (kind, exc, time.perf_counter() - start)
             elapsed = time.perf_counter() - start
             logger.info(
                 "Source client done client=%s title=%s elapsed=%.3fs count=%d",
@@ -232,7 +234,7 @@ class TcgPriceService:
                 kind, exc, elapsed = err
                 if kind == "transient":
                     logger.warning(
-                        "Source client timed out client=%s title=%s elapsed=%.3fs error=%s",
+                        "Source client transient failure client=%s title=%s elapsed=%.3fs error=%s",
                         client_name, spec.title, elapsed, exc,
                     )
                 else:

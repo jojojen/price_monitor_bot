@@ -22,6 +22,7 @@ import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from .log_utils import log_network_failure
 from .official_store_base import (
     PREORDER_OPEN,
     STATUS_UNKNOWN,
@@ -70,12 +71,12 @@ class AmiAmiPreorderCrawler:
     def fetch_listings(self, *, timeout_seconds: int = 30) -> list[OfficialStoreListing]:
         try:
             return self._fetch_api(timeout_seconds=timeout_seconds)
-        except Exception:
-            logger.exception("AmiAmiPreorderCrawler: API failed, trying HTML fallback")
+        except Exception as exc:
+            log_network_failure(logger, exc, "AmiAmiPreorderCrawler: API failed, trying HTML fallback")
         try:
             return self._fetch_html(timeout_seconds=timeout_seconds)
-        except Exception:
-            logger.exception("AmiAmiPreorderCrawler: HTML fallback also failed")
+        except Exception as exc:
+            log_network_failure(logger, exc, "AmiAmiPreorderCrawler: HTML fallback also failed")
         return []
 
     def _fetch_api(self, *, timeout_seconds: int) -> list[OfficialStoreListing]:

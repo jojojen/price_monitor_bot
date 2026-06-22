@@ -16,6 +16,7 @@ import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from .log_utils import log_network_failure
 from .official_store_base import (
     OfficialStoreListing,
     _build_jst_iso,
@@ -59,8 +60,8 @@ class YodobashiPreorderCrawler:
             try:
                 listings = self._fetch_page(url, timeout_seconds=timeout_seconds)
                 results.extend(listings)
-            except Exception:
-                logger.exception("YodobashiPreorderCrawler: failed url=%s", url)
+            except Exception as exc:
+                log_network_failure(logger, exc, "YodobashiPreorderCrawler: failed url=%s", url)
         seen: set[str] = set()
         deduped = [r for r in results if not (seen.add(r.item_key) or r.item_key in seen - {r.item_key})]
         logger.info("YodobashiPreorderCrawler: fetched listings=%d", len(deduped))
