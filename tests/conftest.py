@@ -29,6 +29,7 @@ from pathlib import Path
 
 import pytest
 
+from market_monitor.host_budget import reset_host_budget
 from market_monitor.models import CardImageFingerprint, utc_now
 from market_monitor.storage import MonitorDatabase
 from tcg_tracker.image_fingerprint import DEFAULT_ALGO, compute_dhash
@@ -104,3 +105,19 @@ def regression_db_path(tmp_path_factory) -> Path:
 @pytest.fixture(scope="session", autouse=True)
 def _wire_regression_db_path(regression_db_path: Path) -> None:
     os.environ.setdefault("OPENCLAW_REGRESSION_DB_PATH", str(regression_db_path))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_host_budget_db(tmp_path, monkeypatch):
+    """Point the #24 host-budget store at a throwaway per-test SQLite file.
+
+    Without this, tests open the shared default `/tmp/openclaw_host_budget.sqlite3`
+    that the live stack writes to — a stale cooldown row there can short-circuit
+    requests before they reach a test's stubbed network (flaky failures), and
+    tests can pollute the live host's budget state. Isolating per test keeps the
+    circuit-breaker / budget behaviour hermetic in both directions.
+    """
+    monkeypatch.setenv("OPENCLAW_HOST_BUDGET_DB", str(tmp_path / "host_budget.sqlite3"))
+    reset_host_budget()
+    yield
+    reset_host_budget()
