@@ -245,7 +245,8 @@ def test_reference_band_combines_buy_and_in_stock_sell() -> None:
     band = client.reference_band("test card", price_max=99999, source_options={"game_code": "poc"})
 
     assert isinstance(band, YuyuteiReferenceBand)
-    assert band.sell_prices == (9800,)            # OOS sell excluded
+    assert band.sell_prices == (9800,)            # in-stock 販売
+    assert band.oos_sell_prices == (59800,)       # 在庫× retained as weak upper bound (#41)
     assert set(band.buy_prices) == {6000, 8000}
     assert band.sell_stock_total == 3
     assert band.buy_reference == 7000             # median(6000, 8000)
@@ -255,6 +256,37 @@ def test_reference_band_combines_buy_and_in_stock_sell() -> None:
     for _, kwargs in mock_http.get_text.call_args_list:
         assert kwargs.get("retries") == 1
         assert kwargs.get("curl_fallback") is False
+
+
+def test_reference_band_keeps_out_of_stock_raw_sell_as_weak_upper_bound() -> None:
+    # #41 regression: the user's real card (yuyu-tei.jp/sell/ws/card/pjs2.0/10208)
+    # is 販売 14,800円 but 在庫×. Previously the only raw signal was dropped and the
+    # band reported "rate-limited / no data". Now the 在庫× sell price is retained as
+    # a weak upper bound (oos_sell_prices) alongside the 買取 lower bound.
+    sell_page = _make_page(
+        _make_card_with_stock(
+            title="SSP 風に舞う花びらの中で 初音ミク(サイン入り)",
+            price="¥14,800",
+            href="/card/ws/pjs2.0/10208",
+            zaiko_text="×",
+        )
+    )
+    buy_page = _make_page(
+        _make_card(title="買取 風に舞う花びらの中で 初音ミク", price="¥9,000", href="/card/ws/pjs2.0/10208")
+    )
+    mock_http = MagicMock()
+    mock_http.get_text.side_effect = [sell_page, buy_page]
+
+    client = YuyuteiMarketplaceSearchClient(http_client=mock_http)
+    band = client.reference_band("風に舞う花びらの中で 初音ミク", price_max=99999, source_options={"game_code": "ws"})
+
+    assert band is not None
+    assert band.sell_prices == ()                 # nothing purchasable now
+    assert band.oos_sell_prices == (14800,)       # 在庫× retained as weak upper bound
+    assert band.oos_sell_max == 14800
+    assert band.buy_prices == (9000,)
+    assert band.sell_stock_total == 0
+    assert band.has_data is True
 
 
 def test_reference_band_carries_matched_titles() -> None:
@@ -272,8 +304,9 @@ def test_reference_band_carries_matched_titles() -> None:
     band = client.reference_band("test card", price_max=99999, source_options={"game_code": "poc"})
 
     assert band is not None
-    # Verbatim titles carried for cache enrichment; in-stock sell first, OOS excluded.
-    assert band.sample_titles == ("リザードンex SAR 200/165", "買取タイトル B")
+    # Verbatim titles carried for cache enrichment; sell-side first (in-stock then
+    # 在庫×), then buy. The 在庫× card is now retained (#41).
+    assert band.sample_titles == ("リザードンex SAR 200/165", "Sell OOS", "買取タイトル B")
 
 
 def test_reference_band_exposes_min_max_ranges() -> None:
