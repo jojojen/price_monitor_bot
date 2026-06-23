@@ -25,10 +25,11 @@ from urllib.parse import quote
 from market_monitor.http import HttpClient
 
 from .sealed_box_filters import looks_like_sealed_box_listing
+from .snkrdunk import SNKRDUNK_BASE_URL, iter_snkrdunk_search_tiles
 
 logger = logging.getLogger(__name__)
 
-SNKRDUNK_SEARCH_URL = "https://snkrdunk.com/search"
+SNKRDUNK_SEARCH_URL = f"{SNKRDUNK_BASE_URL}/search"
 
 # Search keyword per game. Snkrdunk's index is broad — these umbrella terms
 # surface the actually-trending products at the top of search results.
@@ -38,15 +39,6 @@ _GAME_SEED_QUERIES: dict[str, str] = {
     "union_arena": "ユニオンアリーナ",
     "yugioh": "遊戯王",
 }
-
-_PRODUCT_TILE_RE = re.compile(
-    r'<a[^>]+href="(?P<href>(?:https?://snkrdunk\.com)?/apparels/\d+)"[^>]*'
-    r'aria-label="(?P<aria>[^"]+)"[^>]*>.*?'
-    r'<img[^>]+src="(?P<img>https://cdn\.snkrdunk\.com/[^"]+)"',
-    re.IGNORECASE | re.DOTALL,
-)
-_ARIA_PRICE_RE = re.compile(r"^(.+?)\s*-\s*¥\s*([\d,]+)\s*$")
-
 
 @dataclass(frozen=True, slots=True)
 class RankedProduct:
@@ -81,34 +73,22 @@ def iter_ranked_products(
         return []
 
     products: list[RankedProduct] = []
-    for idx, m in enumerate(_PRODUCT_TILE_RE.finditer(html), start=1):
-        href = m.group("href")
-        aria = m.group("aria")
-        img = m.group("img")
-        product_url = href if href.startswith("http") else f"https://snkrdunk.com{href}"
-        aria_match = _ARIA_PRICE_RE.match(aria.strip())
-        if aria_match is None:
+    for tile in iter_snkrdunk_search_tiles(html):
+        if tile.image_url is None:
             continue
-        title = aria_match.group(1).strip()
-        price_str = aria_match.group(2).replace(",", "")
-        try:
-            price = int(price_str)
-        except ValueError:
-            continue
-        if price <= 0:
-            continue
+        rank = len(products) + 1
         # Bump image to higher resolution — the search HTML defaults to "size=m"
         # for layout density; "size=l" gives us better pixels for hashing.
-        image_url = re.sub(r"\?size=\w+", f"?size={image_size}", img)
-        item_kind = "sealed_box" if looks_like_sealed_box_listing(title) else "card"
+        image_url = re.sub(r"\?size=\w+", f"?size={image_size}", tile.image_url)
+        item_kind = "sealed_box" if looks_like_sealed_box_listing(tile.title) else "card"
         products.append(
             RankedProduct(
-                title=title,
-                product_url=product_url,
+                title=tile.title,
+                product_url=tile.url,
                 image_url=image_url,
-                price_jpy=price,
+                price_jpy=tile.price_jpy,
                 item_kind=item_kind,
-                rank=idx,
+                rank=rank,
             )
         )
         if len(products) >= limit:

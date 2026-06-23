@@ -12,6 +12,8 @@ from tcg_tracker.cardrush import (
 from tcg_tracker.catalog import TcgCardSpec
 from tcg_tracker.magi import MAGI_PRODUCT_SEARCH_URL, MagiProductClient
 from tcg_tracker.mercari_reference import MercariReferenceClient
+from tcg_tracker.snkrdunk import SNKRDUNK_SEARCH_URL, SnkrdunkClient
+from tcg_tracker.snkrdunk_ranking import iter_ranked_products
 from tcg_tracker.surugaya import SURUGAYA_SEARCH_URL, SurugayaClient
 from tcg_tracker.search_terms import build_lookup_terms
 
@@ -21,7 +23,15 @@ class FixtureHttpClient(HttpClient):
         self.responses = responses
         super().__init__(user_agent="fixture")
 
-    def get_text(self, url: str, *, params=None, encoding="utf-8", headers=None) -> str:  # type: ignore[override]
+    def get_text(  # type: ignore[override]
+        self,
+        url: str,
+        *,
+        params=None,
+        encoding="utf-8",
+        headers=None,
+        timeout_seconds=None,
+    ) -> str:
         target = url
         if params:
             query = urlencode(params, doseq=True)
@@ -37,9 +47,93 @@ class FailingHttpClient(HttpClient):
         self.calls = 0
         super().__init__(user_agent="fixture")
 
-    def get_text(self, url: str, *, params=None, encoding="utf-8", headers=None) -> str:  # type: ignore[override]
+    def get_text(  # type: ignore[override]
+        self,
+        url: str,
+        *,
+        params=None,
+        encoding="utf-8",
+        headers=None,
+        timeout_seconds=None,
+    ) -> str:
         self.calls += 1
         raise RuntimeError("blocked")
+
+
+def test_snkrdunk_parser_handles_reordered_attrs_and_entity_titles() -> None:
+    html = """
+    <section>
+      <a aria-label="白銀の観測者 &quot;SP&quot; [ABC 001/100] - ¥12,800"
+         data-track-card="primary"
+         class="hash_1 productTile"
+         href="https://snkrdunk.com/apparels/900001">
+        <img src="https://cdn.snkrdunk.com/upload_bg_removed/demo.webp?size=m"
+             alt="白銀の観測者 SP [ABC 001/100]">
+      </a>
+    </section>
+    """
+    offers = SnkrdunkClient()._parse_search_html(html)
+
+    assert len(offers) == 1
+    assert offers[0].source == "snkrdunk"
+    assert offers[0].listing_id == "900001"
+    assert offers[0].url == "https://snkrdunk.com/apparels/900001"
+    assert offers[0].title == '白銀の観測者 "SP" [ABC 001/100]'
+    assert offers[0].price_jpy == 12800
+    assert offers[0].attributes["image_url"] == "https://cdn.snkrdunk.com/upload_bg_removed/demo.webp?size=m"
+
+
+def test_snkrdunk_parser_falls_back_to_visible_tile_price() -> None:
+    html = """
+    <a class="styles_productTile"
+       href="/apparels/900002/used/777001"
+       aria-label="商品カード">
+      <span class="styles_productName">月影アーカイブ SAR [XYZ 077/100]</span>
+      <span class="styles_priceRow">
+        <span class="styles_priceYen">¥</span>
+        <span class="styles_productPrice">24,600</span>
+      </span>
+      <img alt="月影アーカイブ SAR [XYZ 077/100]"
+           src="https://cdn.snkrdunk.com/upload_bg_removed/demo-2.webp?size=m">
+    </a>
+    """
+    offers = SnkrdunkClient()._parse_search_html(html)
+
+    assert len(offers) == 1
+    assert offers[0].listing_id == "900002/used/777001"
+    assert offers[0].url == "https://snkrdunk.com/apparels/900002/used/777001"
+    assert offers[0].title == "月影アーカイブ SAR [XYZ 077/100]"
+    assert offers[0].price_jpy == 24600
+
+
+def test_snkrdunk_ranking_uses_shared_tile_parser() -> None:
+    html = """
+    <a class="styles_productTile"
+       href="/apparels/900003"
+       aria-label="星灯りコレクションボックス - ¥9,800">
+      <span class="styles_productName">星灯りコレクションボックス</span>
+      <span class="styles_priceRow">
+        <span class="styles_priceYen">¥</span>
+        <span class="styles_productPrice">9,800</span>
+      </span>
+      <img src="https://cdn.snkrdunk.com/upload_bg_removed/demo-3.webp?size=m"
+           alt="星灯りコレクションボックス">
+    </a>
+    """
+    url = f"{SNKRDUNK_SEARCH_URL}?keyword=%E3%83%9D%E3%82%B1%E3%83%A2%E3%83%B3%E3%82%AB%E3%83%BC%E3%83%89%E3%82%B2%E3%83%BC%E3%83%A0&category=apparels"
+    products = iter_ranked_products(
+        game="pokemon",
+        http_client=FixtureHttpClient({url: html}),
+        image_size="l",
+    )
+
+    assert len(products) == 1
+    assert products[0].title == "星灯りコレクションボックス"
+    assert products[0].price_jpy == 9800
+    assert products[0].product_url == "https://snkrdunk.com/apparels/900003"
+    assert products[0].image_url == "https://cdn.snkrdunk.com/upload_bg_removed/demo-3.webp?size=l"
+    assert products[0].item_kind == "sealed_box"
+    assert products[0].rank == 1
 
 
 def test_cardrush_lookup_matches_precise_pokemon_variant() -> None:
