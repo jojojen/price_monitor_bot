@@ -1877,32 +1877,23 @@ class TelegramCommandProcessor:
                 reply_factory=lambda h=handle, c=cid: self._command_registry["/snsclearfilter"].handler(h, c),
             )
 
-        if intent.intent == "create_workflow":
-            desc = intent.workflow_description
-            if not desc:
-                return TelegramTextReplyPlan(
-                    ack=None,
-                    reply="請告訴我要建立什麼 workflow，例如：建立一個每天查東京天氣的工作流",
-                )
-            spec = self._command_registry.get("/workflow")
-            if spec is None:
-                return TelegramTextReplyPlan(
-                    ack=None,
-                    reply="Workflow 功能未啟用（registry 未載入）。",
-                )
-            logger.info(
-                "Telegram NL routed intent=create_workflow desc=%s confidence=%s",
-                trim_for_log(desc, limit=160),
-                intent.confidence,
-            )
-            cid = str(chat_id)
-            return TelegramTextReplyPlan(
-                ack="⚙️ 已理解：正在用 AI 起草工作流程草稿…",
-                reply=None,
-                reply_factory=lambda d=desc, c=cid: spec.handler(f"create {d}", c),
-                run_in_background=True,
-            )
+        app_plan = self._build_app_natural_language_reply_plan(intent, chat_id=chat_id)
+        if app_plan is not None:
+            return app_plan
 
+        return None
+
+    def _build_app_natural_language_reply_plan(
+        self,
+        intent: "TelegramNaturalLanguageIntent",
+        *,
+        chat_id: str | int = "",
+    ) -> "TelegramTextReplyPlan | None":
+        """Override in application subclasses to handle app-specific NL intents.
+
+        Called after all base intents are checked.  Return a
+        ``TelegramTextReplyPlan`` to handle the intent, or ``None`` to fall
+        through to the base ``return None`` (unhandled)."""
         return None
 
     # _handle_sns_add / render_snslist_view / _handle_sns_delete /
