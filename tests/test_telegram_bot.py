@@ -3670,3 +3670,64 @@ def test_registry_callback_does_not_shadow_builtin_prefix() -> None:
 
     # noop silently acknowledges with no edit.
     assert client.edited_messages == []
+
+
+# --- #52 live catalog fallback: unknown_text_handler intercept ----------------
+
+def _catalog_processor(handler):
+    return TelegramCommandProcessor(
+        allowed_chat_ids=frozenset({"123"}),
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        unknown_text_handler=handler,
+    )
+
+
+def test_unknown_text_handler_reply_is_used() -> None:
+    called: list = []
+
+    def handler(text, chat_id):
+        called.append((text, chat_id))
+        return ("大阪 晴", {"inline_keyboard": [[{"text": "x", "callback_data": "y"}]]})
+
+    processor = _catalog_processor(handler)
+    plan = processor.build_reply_plan(chat_id="123", text="查大阪天氣")
+    assert plan.reply == "大阪 晴"
+    assert plan.reply_markup is not None
+    assert called == [("查大阪天氣", "123")]
+
+
+def test_unknown_text_handler_none_falls_through_to_default() -> None:
+    called: list = []
+
+    def handler(text, chat_id):
+        called.append(text)
+        return None
+
+    processor = _catalog_processor(handler)
+    plan = processor.build_reply_plan(chat_id="123", text="查大阪天氣")
+    # Handler was consulted, returned nothing → fall through to the generic
+    # clarification menu (or, absent candidates, the unknown-command reply).
+    assert called == ["查大阪天氣"]
+    assert plan.reply != "大阪 晴"
+    assert ("/search" in plan.reply) or ("Unknown command" in plan.reply)
+
+
+def test_unknown_text_handler_not_called_for_slash_commands() -> None:
+    called: list = []
+    processor = _catalog_processor(lambda text, chat_id: called.append(text) or ("x", None))
+    plan = processor.build_reply_plan(chat_id="123", text="/bogus")
+    assert "Unknown command" in plan.reply
+    assert called == []
+
+
+def test_unknown_text_handler_exception_falls_through() -> None:
+    def boom(text, chat_id):
+        raise RuntimeError("nope")
+
+    processor = _catalog_processor(boom)
+    plan = processor.build_reply_plan(chat_id="123", text="查大阪天氣")
+    # A throwing handler is swallowed; routing falls through to the menu.
+    assert plan.reply != "大阪 晴"
+    assert ("/search" in plan.reply) or ("Unknown command" in plan.reply)

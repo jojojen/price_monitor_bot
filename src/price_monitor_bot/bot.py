@@ -783,6 +783,7 @@ class TelegramCommandProcessor:
         view_handlers: "dict[str, Callable[..., tuple[str, dict | None, int]]] | None" = None,
         item_deleter_handlers: "dict[str, tuple[Callable[[str], bool], str]] | None" = None,
         watch_inbox: "object | None" = None,
+        unknown_text_handler: "Callable[[str, str], tuple[str, dict | None] | None] | None" = None,
     ) -> None:
         self._lookup_renderer = lookup_renderer
         self._board_loader = board_loader
@@ -802,6 +803,7 @@ class TelegramCommandProcessor:
         self._sns_buzz_fn = sns_buzz_fn
         self._collab_backfiller = collab_backfiller
         self._feedback_service = feedback_service
+        self._unknown_text_handler = unknown_text_handler
         self._command_registry: dict[str, RegisteredCommand] = command_handlers or {}
         self._callback_registry: dict[
             str, Callable[[str, str, str], tuple[object, str, object]]
@@ -1162,6 +1164,24 @@ class TelegramCommandProcessor:
         if not content.startswith("/"):
             intent = self._route_natural_language(content)
             if _is_text_intent_ambiguous(intent):
+                # Built-in routing didn't confidently match a command. Give the
+                # growing generated-tool catalog (#52 live integration) first
+                # crack BEFORE the generic "did you mean search/help"
+                # clarification menu. Its cheap lexical gate returns nothing for
+                # irrelevant chatter, so only text that plausibly maps to an
+                # existing tool is diverted; the handler reuses an existing tool,
+                # asks before reusing a fresh one, or offers to generate.
+                if self._unknown_text_handler is not None:
+                    try:
+                        handled = self._unknown_text_handler(content, str(chat_id))
+                    except Exception:
+                        logger.exception("unknown_text_handler failed")
+                        handled = None
+                    if handled is not None:
+                        reply, reply_markup = handled
+                        return TelegramTextReplyPlan(
+                            ack=None, reply=reply, reply_markup=reply_markup
+                        )
                 clarification_plan = self._build_text_clarification_plan(
                     chat_id=chat_id,
                     text=content,
@@ -2840,6 +2860,7 @@ def run_telegram_polling(
     view_handlers: "dict[str, Callable[..., tuple[str, dict | None, int]]] | None" = None,
     item_deleter_handlers: "dict[str, tuple[Callable[[str], bool], str]] | None" = None,
     watch_inbox: "object | None" = None,
+    unknown_text_handler: "Callable[[str, str], tuple[str, dict | None] | None] | None" = None,
     poll_timeout: int = 20,
     notify_startup: bool = False,
     drop_pending_updates: bool = True,
@@ -2887,6 +2908,7 @@ def run_telegram_polling(
         view_handlers=view_handlers,
         item_deleter_handlers=item_deleter_handlers,
         watch_inbox=watch_inbox,
+        unknown_text_handler=unknown_text_handler,
     )
     resolved_photo_renderer = photo_renderer or default_photo_renderer()
 
