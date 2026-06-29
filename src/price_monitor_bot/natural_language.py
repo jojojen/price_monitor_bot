@@ -71,12 +71,14 @@ _ROUTER_JSON_SCHEMA = {
                 {"type": "null"},
             ]
         },
+        # workflow creation (create_workflow)
+        "workflow_description": {"type": ["string", "null"]},
     },
     "required": [
         "intent", "game", "name", "card_number", "rarity", "set_code", "limit", "confidence",
         "watch_query", "watch_price_threshold", "watch_id", "watch_markets", "query_url", "research_query", "opportunity_target",
         "sns_handle", "sns_keyword", "sns_buzz_query", "sns_include_keywords", "sns_schedule_minutes",
-        "bulk_target_domain", "bulk_filter_keywords",
+        "bulk_target_domain", "bulk_filter_keywords", "workflow_description",
     ],
     "additionalProperties": False,
 }
@@ -372,6 +374,8 @@ class TelegramNaturalLanguageIntent:
     # SNS bulk filter update (sns_bulk_add_filter)
     bulk_target_domain: str | None = None      # e.g. "tcg" / "pokemon"
     bulk_filter_keywords: tuple[str, ...] = ()
+    # workflow creation (create_workflow)
+    workflow_description: str | None = None
 
 
 class TelegramNaturalLanguageRouter:
@@ -420,6 +424,7 @@ class TelegramNaturalLanguageRouter:
             "You route Telegram messages for a trading-card price assistant and must return only JSON.\n"
             "Allowed intents: lookup_card, trend_board, add_watch, list_watches, remove_watch, update_watch_price, reputation_snapshot, product_research, "
             "web_research, opportunity_remove, sns_add_account, sns_add_keyword, sns_list, sns_delete, sns_buzz, sns_bulk_add_filter, sns_bulk_remove_filter, sns_bulk_update_schedule, sns_clear_filter, "
+            "create_workflow, "
             "help, status, tools, scan_help, unknown.\n"
             + tool_spec_block +
             "Use lookup_card when the user wants the price, value, or card lookup of one specific card.\n"
@@ -476,6 +481,9 @@ class TelegramNaturalLanguageRouter:
             "an action like '加上/加入/改成', and a filter/keyword hint word).\n"
             "  Set bulk_target_domain to one of: tcg, pokemon, yugioh, ws, union_arena.\n"
             "  Set bulk_filter_keywords to the list of keywords to append (e.g. [\"抽選\"]).\n"
+            "Use create_workflow when the user wants to BUILD / CREATE / 建立 / 設定 a workflow / 工作流 / 自動化流程 / 例行任務.\n"
+            "  Set workflow_description to the full natural-language task description the user provided (verbatim or lightly cleaned).\n"
+            "  Signals: '建立 workflow', '建立一個...工作流', 'create a workflow', '幫我建立...流程', '自動化...任務'.\n"
             "Use help when the user asks what the bot can do.\n"
             "Use status when the user asks about current runtime state, models, or service health.\n"
             "Use tools when the user explicitly asks for the full tool catalog or list of available tools.\n"
@@ -554,6 +562,8 @@ class TelegramNaturalLanguageRouter:
             '- "把所有 pokemon 帳號 filter 裡的 抽選 移除" -> sns_bulk_remove_filter, bulk_target_domain="pokemon", bulk_filter_keywords=["抽選"]\n'
             '- "把 sns 監控規則裡 domain 有 tcg 的帳號 追蹤頻率都改成每 720 分鐘" -> sns_bulk_update_schedule, bulk_target_domain="tcg", sns_schedule_minutes=720\n'
             '- "所有 yugioh 帳號排程改成每 60 分鐘" -> sns_bulk_update_schedule, bulk_target_domain="yugioh", sns_schedule_minutes=60\n'
+            '- "建立一個 workflow：每天早上查東京天氣，用女僕口吻說日文進行報天氣跟早安問候，然後念出來" -> create_workflow, workflow_description="每天早上查東京天氣，用女僕口吻說日文進行報天氣跟早安問候，然後念出來"\n'
+            '- "幫我建立自動化流程：查東京天氣後以日文女僕口吻播報" -> create_workflow, workflow_description="查東京天氣後以日文女僕口吻播報"\n'
             '- "你會什麼" -> help\n'
             '- "你現在狀態如何" -> status\n'
             '- "列出所有工具" -> tools\n'
@@ -1069,6 +1079,7 @@ _ALLOWED_INTENTS = frozenset({
     "sns_add_account", "sns_add_keyword", "sns_list", "sns_delete", "sns_buzz",
     "sns_bulk_add_filter", "sns_bulk_remove_filter", "sns_bulk_update_schedule",
     "sns_clear_filter",
+    "create_workflow",
     "help", "status", "tools", "scan_help", "unknown",
 })
 
@@ -1099,6 +1110,7 @@ def _normalize_intent(payload: dict[str, object]) -> TelegramNaturalLanguageInte
     sns_schedule_minutes = _normalize_schedule_minutes(payload.get("sns_schedule_minutes"))
     bulk_target_domain = _normalize_bulk_target_domain(payload.get("bulk_target_domain"))
     bulk_filter_keywords = _normalize_sns_include_keywords(payload.get("bulk_filter_keywords"))
+    workflow_description = _normalize_text_field(payload.get("workflow_description"))
 
     if intent == "trend_board" and limit is None:
         limit = 5
@@ -1131,6 +1143,7 @@ def _normalize_intent(payload: dict[str, object]) -> TelegramNaturalLanguageInte
         sns_schedule_minutes=sns_schedule_minutes,
         bulk_target_domain=bulk_target_domain,
         bulk_filter_keywords=bulk_filter_keywords,
+        workflow_description=workflow_description,
     )
 
 
