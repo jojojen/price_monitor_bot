@@ -221,52 +221,43 @@ def test_fallback_routes_watch_add() -> None:
     assert intent.watch_price_threshold == 50000
 
 
-# ── extra_allowed_intents extension mechanism ─────────────────────────────────
+# ── canonical intents: create_workflow / play_music / home_action ─────────────
 
-def test_normalize_intent_rejects_app_specific_intent_without_extras() -> None:
+def test_normalize_intent_accepts_create_workflow() -> None:
     from price_monitor_bot.natural_language import _normalize_intent
 
     payload = {"intent": "create_workflow", "workflow_description": "每天查天氣"}
     result = _normalize_intent(payload)
-    assert result.intent == "unknown"
-
-
-def test_normalize_intent_rejects_play_music_without_extras() -> None:
-    from price_monitor_bot.natural_language import _normalize_intent
-
-    payload = {"intent": "play_music", "music_query": "random"}
-    result = _normalize_intent(payload)
-    assert result.intent == "unknown"
-
-
-def test_normalize_intent_accepts_create_workflow_with_extra_allowed() -> None:
-    from price_monitor_bot.natural_language import _normalize_intent
-
-    extras = frozenset({"create_workflow", "play_music"})
-    payload = {"intent": "create_workflow", "workflow_description": "每天查天氣"}
-    result = _normalize_intent(payload, extra_allowed_intents=extras)
     assert result.intent == "create_workflow"
     assert result.workflow_description == "每天查天氣"
 
 
-def test_normalize_intent_accepts_play_music_with_extra_allowed() -> None:
+def test_normalize_intent_accepts_play_music() -> None:
     from price_monitor_bot.natural_language import _normalize_intent
 
-    extras = frozenset({"create_workflow", "play_music"})
     payload = {"intent": "play_music", "music_query": "playbest"}
-    result = _normalize_intent(payload, extra_allowed_intents=extras)
+    result = _normalize_intent(payload)
     assert result.intent == "play_music"
     assert result.music_query == "playbest"
 
 
-def test_build_router_accepts_extra_allowed_intents_param() -> None:
+def test_normalize_intent_accepts_home_action() -> None:
+    from price_monitor_bot.natural_language import _normalize_intent
+
+    payload = {"intent": "home_action", "home_target": "客廳燈", "home_command": "on"}
+    result = _normalize_intent(payload)
+    assert result.intent == "home_action"
+    assert result.home_target == "客廳燈"
+    assert result.home_command == "on"
+
+
+def test_build_router_accepts_extra_allowed_intents_param_for_compat() -> None:
     from price_monitor_bot.natural_language import build_telegram_natural_language_router
 
     router = build_telegram_natural_language_router(
         endpoint="http://localhost:11434",
         model="gemma3:4b",
-        extra_allowed_intents=frozenset({"create_workflow", "play_music"}),
+        extra_allowed_intents=frozenset({"my_custom_intent"}),
     )
     assert router is not None
-    assert "create_workflow" in router._extra_allowed_intents
-    assert "play_music" in router._extra_allowed_intents
+    assert "my_custom_intent" in router._extra_allowed_intents
