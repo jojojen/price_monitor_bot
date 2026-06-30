@@ -313,6 +313,7 @@ class RegisteredCommand:
     handler: "Callable[[str, str], object]"
     ack: str | None = None
     background: bool = False
+    usage: str | None = None    # short argument hint, e.g. "playbest=播放最愛清單"; used to ground workflow drafting
 
 
 @dataclass(frozen=True, slots=True)
