@@ -1315,6 +1315,21 @@ def test_handle_telegram_message_clarifies_when_intent_is_unknown() -> None:
     assert processor.get_pending_text_clarification("123") is not None
 
 
+def test_route_natural_language_prefers_generic_fast_path_over_llm() -> None:
+    router = StubNaturalLanguageRouter(
+        TelegramNaturalLanguageIntent(intent="sns_delete", sns_handle="example_tcg", confidence=0.9)
+    )
+    processor = _make_clarifying_processor(router.intent)
+    processor._natural_language_router = router
+
+    intent = processor._route_natural_language("把 @example_tcg 的 filter 全部拿掉")
+
+    assert intent is not None
+    assert intent.intent == "sns_clear_filter"
+    assert intent.sns_handle == "example_tcg"
+    assert router.seen_texts == []
+
+
 def test_handle_telegram_message_clarifies_when_intent_confidence_is_low() -> None:
     # Confidence below the 0.55 threshold should trigger clarification even
     # when the LLM has a guess — exactly the "don't guess silently" rule that
@@ -1634,9 +1649,9 @@ CANONICAL_FALLBACK_PHRASES: tuple[tuple[str, str], ...] = (
     ("把 abc12345 改成 4萬", "update_watch_price"),
     # reputation, sns — untouched lists, still work.
     ("信用 https://jp.mercari.com/user/profile/123", "reputation_snapshot"),
-    ("追蹤 @elonmusk", "sns_add_account"),
+    ("追蹤 @example_news", "sns_add_account"),
     ("snslist", "sns_list"),
-    ("取消追蹤 @elonmusk", "sns_delete"),
+    ("取消追蹤 @example_news", "sns_delete"),
     # sns_buzz — slimmed; canonical phrasings keep working, generic
     # "什麼熱門" no longer over-eats (asserted separately below).
     ("snsbuzz amd", "sns_buzz"),
