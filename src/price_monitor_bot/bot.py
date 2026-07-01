@@ -53,6 +53,8 @@ from .natural_language import (
     TelegramNaturalLanguageIntent,
     TelegramNaturalLanguageRouter,
     fallback_route_telegram_natural_language,
+    fast_route_telegram_natural_language,
+    slow_fallback_route_telegram_natural_language,
     _recover_lookup_fields,
 )
 
@@ -1768,7 +1770,7 @@ class TelegramCommandProcessor:
             if not intent.sns_handle:
                 return TelegramTextReplyPlan(
                     ack=None,
-                    reply="請告訴我要追蹤哪個 X 帳號，例如：追蹤 @elonmusk",
+                    reply="請告訴我要追蹤哪個 X 帳號，例如：追蹤 @example_news",
                 )
             handle = intent.sns_handle
             include_keywords = tuple(intent.sns_include_keywords)
@@ -1818,7 +1820,7 @@ class TelegramCommandProcessor:
             if not target:
                 return TelegramTextReplyPlan(
                     ack=None,
-                    reply="請告訴我要移除哪個 X 帳號或規則 ID，例如：刪除追蹤 @elonmusk",
+                    reply="請告訴我要移除哪個 X 帳號或規則 ID，例如：刪除追蹤 @example_news",
                 )
             logger.info("Telegram NL routed intent=sns_delete target=%s", target)
             cid = str(chat_id)
@@ -1867,7 +1869,7 @@ class TelegramCommandProcessor:
             if not intent.sns_handle:
                 return TelegramTextReplyPlan(
                     ack=None,
-                    reply="請告訴我要清空哪個 @ 帳號的 filter，例如：把 @elonmusk 的 filter 拿掉。",
+                    reply="請告訴我要清空哪個 @ 帳號的 filter，例如：把 @example_news 的 filter 拿掉。",
                 )
             handle = intent.sns_handle
             logger.info("Telegram NL routed intent=sns_clear_filter handle=%s", handle)
@@ -2140,6 +2142,15 @@ class TelegramCommandProcessor:
                 )
                 return fast_intent
 
+        generic_fast_intent = fast_route_telegram_natural_language(text)
+        if generic_fast_intent is not None and generic_fast_intent.intent != "unknown":
+            logger.info(
+                "Telegram generic fast-path routed intent=%s confidence=%s",
+                generic_fast_intent.intent,
+                generic_fast_intent.confidence,
+            )
+            return generic_fast_intent
+
         llm_intent: TelegramNaturalLanguageIntent | None = None
         if self._natural_language_router is not None:
             try:
@@ -2147,36 +2158,7 @@ class TelegramCommandProcessor:
             except Exception:
                 logger.exception("Telegram natural-language router failed, falling back to keyword rules text=%s", trim_for_log(text, limit=240))
 
-        fallback_intent = fallback_route_telegram_natural_language(text)
-
-        # Bulk-filter sentences (e.g. "把每個跟 pokemon 相關的 sns 追蹤帳號 filter 都加上「抽選」")
-        # are unreliable through the LLM — the structured fields it must populate are easy to drop.
-        # When the deterministic regex fallback identifies this intent, prefer it over the LLM result.
-        if (
-            fallback_intent is not None
-            and fallback_intent.intent == "sns_bulk_add_filter"
-            and (llm_intent is None or llm_intent.intent != "sns_bulk_add_filter")
-        ):
-            logger.info(
-                "Telegram natural-language fallback rescued sns_bulk_add_filter (llm_intent=%s)",
-                getattr(llm_intent, "intent", None),
-            )
-            return fallback_intent
-
-        # Clear-filter sentences (e.g. "把 @ARS_Arsales 的 filter 全部拿掉") get
-        # routinely mis-mapped by the LLM to sns_delete because "拿掉" reads as
-        # a remove-verb. The fallback's double-signal regex (filter-noun + clear-verb)
-        # is the reliable detector — prefer it over the LLM when it fires.
-        if (
-            fallback_intent is not None
-            and fallback_intent.intent == "sns_clear_filter"
-            and (llm_intent is None or llm_intent.intent != "sns_clear_filter")
-        ):
-            logger.info(
-                "Telegram natural-language fallback rescued sns_clear_filter (llm_intent=%s)",
-                getattr(llm_intent, "intent", None),
-            )
-            return fallback_intent
+        fallback_intent = slow_fallback_route_telegram_natural_language(text)
 
         if llm_intent is not None and llm_intent.intent != "unknown":
             return llm_intent
