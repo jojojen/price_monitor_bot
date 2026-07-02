@@ -41,14 +41,49 @@ from tcg_tracker.image_lookup import (
 
 from .commands import lookup_card
 from .formatters import build_lookup_feedback_keyboard, format_jpy, format_lookup_result_telegram
-from .list_view import (
+from telegram_core.list_view import (
     LIST_VIEW_MODE_EDIT,
     LIST_VIEW_MODE_READ,
     LIST_VIEW_PAGE_SIZE,
     ListRow,
     build_list_view,
 )
-from .logging_utils import mask_identifier, trim_for_log
+from telegram_core.logging_utils import mask_identifier, trim_for_log
+from telegram_core.contracts import (
+    PendingTelegramTextClarification,
+    RegisteredCommand,
+    TelegramReputationDelivery,
+    TelegramTextIntentOption,
+    TelegramTextReplyPlan,
+)
+from telegram_core.transport import (
+    TelegramBotClient,
+    TelegramFileAttachment,
+    send_telegram_test_message,
+)
+from telegram_core.polling import (
+    PollHeartbeat,
+    _drain_pending_updates,
+    _guess_current_page,
+    _heartbeat_beacon,
+    _is_conflict_error,
+    _send_reputation_delivery,
+    _send_text_reply_plan,
+    start_poll_watchdog,
+)
+from telegram_core.polling import handle_telegram_callback_query as _core_handle_telegram_callback_query
+from telegram_core.polling import handle_telegram_message as _core_handle_telegram_message
+from telegram_core.processor import (
+    CoreCommandProcessor,
+    _build_clarification_keyboard,
+    _build_pending_text_retry_reply,
+    _build_text_clarification_reply,
+    _extract_command_name,
+    _extract_command_remainder,
+    _extract_photo_clarification_override,
+    _is_text_intent_ambiguous,
+    _match_text_clarification_option,
+)
 from .natural_language import (
     TelegramNaturalLanguageIntent,
     TelegramNaturalLanguageRouter,
@@ -156,8 +191,7 @@ HEAVY_COMMANDS = PRICE_LOOKUP_COMMANDS | TREND_BOARD_COMMANDS | REPUTATION_SNAPS
 
 logger = logging.getLogger(__name__)
 PHOTO_CLARIFICATION_TTL_SECONDS = 15 * 60
-TEXT_CLARIFICATION_TTL_SECONDS = 15 * 60
-TEXT_AMBIGUITY_CONFIDENCE_THRESHOLD = 0.55
+# TEXT_AMBIGUITY_CONFIDENCE_THRESHOLD imported from telegram_core.processor above (via _is_text_intent_ambiguous).
 
 # LIST_VIEW_PAGE_SIZE, LIST_VIEW_MODE_READ/EDIT imported from .list_view above.
 # Internal aliases so existing code in this file needs no further changes.
@@ -290,59 +324,9 @@ class TelegramResearchQuery:
     query: str
 
 
-@dataclass(frozen=True, slots=True)
-class TelegramFileAttachment:
-    kind: str
-    path: Path
-    caption: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class TelegramReputationDelivery:
-    summary_text: str
-    attachments: tuple[TelegramFileAttachment, ...] = ()
-    cleanup_paths: tuple[Path, ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
-class RegisteredCommand:
-    """A command handler injected by data into the dispatcher (instead of a
-    hardcoded if/elif branch). ``handler(remainder, chat_id)`` returns either a
-    bare reply string or a ``(text, reply_markup)`` tuple. The dispatcher wraps
-    the result in a reply plan, applying ``ack`` and, when ``background`` is set,
-    running the handler off the poll loop via ``reply_factory``."""
-
-    handler: "Callable[[str, str], object]"
-    ack: str | None = None
-    background: bool = False
-    usage: str | None = None    # short argument hint, e.g. "playbest=播放最愛清單"; used to ground workflow drafting
-
-
-@dataclass(frozen=True, slots=True)
-class TelegramTextReplyPlan:
-    ack: str | None
-    reply: str | None
-    reply_factory: "Callable[[], str | tuple[str, dict[str, object] | None]] | None" = None
-    reputation_delivery_factory: "Callable[[], TelegramReputationDelivery] | None" = None
-    reply_markup: dict[str, object] | None = None  # optional inline keyboard for list views
-    run_in_background: bool = False  # True only for slow ops like /new codegen
-
-    def execute(self) -> str | None:
-        text, _ = self._execute_unpacked()
-        return text
-
-    def _execute_unpacked(self) -> tuple[str | None, dict[str, object] | None]:
-        """Return (text, reply_markup_from_factory). Factory may return either
-        a bare string (legacy) or a tuple (text, markup-override). Callers
-        merge the override with self.reply_markup at send time."""
-        if self.reply is not None:
-            return self.reply, None
-        if self.reply_factory is not None:
-            result = self.reply_factory()
-            if isinstance(result, tuple):
-                return result[0], result[1]
-            return result, None
-        return None, None
+# TelegramFileAttachment imported from telegram_core.transport above.
+# TelegramReputationDelivery, RegisteredCommand, TelegramTextReplyPlan imported
+# from telegram_core.contracts above.
 
 
 @dataclass(frozen=True, slots=True)
@@ -393,24 +377,8 @@ class PendingTelegramPhotoClarification:
         return (time.monotonic() - self.created_at) > PHOTO_CLARIFICATION_TTL_SECONDS
 
 
-@dataclass(frozen=True, slots=True)
-class TelegramTextIntentOption:
-    option_number: int
-    action_key: str
-    prompt: str
-    intent: "TelegramNaturalLanguageIntent"
-
-
-@dataclass(slots=True)
-class PendingTelegramTextClarification:
-    chat_id: str
-    original_text: str
-    options: tuple[TelegramTextIntentOption, ...]
-    top_intent: "TelegramNaturalLanguageIntent | None" = None
-    created_at: float = field(default_factory=time.monotonic)
-
-    def is_expired(self) -> bool:
-        return (time.monotonic() - self.created_at) > TEXT_CLARIFICATION_TTL_SECONDS
+# TelegramTextIntentOption, PendingTelegramTextClarification imported from
+# telegram_core.contracts above.
 
 
 PRICE_FEEDBACK_TTL_SECONDS = 10 * 60
@@ -430,26 +398,7 @@ class PendingTelegramPriceFeedback:
         return (time.monotonic() - self.created_at) > PRICE_FEEDBACK_TTL_SECONDS
 
 
-@dataclass(slots=True)
-class PendingTelegramSnsBulkUpdate:
-    """A SNS bulk-rule update that's been previewed to the user and is
-    waiting on a confirm / cancel inline-button tap.
-
-    The ``action`` field selects which apply helper runs on confirm:
-    - ``"add"``           → apply_bulk_keyword_filter_add (uses keywords)
-    - ``"remove"``        → apply_bulk_keyword_filter_remove (uses keywords)
-    - ``"set_schedule"``  → apply_bulk_schedule_update (uses schedule_minutes)
-    """
-    chat_id: str
-    bulk_target_domain: str
-    keywords: tuple[str, ...]
-    affected_rule_ids: tuple[str, ...]
-    action: str = "add"
-    schedule_minutes: int | None = None
-    created_at: float = field(default_factory=time.monotonic)
-
-    def is_expired(self) -> bool:
-        return (time.monotonic() - self.created_at) > TEXT_CLARIFICATION_TTL_SECONDS
+# PendingTelegramSnsBulkUpdate — moved to openclaw_adapter.sns_commands (aka_no_claw).
 
 
 def default_photo_intent_analyzer(
@@ -535,29 +484,8 @@ def _build_photo_intent_options(*, parsed_game: str | None, item_kind: str | Non
     return tuple(options)
 
 
-def _build_clarification_keyboard(
-    prefix: str, options: tuple
-) -> dict[str, object] | None:
-    """Build the inline keyboard for a numbered-options clarification message.
-
-    Each option becomes one row: ``[N. <prompt>]`` with callback_data
-    ``<prefix>:<N>``. The "都不是 / 否，..." free-form fallback stays as a
-    text-only instruction (Telegram inline buttons can't capture free text).
-    Returns None if there are no options to render.
-    """
-    if not options:
-        return None
-    keyboard: list[list[dict[str, object]]] = []
-    for opt in options:
-        prompt = str(opt.prompt or "").strip()
-        # Telegram renders button text on a single line; cap to keep it readable.
-        if len(prompt) > 48:
-            prompt = prompt[:47] + "…"
-        keyboard.append([{
-            "text": f"{opt.option_number}. {prompt}",
-            "callback_data": f"{prefix}:{opt.option_number}",
-        }])
-    return {"inline_keyboard": keyboard}
+# _build_clarification_keyboard imported from telegram_core.processor above
+# (generic — shared by both photo ("popt") and text ("topt") clarification flows).
 
 
 def _build_photo_clarification_reply(
@@ -595,172 +523,10 @@ def _display_game_name(game: str) -> str:
     return labels.get(game, game)
 
 
-class TelegramBotClient:
-    def __init__(
-        self,
-        token: str,
-        *,
-        timeout_seconds: float = 35.0,
-        ssl_context: ssl.SSLContext | None = None,
-    ) -> None:
-        self._token = token
-        self._base_url = f"https://api.telegram.org/bot{token}/"
-        self._file_base_url = f"https://api.telegram.org/file/bot{token}/"
-        self._timeout_seconds = timeout_seconds
-        self._ssl_context = ssl_context
-
-    def get_me(self) -> dict[str, object]:
-        return self._call("getMe")
-
-    def get_updates(self, *, offset: int | None = None, timeout: int = 20) -> list[dict[str, object]]:
-        payload: dict[str, object] = {
-            "timeout": timeout,
-            "allowed_updates": ["message", "callback_query"],
-        }
-        if offset is not None:
-            payload["offset"] = offset
-        result = self._call("getUpdates", payload)
-        return result if isinstance(result, list) else []
-
-    def send_message(
-        self,
-        *,
-        chat_id: str | int,
-        text: str,
-        reply_markup: dict[str, object] | None = None,
-    ) -> dict[str, object]:
-        payload: dict[str, object] = {
-            "chat_id": str(chat_id),
-            "text": text[:4096],
-            "disable_web_page_preview": True,
-        }
-        if reply_markup is not None:
-            payload["reply_markup"] = reply_markup
-        return self._call("sendMessage", payload)
-
-    def edit_message_text(
-        self,
-        *,
-        chat_id: str | int,
-        message_id: int,
-        text: str,
-        reply_markup: dict[str, object] | None = None,
-    ) -> dict[str, object]:
-        payload: dict[str, object] = {
-            "chat_id": str(chat_id),
-            "message_id": int(message_id),
-            "text": text[:4096],
-            "disable_web_page_preview": True,
-        }
-        if reply_markup is not None:
-            payload["reply_markup"] = reply_markup
-        return self._call("editMessageText", payload)
-
-    def answer_callback_query(
-        self,
-        *,
-        callback_query_id: str,
-        text: str | None = None,
-        show_alert: bool = False,
-    ) -> dict[str, object]:
-        payload: dict[str, object] = {
-            "callback_query_id": callback_query_id,
-            "show_alert": show_alert,
-        }
-        if text is not None:
-            payload["text"] = text[:200]
-        return self._call("answerCallbackQuery", payload)
-
-    def send_photo(self, *, chat_id: str | int, photo_path: Path, caption: str | None = None) -> dict[str, object]:
-        return self._call_multipart(
-            "sendPhoto",
-            fields={"chat_id": str(chat_id), "caption": caption},
-            file_field="photo",
-            file_path=photo_path,
-        )
-
-    def send_document(self, *, chat_id: str | int, document_path: Path, caption: str | None = None) -> dict[str, object]:
-        return self._call_multipart(
-            "sendDocument",
-            fields={"chat_id": str(chat_id), "caption": caption},
-            file_field="document",
-            file_path=document_path,
-        )
-
-    def get_file(self, *, file_id: str) -> dict[str, object]:
-        result = self._call("getFile", {"file_id": file_id})
-        return result if isinstance(result, dict) else {}
-
-    def download_file(self, *, file_path: str) -> bytes:
-        request = Request(self._file_base_url + file_path, method="GET")
-        try:
-            with urlopen(request, timeout=self._timeout_seconds, context=self._ssl_context) as response:
-                return response.read()
-        except HTTPError as exc:  # pragma: no cover - network-dependent.
-            raise RuntimeError(f"Telegram file download HTTP {exc.code} for {file_path}.") from exc
-        except URLError as exc:  # pragma: no cover - network-dependent.
-            raise RuntimeError(f"Telegram file download failed for {file_path}: {exc.reason}") from exc
-
-    def _call(self, method: str, payload: dict[str, object] | None = None) -> dict[str, object] | list[dict[str, object]]:
-        request_body = None if payload is None else json.dumps(payload).encode("utf-8")
-        request = Request(
-            self._base_url + method,
-            data=request_body,
-            headers={"Content-Type": "application/json; charset=utf-8"},
-            method="POST",
-        )
-        try:
-            with urlopen(request, timeout=self._timeout_seconds, context=self._ssl_context) as response:
-                response_payload = json.loads(response.read().decode("utf-8"))
-        except HTTPError as exc:  # pragma: no cover - network-dependent.
-            raise RuntimeError(f"Telegram API HTTP {exc.code} for {method}.") from exc
-        except URLError as exc:  # pragma: no cover - network-dependent.
-            raise RuntimeError(f"Telegram API request failed for {method}: {exc.reason}") from exc
-
-        if not response_payload.get("ok"):
-            description = response_payload.get("description", "Unknown Telegram API error.")
-            raise RuntimeError(f"Telegram API {method} failed: {description}")
-        return response_payload.get("result", {})
-
-    def _call_multipart(
-        self,
-        method: str,
-        *,
-        fields: dict[str, str | None],
-        file_field: str,
-        file_path: Path,
-    ) -> dict[str, object]:
-        boundary = f"----OpenClawBoundary{uuid.uuid4().hex}"
-        content_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
-        body = _encode_multipart_body(
-            boundary=boundary,
-            fields=fields,
-            file_field=file_field,
-            file_path=file_path,
-            content_type=content_type,
-        )
-        request = Request(
-            self._base_url + method,
-            data=body,
-            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
-            method="POST",
-        )
-        try:
-            with urlopen(request, timeout=self._timeout_seconds, context=self._ssl_context) as response:
-                response_payload = json.loads(response.read().decode("utf-8"))
-        except HTTPError as exc:  # pragma: no cover - network-dependent.
-            raise RuntimeError(f"Telegram API HTTP {exc.code} for {method}.") from exc
-        except URLError as exc:  # pragma: no cover - network-dependent.
-            raise RuntimeError(f"Telegram API request failed for {method}: {exc.reason}") from exc
-
-        if not response_payload.get("ok"):
-            description = response_payload.get("description", "Unknown Telegram API error.")
-            raise RuntimeError(f"Telegram API {method} failed: {description}")
-        result = response_payload.get("result", {})
-        return result if isinstance(result, dict) else {}
+# TelegramBotClient imported from telegram_core.transport above.
 
 
-class TelegramCommandProcessor:
+class TelegramCommandProcessor(CoreCommandProcessor):
     def __init__(
         self,
         *,
@@ -788,9 +554,33 @@ class TelegramCommandProcessor:
         watch_inbox: "object | None" = None,
         unknown_text_handler: "Callable[[str, str], tuple[str, dict | None] | None] | None" = None,
     ) -> None:
+        # Domain callback prefixes route through the generic registry contract
+        # (Phase 3: telegram_core.polling has zero vocabulary for these).
+        # External kwargs win on key collision, matching the pre-Phase-3
+        # "registry checked first" precedence.
+        default_callback_handlers: dict = {
+            "cond": self._cond_callback,
+            "wedit": self._wedit_callback,
+            "wmkt": self._wmkt_callback,
+            "wback": self._wback_callback,
+            "fbpos": self._fbpos_callback,
+        }
+        default_view_handlers: dict = {"wl": self.render_watchlist_view}
+        default_deleter_handlers: dict = {
+            "wl": (self.delete_marketplace_watch_by_id, "Marketplace 追蹤"),
+        }
+        super().__init__(
+            catalog_renderer=catalog_renderer,
+            allowed_chat_ids=allowed_chat_ids,
+            status_renderer=status_renderer,
+            command_handlers=command_handlers,
+            callback_handlers={**default_callback_handlers, **(callback_handlers or {})},
+            view_handlers={**default_view_handlers, **(view_handlers or {})},
+            item_deleter_handlers={**default_deleter_handlers, **(item_deleter_handlers or {})},
+            unknown_text_handler=unknown_text_handler,
+        )
         self._lookup_renderer = lookup_renderer
         self._board_loader = board_loader
-        self._catalog_renderer = catalog_renderer
         self._photo_intent_analyzer = photo_intent_analyzer or default_photo_intent_analyzer()
         self._reputation_renderer = reputation_renderer
         self._research_renderer = research_renderer
@@ -798,34 +588,14 @@ class TelegramCommandProcessor:
         self._natural_language_router = natural_language_router
         self._intent_fast_path = intent_fast_path
         self._image_translate_recognizer = image_translate_recognizer
-        self._allowed_chat_ids: frozenset[str] = allowed_chat_ids or frozenset()
-        self._status_renderer = status_renderer
         self._watch_db = watch_db
         self._watch_inbox = watch_inbox
         self._sns_db = sns_db
         self._sns_buzz_fn = sns_buzz_fn
         self._collab_backfiller = collab_backfiller
         self._feedback_service = feedback_service
-        self._unknown_text_handler = unknown_text_handler
-        self._command_registry: dict[str, RegisteredCommand] = command_handlers or {}
-        self._callback_registry: dict[
-            str, Callable[[str, str, str], tuple[object, str, object]]
-        ] = callback_handlers or {}
-        self._view_registry: dict[str, Callable[..., tuple[str, "dict | None", int]]] = (
-            view_handlers or {}
-        )
-        self._deleter_registry: dict[str, tuple[Callable[[str], bool], str]] = (
-            item_deleter_handlers or {}
-        )
         self._pending_photo_clarifications: dict[str, PendingTelegramPhotoClarification] = {}
-        self._pending_text_clarifications: dict[str, PendingTelegramTextClarification] = {}
-        self._pending_sns_bulk_updates: dict[str, PendingTelegramSnsBulkUpdate] = {}
         self._pending_price_feedbacks: dict[str, PendingTelegramPriceFeedback] = {}
-
-    def is_allowed_chat(self, chat_id: str | int) -> bool:
-        if not self._allowed_chat_ids:
-            return False  # fail-closed: no allowlist = deny all (startup guard catches this first)
-        return str(chat_id) in self._allowed_chat_ids
 
     def get_pending_photo_clarification(self, chat_id: str | int) -> PendingTelegramPhotoClarification | None:
         key = str(chat_id)
@@ -851,24 +621,7 @@ class TelegramCommandProcessor:
         if pending is not None:
             self._cleanup_pending_photo_path(pending.image_path)
 
-    def get_pending_text_clarification(self, chat_id: str | int) -> PendingTelegramTextClarification | None:
-        key = str(chat_id)
-        pending = self._pending_text_clarifications.get(key)
-        if pending is None:
-            return None
-        if not pending.is_expired():
-            return pending
-        self._pending_text_clarifications.pop(key, None)
-        return None
-
-    def set_pending_text_clarification(self, clarification: PendingTelegramTextClarification) -> None:
-        self._pending_text_clarifications[clarification.chat_id] = clarification
-
-    def pop_pending_text_clarification(self, chat_id: str | int) -> PendingTelegramTextClarification | None:
-        return self._pending_text_clarifications.pop(str(chat_id), None)
-
-    def clear_pending_text_clarification(self, chat_id: str | int) -> None:
-        self._pending_text_clarifications.pop(str(chat_id), None)
+    # get/set/pop/clear_pending_text_clarification inherited from CoreCommandProcessor.
 
     def get_pending_price_feedback(self, chat_id: str | int) -> PendingTelegramPriceFeedback | None:
         key = str(chat_id)
@@ -889,21 +642,316 @@ class TelegramCommandProcessor:
     def clear_pending_price_feedback(self, chat_id: str | int) -> None:
         self._pending_price_feedbacks.pop(str(chat_id), None)
 
-    def get_pending_sns_bulk_update(self, chat_id: str | int) -> PendingTelegramSnsBulkUpdate | None:
-        key = str(chat_id)
-        pending = self._pending_sns_bulk_updates.get(key)
-        if pending is None:
-            return None
-        if not pending.is_expired():
-            return pending
-        self._pending_sns_bulk_updates.pop(key, None)
+    # get/set/pop_pending_sns_bulk_update — moved to openclaw_adapter.telegram_bot (aka_no_claw).
+
+    # ── Phase 3 registry callback adapters ──────────────────────────────
+    # Each preserves the pre-Phase-3 quirk that `toast` defaults to
+    # "未知按鈕" unless the underlying handler explicitly overrides it —
+    # the generic registry contract in telegram_core.polling unconditionally
+    # assigns whatever these return, so the default must be baked in here.
+
+    def _cond_callback(
+        self, payload: str, original_text: str, chat_id: str
+    ) -> tuple[str | None, str | None, dict[str, object] | None]:
+        parts = payload.split(":")
+        watch_id = parts[0] if parts else ""
+        action = parts[1] if len(parts) >= 2 else ""
+        toast_out, edit_text, edit_kb = _handle_condition_callback(
+            processor=self,
+            watch_id=watch_id,
+            action=action,
+            extra=parts[2] if len(parts) >= 3 else "",
+            original_text=original_text,
+        )
+        return (toast_out if toast_out is not None else "未知按鈕"), edit_text, edit_kb
+
+    # _bulk_callback — moved to openclaw_adapter.telegram_bot (aka_no_claw).
+
+    def _wedit_callback(
+        self, payload: str, original_text: str, chat_id: str
+    ) -> tuple[str | None, str | None, dict[str, object] | None]:
+        if not payload:
+            logger.warning("Unknown callback_query prefix=%r data=%r", "wedit", f"wedit:{payload}")
+            return "未知按鈕", None, None
+        result = _render_watch_edit_view(self, payload)
+        if result:
+            new_text, new_reply_markup = result
+            return "未知按鈕", new_text, new_reply_markup
+        return "找不到該追蹤", None, None
+
+    def _wmkt_callback(
+        self, payload: str, original_text: str, chat_id: str
+    ) -> tuple[str | None, str | None, dict[str, object] | None]:
+        if payload.count(":") != 1:
+            logger.warning("Unknown callback_query prefix=%r data=%r", "wmkt", f"wmkt:{payload}")
+            return "未知按鈕", None, None
+        watch_id, market = payload.split(":", 1)
+        watch_db = getattr(self, "_watch_db", None)
+        watch_inbox = getattr(self, "_watch_inbox", None)
+        toast: str | None = "未知按鈕"
+        new_text: str | None = None
+        new_reply_markup: dict[str, object] | None = None
+        if watch_db and watch_id:
+            watch = watch_db.get_marketplace_watch(watch_id)
+            if watch:
+                current = set(watch.markets)
+                name, emoji = _marketplace_source_display(market)
+                if market in current:
+                    if len(current) == 1:
+                        toast = "至少要保留一個平台"
+                    else:
+                        current.remove(market)
+                        new_mkt = tuple(m for m in DEFAULT_MARKETS if m in current)
+                        if watch_inbox is not None:
+                            watch_inbox.push("update_watch", {"watch_id": watch_id, "markets": list(new_mkt)})
+                        else:
+                            watch_db.update_marketplace_watch(watch_id, markets=new_mkt)
+                        toast = f"已移除 {emoji}{name}"
+                else:
+                    current.add(market)
+                    new_mkt = tuple(m for m in DEFAULT_MARKETS if m in current)
+                    if watch_inbox is not None:
+                        watch_inbox.push("update_watch", {"watch_id": watch_id, "markets": list(new_mkt)})
+                    else:
+                        watch_db.update_marketplace_watch(watch_id, markets=new_mkt)
+                    toast = f"已加入 {emoji}{name}"
+                result = _render_watch_edit_view(self, watch_id)
+                if result:
+                    new_text, new_reply_markup = result
+            else:
+                toast = "找不到該追蹤"
+        return toast, new_text, new_reply_markup
+
+    def _wback_callback(
+        self, payload: str, original_text: str, chat_id: str
+    ) -> tuple[str | None, str | None, dict[str, object] | None]:
+        text, kb, _ = self.render_watchlist_view(mode=LIST_VIEW_MODE_EDIT)
+        return "未知按鈕", text, kb
+
+    def _fbpos_callback(
+        self, payload: str, original_text: str, chat_id: str
+    ) -> tuple[str | None, str | None, dict[str, object] | None]:
+        if not payload:
+            logger.warning("Unknown callback_query prefix=%r data=%r", "fbpos", f"fbpos:{payload}")
+            return "未知按鈕", None, None
+        feedback_service = getattr(self, "_feedback_service", None)
+        watch_db = getattr(self, "_watch_db", None)
+        if feedback_service is None or watch_db is None:
+            return "回饋功能未啟用", None, None
+        item = watch_db.find_item(payload)
+        if item is None:
+            return "找不到該品項，可能已過期", None, None
+        fair_value = watch_db.latest_fair_value_for(payload)
+        try:
+            from tcg_tracker.catalog import TcgCardSpec as _TcgCardSpec
+            spec = _TcgCardSpec.from_tracked_item(item)
+        except Exception:
+            logger.exception("fbpos: failed to build spec from item_id=%s", payload)
+            return "解析品項失敗", None, None
+        try:
+            feedback_service.submit_positive(
+                item=item, spec=spec, chat_id=chat_id, original_fair_value_jpy=fair_value,
+            )
+            return "👍 已記錄", None, None
+        except Exception:
+            logger.exception("fbpos: submit_positive failed item_id=%s", payload)
+            return "回饋寫入失敗", None, None
+
+    # ── Phase 3 hook overrides (see CoreCommandProcessor for contracts) ────
+
+    def handle_callback_query_async(
+        self,
+        *,
+        client: object,
+        callback_id: str,
+        chat_id: str,
+        message_id: int,
+        prefix: str,
+        payload: str,
+        original_text: str,
+    ) -> bool:
+        # wprc / fbprc must send a BRAND NEW ForceReply message, which the
+        # plain registry contract (edit-only) can't express.
+        if prefix == "wprc" and payload:
+            watch_db = getattr(self, "_watch_db", None)
+            toast: str | None = "未知按鈕"
+            if watch_db:
+                watch = watch_db.get_marketplace_watch(payload)
+                if watch:
+                    fr_text = (
+                        f"請輸入「{watch.query}」的新目標上限（日圓整數，例：25000）：\n"
+                        f"[wprc:{payload}]"
+                    )
+                    try:
+                        client.send_message(
+                            chat_id=chat_id,
+                            text=fr_text,
+                            reply_markup={"force_reply": True, "selective": True},
+                        )
+                    except Exception:
+                        logger.exception("wprc: ForceReply send failed watch_id=%s", payload)
+                        toast = "發送失敗"
+                else:
+                    toast = "找不到該追蹤"
+            try:
+                client.answer_callback_query(callback_query_id=callback_id, text=toast)
+            except Exception:
+                logger.exception("answer_callback_query failed callback_id=%s", callback_id)
+            return True
+
+        if prefix == "fbprc" and payload:
+            feedback_service = getattr(self, "_feedback_service", None)
+            watch_db = getattr(self, "_watch_db", None)
+            toast = "未知按鈕"
+            if feedback_service is None or watch_db is None:
+                toast = "回饋功能未啟用"
+            else:
+                item = watch_db.find_item(payload)
+                if item is None:
+                    toast = "找不到該品項，可能已過期"
+                else:
+                    fair_value = watch_db.latest_fair_value_for(payload)
+                    self.set_pending_price_feedback(
+                        PendingTelegramPriceFeedback(
+                            chat_id=str(chat_id),
+                            item_id=payload,
+                            original_fair_value_jpy=fair_value,
+                        )
+                    )
+                    fr_text = (
+                        "請貼上你覺得合理價格的參考 URL（必須是公開可讀的網頁）：\n"
+                        f"[fbprc:{payload}]"
+                    )
+                    try:
+                        client.send_message(
+                            chat_id=chat_id,
+                            text=fr_text,
+                            reply_markup={"force_reply": True, "selective": True},
+                        )
+                        toast = "好的，等你貼 URL"
+                    except Exception:
+                        logger.exception("fbprc: ForceReply send failed item_id=%s", payload)
+                        toast = "發送失敗"
+            try:
+                client.answer_callback_query(callback_query_id=callback_id, text=toast)
+            except Exception:
+                logger.exception("answer_callback_query failed callback_id=%s", callback_id)
+            return True
+
+        return super().handle_callback_query_async(
+            client=client, callback_id=callback_id, chat_id=chat_id, message_id=message_id,
+            prefix=prefix, payload=payload, original_text=original_text,
+        )
+
+    def handle_reply_to_message(
+        self,
+        *,
+        client: object,
+        chat_id: str | int,
+        text_value: str,
+        reply_to_message: dict[str, object],
+    ) -> tuple[str, ...] | None:
+        rt_text = reply_to_message.get("text") or ""
+        fbprc_m = _FBPRC_TAG_RE.search(rt_text) if isinstance(rt_text, str) else None
+        if fbprc_m:
+            pending = self.pop_pending_price_feedback(chat_id)
+            url = text_value.strip()
+            if not (url.startswith("http://") or url.startswith("https://")):
+                client.send_message(chat_id=chat_id, text="⚠️ 這看起來不是合法 URL，回饋已取消。")
+                return ("⚠️ 不是合法 URL",)
+            if pending is None:
+                client.send_message(chat_id=chat_id, text="⚠️ 該回饋對話已過期，請重新點擊「不合理」。")
+                return ("⚠️ 過期",)
+            feedback_service = getattr(self, "_feedback_service", None)
+            watch_db = getattr(self, "_watch_db", None)
+            if feedback_service is None or watch_db is None:
+                client.send_message(chat_id=chat_id, text="⚠️ 回饋服務未啟用。")
+                return ("⚠️ 未啟用",)
+            item = watch_db.find_item(pending.item_id)
+            if item is None:
+                client.send_message(chat_id=chat_id, text="⚠️ 找不到對應品項。")
+                return ("⚠️ 品項遺失",)
+            try:
+                from tcg_tracker.catalog import TcgCardSpec as _TcgCardSpec
+                spec = _TcgCardSpec.from_tracked_item(item)
+            except Exception as exc:
+                logger.exception("fbprc consumer: failed to build spec from item_id=%s: %s", pending.item_id, exc)
+                client.send_message(chat_id=chat_id, text="⚠️ 解析品項失敗。")
+                return ("⚠️ 解析失敗",)
+            try:
+                outcome = feedback_service.submit(
+                    item=item,
+                    spec=spec,
+                    chat_id=chat_id,
+                    original_fair_value_jpy=pending.original_fair_value_jpy,
+                    claimed_url=url,
+                )
+            except Exception:
+                logger.exception("Feedback service failed for chat_id=%s url=%s", chat_id, url)
+                client.send_message(chat_id=chat_id, text="⚠️ 抓取／分析時出現錯誤，已記錄。")
+                return ("⚠️ 內部錯誤",)
+            client.send_message(chat_id=chat_id, text=outcome.summary_for_user)
+            return (outcome.summary_for_user,)
+
+        wprc_m = _WPRC_TAG_RE.search(rt_text) if isinstance(rt_text, str) else None
+        if wprc_m:
+            watch_id = wprc_m.group(1)
+            price_str = text_value.strip().replace(",", "").replace("¥", "").replace("円", "")
+            watch_db = getattr(self, "_watch_db", None)
+            if price_str.isdigit() and watch_db:
+                new_price = int(price_str)
+                watch = watch_db.get_marketplace_watch(watch_id)
+                if watch:
+                    watch_db.update_marketplace_watch(watch_id, price_threshold_jpy=new_price)
+                    result = _render_watch_edit_view(self, watch_id)
+                    reply_text = f"✓ 已更新上限 ¥{new_price:,}"
+                    reply_markup = result[1] if result else None
+                    msg_text = f"{reply_text}\n\n{result[0]}" if result else reply_text
+                    client.send_message(chat_id=chat_id, text=msg_text, reply_markup=reply_markup)
+                    return (reply_text,)
+                # watch not found: fall through silently to the normal
+                # pipeline (matches the pre-Phase-3 behavior exactly).
+            else:
+                client.send_message(chat_id=chat_id, text="⚠️ 請輸入純數字，例：25000")
+                return ("⚠️ 格式錯誤",)
         return None
 
-    def set_pending_sns_bulk_update(self, pending: PendingTelegramSnsBulkUpdate) -> None:
-        self._pending_sns_bulk_updates[pending.chat_id] = pending
+    def build_intake_ack_text(self, *, has_photo: bool, caption: "str | None") -> str | None:
+        if has_photo:
+            if self.caption_requests_image_translation(caption):
+                return "已理解為：圖片文字翻譯，正在 OCR 並翻成繁體中文…（約 1–2 分鐘）"
+            return "已收到圖片，開始解讀使用者意圖"
+        return "已收到訊息，開始解讀使用者意圖"
 
-    def pop_pending_sns_bulk_update(self, chat_id: str | int) -> PendingTelegramSnsBulkUpdate | None:
-        return self._pending_sns_bulk_updates.pop(str(chat_id), None)
+    def check_pending_photo_reply(
+        self, *, chat_id: "str | int", text_value: "str | None", photo_renderer: "PhotoLookupRenderer | None",
+    ) -> "TelegramTextReplyPlan | None":
+        return self.build_pending_photo_reply_plan(chat_id=chat_id, text=text_value, photo_renderer=photo_renderer)
+
+    def handle_photo_message(
+        self, *, client: object, photo_renderer: "PhotoLookupRenderer | None", chat_id: "str | int",
+        message: dict[str, object],
+    ) -> tuple[str, str | None, dict[str, object] | None] | None:
+        return _handle_photo_message(
+            client=client, processor=self, photo_renderer=photo_renderer, chat_id=chat_id, message=message,
+        )
+
+    def handle_pre_dispatch_text(
+        self, *, client: object, chat_id: "str | int", text_value: "str | None",
+    ) -> tuple[str, ...] | None:
+        if text_value is None or _extract_command_name(text_value) not in REPUTATION_SNAPSHOT_COMMANDS:
+            return None
+        if not self.is_allowed_chat(chat_id):
+            return ()
+        replies: list[str] = []
+        ack = build_processing_ack(text=text_value)
+        if ack:
+            client.send_message(chat_id=chat_id, text=ack)
+            replies.append(ack)
+        delivery = self.build_reputation_delivery(_extract_command_remainder(text_value))
+        _send_reputation_delivery(client=client, chat_id=chat_id, delivery=delivery)
+        replies.append(delivery.summary_text)
+        return tuple(replies)
 
     def analyze_photo_intent(self, query: TelegramPhotoQuery) -> TelegramPhotoIntentAnalysis:
         return self._photo_intent_analyzer(query)
@@ -915,8 +963,7 @@ class TelegramCommandProcessor:
         except PermissionError:
             logger.debug("Could not remove pending Telegram photo path=%s", path)
 
-    def build_reply(self, *, chat_id: str | int, text: str | None) -> str | None:
-        return self.build_reply_plan(chat_id=chat_id, text=text).execute()
+    # build_reply inherited from CoreCommandProcessor.
 
     def build_pending_photo_reply_plan(
         self,
@@ -992,124 +1039,20 @@ class TelegramCommandProcessor:
             reply_markup=retry_kb,
         )
 
-    def build_pending_text_reply_plan(
+    # build_pending_text_reply_plan inherited from CoreCommandProcessor.
+
+    # build_reply_plan and _build_text_clarification_plan inherited from
+    # CoreCommandProcessor; the price-domain command set below plugs into its
+    # _dispatch_domain_command hook.
+
+    def _dispatch_domain_command(
         self,
+        command: str | None,
+        remainder: str,
         *,
+        content: str,
         chat_id: str | int,
-        text: str | None,
     ) -> TelegramTextReplyPlan | None:
-        pending = self.get_pending_text_clarification(chat_id)
-        if pending is None or text is None:
-            return None
-
-        content = text.strip()
-        if not content or content.startswith("/"):
-            return None
-
-        # "都不是" sentinel option (last numbered choice = len(options) + 1)
-        if content == str(len(pending.options) + 1):
-            return TelegramTextReplyPlan(
-                ack=None,
-                reply="好，請直接回答：否，[您的意圖]",
-            )
-
-        selected = _match_text_clarification_option(content, pending.options)
-        if selected is not None:
-            self.pop_pending_text_clarification(chat_id)
-            plan = self._build_natural_language_reply_plan(selected.intent, chat_id=chat_id)
-            ack_prefix = f"收到，我就照第 {selected.option_number} 個方式處理。"
-            if plan is not None:
-                combined_ack = ack_prefix if not plan.ack else f"{ack_prefix}\n{plan.ack}"
-                return TelegramTextReplyPlan(
-                    ack=combined_ack,
-                    reply=plan.reply,
-                    reply_factory=plan.reply_factory,
-                    reputation_delivery_factory=plan.reputation_delivery_factory,
-                    run_in_background=plan.run_in_background,
-                )
-            return TelegramTextReplyPlan(
-                ack=None,
-                reply=f"{ack_prefix}\n但暫時無法執行該動作，請告訴我更詳細的需求。",
-            )
-
-        override_text = _extract_photo_clarification_override(content)
-        if override_text is not None:
-            self.pop_pending_text_clarification(chat_id)
-            if not override_text:
-                return TelegramTextReplyPlan(
-                    ack=None,
-                    reply="好，請直接告訴我你的意圖。",
-                )
-            rerouted_plan = self.build_reply_plan(chat_id=chat_id, text=override_text)
-            new_pending = self.get_pending_text_clarification(chat_id)
-            if new_pending is not None:
-                # Re-routing produced a fresh clarification — let it speak for itself.
-                return rerouted_plan
-            ack = f"收到，我改照你補充的意思處理：{override_text}"
-            combined_ack = ack if not rerouted_plan.ack else f"{ack}\n{rerouted_plan.ack}"
-            return TelegramTextReplyPlan(
-                ack=combined_ack,
-                reply=rerouted_plan.reply,
-                reply_factory=rerouted_plan.reply_factory,
-                reputation_delivery_factory=rerouted_plan.reputation_delivery_factory,
-            )
-
-        retry_text, retry_kb = _build_pending_text_retry_reply(pending.options)
-        return TelegramTextReplyPlan(
-            ack=None,
-            reply=retry_text,
-            reply_markup=retry_kb,
-        )
-
-    def build_reply_plan(self, *, chat_id: str | int, text: str | None) -> TelegramTextReplyPlan:
-        logger.info(
-            "Telegram message received chat_id=%s text=%s",
-            mask_identifier(chat_id),
-            trim_for_log(text or "", limit=320),
-        )
-        if text is None:
-            return TelegramTextReplyPlan(ack=None, reply=None)
-        if not self.is_allowed_chat(chat_id):
-            logger.warning("Rejected Telegram message from unauthorized chat_id=%s", mask_identifier(chat_id))
-            return TelegramTextReplyPlan(ack=None, reply=None)
-
-        content = text.strip()
-        if not content:
-            return TelegramTextReplyPlan(ack=None, reply="Empty command. Use /help to see supported commands.")
-
-        command = _extract_command_name(content)
-        remainder = _extract_command_remainder(content)
-        logger.debug("Telegram command parsed command=%s remainder=%s", command, trim_for_log(remainder, limit=240))
-
-        if command in {"/start", "/help"}:
-            return TelegramTextReplyPlan(ack=None, reply=self._help_text())
-        if command == "/ping":
-            return TelegramTextReplyPlan(ack=None, reply="pong")
-        if command == "/status":
-            return TelegramTextReplyPlan(ack=None, reply=self._status_text())
-        if command == "/tools":
-            return TelegramTextReplyPlan(ack=None, reply=self._catalog_renderer())
-
-        # Registry extension point: commands injected as data (e.g. aka_no_claw's
-        # /quiz /voice /say …) are dispatched here without a hardcoded branch.
-        spec = self._command_registry.get(command)
-        if spec is not None:
-            if spec.background:
-                return TelegramTextReplyPlan(
-                    ack=spec.ack,
-                    reply=None,
-                    reply_factory=lambda r=remainder, c=chat_id: spec.handler(r, str(c)),
-                    run_in_background=True,
-                )
-            try:
-                result = spec.handler(remainder, str(chat_id))
-            except Exception as exc:  # noqa: BLE001 - surface a friendly failure
-                logger.exception("registered command failed command=%s", command)
-                return TelegramTextReplyPlan(ack=None, reply=f"指令失敗：{exc}")
-            if isinstance(result, tuple):
-                return TelegramTextReplyPlan(ack=spec.ack, reply=result[0], reply_markup=result[1])
-            return TelegramTextReplyPlan(ack=spec.ack, reply=result)
-
         if command in PRICE_LOOKUP_COMMANDS:
             return TelegramTextReplyPlan(
                 ack=build_processing_ack(text=content),
@@ -1164,75 +1107,20 @@ class TelegramCommandProcessor:
                 ack=None,
                 reply=self._handle_set_price(remainder),
             )
-        if not content.startswith("/"):
-            intent = self._route_natural_language(content)
-            if _is_text_intent_ambiguous(intent):
-                # Built-in routing didn't confidently match a command. Give the
-                # growing generated-tool catalog (#52 live integration) first
-                # crack BEFORE the generic "did you mean search/help"
-                # clarification menu. Its cheap lexical gate returns nothing for
-                # irrelevant chatter, so only text that plausibly maps to an
-                # existing tool is diverted; the handler reuses an existing tool,
-                # asks before reusing a fresh one, or offers to generate.
-                if self._unknown_text_handler is not None:
-                    try:
-                        handled = self._unknown_text_handler(content, str(chat_id))
-                    except Exception:
-                        logger.exception("unknown_text_handler failed")
-                        handled = None
-                    if handled is not None:
-                        reply, reply_markup = handled
-                        return TelegramTextReplyPlan(
-                            ack=None, reply=reply, reply_markup=reply_markup
-                        )
-                clarification_plan = self._build_text_clarification_plan(
-                    chat_id=chat_id,
-                    text=content,
-                    top_intent=intent,
-                )
-                if clarification_plan is not None:
-                    return clarification_plan
-            natural_language_plan = self._build_natural_language_reply_plan(intent, chat_id=chat_id)
-            if natural_language_plan is not None:
-                return natural_language_plan
-            clarification_plan = self._build_text_clarification_plan(
-                chat_id=chat_id,
-                text=content,
-                top_intent=intent,
-            )
-            if clarification_plan is not None:
-                return clarification_plan
+        return None
 
-        logger.info("Telegram unknown command command=%s", command)
-        return TelegramTextReplyPlan(
-            ack=None,
-            reply="Unknown command. Use /help, /price, /trend, /snapshot, /search, or send a photo with /scan. You can also ask in natural language.",
+    def _unknown_command_text(self) -> str:
+        return (
+            "Unknown command. Use /help, /price, /trend, /snapshot, /search, "
+            "or send a photo with /scan. You can also ask in natural language."
         )
 
-    def _build_text_clarification_plan(
+    def _build_text_intent_candidates(
         self,
-        *,
-        chat_id: str | int,
         text: str,
         top_intent: "TelegramNaturalLanguageIntent | None",
-    ) -> TelegramTextReplyPlan | None:
-        options = _build_text_intent_candidates(text, top_intent)
-        if not options:
-            return None
-        self.set_pending_text_clarification(
-            PendingTelegramTextClarification(
-                chat_id=str(chat_id),
-                original_text=text,
-                options=options,
-                top_intent=top_intent,
-            )
-        )
-        clar_text, clar_kb = _build_text_clarification_reply(text, options, top_intent)
-        return TelegramTextReplyPlan(
-            ack=None,
-            reply=clar_text,
-            reply_markup=clar_kb,
-        )
+    ) -> tuple[TelegramTextIntentOption, ...]:
+        return _build_text_intent_candidates(text, top_intent)
 
     def _handle_lookup(self, raw: str) -> str:
         try:
@@ -1844,26 +1732,8 @@ class TelegramCommandProcessor:
                 reply_factory=lambda x=q, c=cid: self._command_registry["/snsbuzz"].handler(x, c),
             )
 
-        if intent.intent == "sns_bulk_add_filter":
-            return self._build_sns_bulk_add_filter_plan(
-                chat_id=chat_id,
-                target_domain=intent.bulk_target_domain or "",
-                keywords=intent.bulk_filter_keywords,
-            )
-
-        if intent.intent == "sns_bulk_remove_filter":
-            return self._build_sns_bulk_remove_filter_plan(
-                chat_id=chat_id,
-                target_domain=intent.bulk_target_domain or "",
-                keywords=intent.bulk_filter_keywords,
-            )
-
-        if intent.intent == "sns_bulk_update_schedule":
-            return self._build_sns_bulk_update_schedule_plan(
-                chat_id=chat_id,
-                target_domain=intent.bulk_target_domain or "",
-                minutes=intent.sns_schedule_minutes,
-            )
+        # sns_bulk_add_filter / sns_bulk_remove_filter / sns_bulk_update_schedule —
+        # handled by the aka_no_claw subclass via _build_app_natural_language_reply_plan.
 
         if intent.intent == "sns_clear_filter":
             if not intent.sns_handle:
@@ -1903,225 +1773,9 @@ class TelegramCommandProcessor:
     # _resolve_sns_rule_id / _describe_sns_rule / _handle_sns_clear_filter /
     # _handle_sns_buzz — all moved to openclaw_adapter.sns_commands (Task 2).
 
-    def _build_sns_bulk_add_filter_plan(
-        self,
-        *,
-        chat_id: str | int,
-        target_domain: str,
-        keywords: tuple[str, ...],
-    ) -> "TelegramTextReplyPlan":
-        """Build the preview message for ``sns_bulk_add_filter`` and stash a
-        PendingTelegramSnsBulkUpdate so the confirm/cancel inline buttons
-        know what to do."""
-        if self._sns_db is None:
-            return TelegramTextReplyPlan(ack=None, reply="SNS 監控尚未啟用（sns_db 未設定）。")
-        if not target_domain:
-            return TelegramTextReplyPlan(ack=None, reply="我看不太懂你要對哪類帳號加 filter，請重講一次。")
-        if not keywords:
-            return TelegramTextReplyPlan(ack=None, reply="請告訴我要加哪個 filter 關鍵字。")
-
-        try:
-            from sns_monitor.bulk_filter import (
-                find_accounts_matching_domain,
-                resolve_target_domain_set,
-            )
-        except ImportError:
-            logger.exception("sns_monitor.bulk_filter import failed")
-            return TelegramTextReplyPlan(ack=None, reply="SNS bulk-filter 模組載入失敗。")
-
-        target_set = resolve_target_domain_set(target_domain)
-        accounts = find_accounts_matching_domain(self._sns_db, target_set)
-        if not accounts:
-            return TelegramTextReplyPlan(
-                ack=None,
-                reply=f"找不到任何 domain 跟 {target_domain} 有交集的 SNS 帳號。",
-            )
-
-        kw_display = "、".join(keywords)
-        lines = [
-            f"🎯 找到 {len(accounts)} 個 {target_domain} 相關帳號，要把 filter 加上：{kw_display}",
-            "",
-        ]
-        for rule in accounts[:10]:
-            existing = (
-                f" 現有 filter[{', '.join(rule.include_keywords)}]"
-                if rule.include_keywords else " 現有 filter[]"
-            )
-            domain_label = f" domain[{', '.join(rule.domains)}]" if rule.domains else ""
-            lines.append(f"- @{rule.screen_name}{domain_label}{existing}")
-        if len(accounts) > 10:
-            lines.append(f"  …以及另外 {len(accounts) - 10} 筆")
-        lines.append("")
-        lines.append(f"確認要把「{kw_display}」加進這 {len(accounts)} 個帳號的 filter 嗎？")
-
-        pending = PendingTelegramSnsBulkUpdate(
-            chat_id=str(chat_id),
-            bulk_target_domain=target_domain,
-            keywords=keywords,
-            affected_rule_ids=tuple(r.rule_id for r in accounts),
-            action="add",
-        )
-        self.set_pending_sns_bulk_update(pending)
-
-        reply_markup = {
-            "inline_keyboard": [
-                [{"text": f"✓ 全部修改 ({len(accounts)})", "callback_data": "bulk:c"}],
-                [{"text": "✖️ 取消", "callback_data": "bulk:x"}],
-            ]
-        }
-        return TelegramTextReplyPlan(
-            ack=None,
-            reply="\n".join(lines),
-            reply_markup=reply_markup,
-        )
-
-    def _build_sns_bulk_remove_filter_plan(
-        self,
-        *,
-        chat_id: str | int,
-        target_domain: str,
-        keywords: tuple[str, ...],
-    ) -> "TelegramTextReplyPlan":
-        """Preview for ``sns_bulk_remove_filter`` — symmetric to the add plan
-        but the message text describes a removal, and the pending state
-        carries ``action="remove"``."""
-        if self._sns_db is None:
-            return TelegramTextReplyPlan(ack=None, reply="SNS 監控尚未啟用（sns_db 未設定）。")
-        if not target_domain:
-            return TelegramTextReplyPlan(ack=None, reply="我看不太懂你要對哪類帳號移除 filter 關鍵字，請重講一次。")
-        if not keywords:
-            return TelegramTextReplyPlan(ack=None, reply="請告訴我要移除哪個 filter 關鍵字。")
-
-        try:
-            from sns_monitor.bulk_filter import (
-                find_accounts_matching_domain,
-                resolve_target_domain_set,
-            )
-        except ImportError:
-            logger.exception("sns_monitor.bulk_filter import failed")
-            return TelegramTextReplyPlan(ack=None, reply="SNS bulk-filter 模組載入失敗。")
-
-        target_set = resolve_target_domain_set(target_domain)
-        accounts = find_accounts_matching_domain(self._sns_db, target_set)
-        if not accounts:
-            return TelegramTextReplyPlan(
-                ack=None,
-                reply=f"找不到任何 domain 跟 {target_domain} 有交集的 SNS 帳號。",
-            )
-
-        drop_set = {kw.casefold() for kw in keywords if kw}
-        affected_count = sum(
-            1 for r in accounts if any(kw.casefold() in drop_set for kw in r.include_keywords)
-        )
-
-        kw_display = "、".join(keywords)
-        lines = [
-            f"🗑 找到 {len(accounts)} 個 {target_domain} 相關帳號，要從 filter 移除：{kw_display}",
-            f"   其中 {affected_count} 個目前有這些 keyword（會被改），{len(accounts) - affected_count} 個沒有（不會動）",
-            "",
-        ]
-        for rule in accounts[:10]:
-            existing = (
-                f" 現有 filter[{', '.join(rule.include_keywords)}]"
-                if rule.include_keywords else " 現有 filter[]"
-            )
-            domain_label = f" domain[{', '.join(rule.domains)}]" if rule.domains else ""
-            lines.append(f"- @{rule.screen_name}{domain_label}{existing}")
-        if len(accounts) > 10:
-            lines.append(f"  …以及另外 {len(accounts) - 10} 筆")
-        lines.append("")
-        lines.append(f"確認要從這 {len(accounts)} 個帳號的 filter 移除「{kw_display}」嗎？")
-
-        pending = PendingTelegramSnsBulkUpdate(
-            chat_id=str(chat_id),
-            bulk_target_domain=target_domain,
-            keywords=keywords,
-            affected_rule_ids=tuple(r.rule_id for r in accounts),
-            action="remove",
-        )
-        self.set_pending_sns_bulk_update(pending)
-
-        reply_markup = {
-            "inline_keyboard": [
-                [{"text": f"✓ 全部移除 ({affected_count})", "callback_data": "bulk:c"}],
-                [{"text": "✖️ 取消", "callback_data": "bulk:x"}],
-            ]
-        }
-        return TelegramTextReplyPlan(
-            ack=None,
-            reply="\n".join(lines),
-            reply_markup=reply_markup,
-        )
-
-    def _build_sns_bulk_update_schedule_plan(
-        self,
-        *,
-        chat_id: str | int,
-        target_domain: str,
-        minutes: int | None,
-    ) -> "TelegramTextReplyPlan":
-        """Preview for ``sns_bulk_update_schedule`` — same pattern but the
-        pending state carries ``action="set_schedule"`` and ``schedule_minutes``."""
-        if self._sns_db is None:
-            return TelegramTextReplyPlan(ack=None, reply="SNS 監控尚未啟用（sns_db 未設定）。")
-        if not target_domain:
-            return TelegramTextReplyPlan(ack=None, reply="我看不太懂你要對哪類帳號改 schedule，請重講一次。")
-        if minutes is None or not (5 <= minutes <= 1440):
-            return TelegramTextReplyPlan(ack=None, reply="請給一個有效的分鐘數 (5-1440)。")
-
-        try:
-            from sns_monitor.bulk_filter import (
-                find_accounts_matching_domain,
-                resolve_target_domain_set,
-            )
-        except ImportError:
-            logger.exception("sns_monitor.bulk_filter import failed")
-            return TelegramTextReplyPlan(ack=None, reply="SNS bulk-filter 模組載入失敗。")
-
-        target_set = resolve_target_domain_set(target_domain)
-        accounts = find_accounts_matching_domain(self._sns_db, target_set)
-        if not accounts:
-            return TelegramTextReplyPlan(
-                ack=None,
-                reply=f"找不到任何 domain 跟 {target_domain} 有交集的 SNS 帳號。",
-            )
-        already_count = sum(1 for r in accounts if r.schedule_minutes == minutes)
-        will_change = len(accounts) - already_count
-
-        lines = [
-            f"⏱ 找到 {len(accounts)} 個 {target_domain} 相關帳號，要把 schedule 改成 {minutes} 分鐘",
-            f"   其中 {already_count} 個本來就是 {minutes} 分鐘（不會動），{will_change} 個會被改",
-            "",
-        ]
-        for rule in accounts[:10]:
-            domain_label = f" domain[{', '.join(rule.domains)}]" if rule.domains else ""
-            lines.append(f"- @{rule.screen_name}{domain_label} 目前 schedule={rule.schedule_minutes}m")
-        if len(accounts) > 10:
-            lines.append(f"  …以及另外 {len(accounts) - 10} 筆")
-        lines.append("")
-        lines.append(f"確認要把這 {len(accounts)} 個帳號的 schedule 改成 {minutes} 分鐘嗎？")
-
-        pending = PendingTelegramSnsBulkUpdate(
-            chat_id=str(chat_id),
-            bulk_target_domain=target_domain,
-            keywords=(),
-            affected_rule_ids=tuple(r.rule_id for r in accounts),
-            action="set_schedule",
-            schedule_minutes=minutes,
-        )
-        self.set_pending_sns_bulk_update(pending)
-
-        reply_markup = {
-            "inline_keyboard": [
-                [{"text": f"✓ 全部修改 ({will_change})", "callback_data": "bulk:c"}],
-                [{"text": "✖️ 取消", "callback_data": "bulk:x"}],
-            ]
-        }
-        return TelegramTextReplyPlan(
-            ack=None,
-            reply="\n".join(lines),
-            reply_markup=reply_markup,
-        )
+    # _build_sns_bulk_add_filter_plan / _build_sns_bulk_remove_filter_plan /
+    # _build_sns_bulk_update_schedule_plan — moved to openclaw_adapter.sns_commands
+    # (aka_no_claw), wired via the subclass's _build_app_natural_language_reply_plan.
 
     def _route_natural_language(self, text: str) -> TelegramNaturalLanguageIntent | None:
         # Fast-path: an embedding match short-circuits zero-arg commands
@@ -2190,10 +1844,7 @@ class TelegramCommandProcessor:
                 )
         return _caption_requests_image_translation(caption)
 
-    def _status_text(self) -> str:
-        if self._status_renderer is not None:
-            return self._status_renderer()
-        return "OpenClaw Telegram bot is online."
+    # _status_text inherited from CoreCommandProcessor.
 
     def _help_text(self) -> str:
         return "\n".join(
@@ -2670,170 +2321,6 @@ def build_processing_ack(*, text: str | None = None, has_photo: bool = False) ->
     return None
 
 
-# ── Poll-loop health helpers ───────────────────────────────────────────────
-
-
-class PollHeartbeat:
-    """File-mtime liveness beacon written by the Telegram poll loop each round.
-
-    A companion watchdog thread calls is_stale() to detect the known failure
-    mode: poll loop dies while non-daemon monitor threads keep the process
-    alive, causing launchd to believe the service is healthy while /new and
-    all commands are dead.
-    """
-
-    def __init__(self, path: Path) -> None:
-        self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-
-    def touch(self) -> None:
-        try:
-            self.path.write_text(str(time.time()))
-        except OSError:
-            logger.warning("Heartbeat write failed path=%s", self.path)
-
-    def last_beat(self) -> float | None:
-        try:
-            return float(self.path.read_text().strip())
-        except (OSError, ValueError):
-            return None
-
-    def is_stale(self, max_age_seconds: float, *, now: float | None = None) -> bool:
-        beat = self.last_beat()
-        if beat is None:
-            return False  # never written yet — still in warmup, not stale
-        ref = time.time() if now is None else now
-        return (ref - beat) > max_age_seconds
-
-
-@contextlib.contextmanager
-def _heartbeat_beacon(
-    heartbeat: PollHeartbeat,
-    *,
-    interval_seconds: float = 20.0,
-    max_seconds: float = 240.0,
-):
-    """Keep the poll-loop heartbeat fresh while a slow handler runs.
-
-    The loop only touches the heartbeat once per poll round, so a legitimately
-    slow command (e.g. /search doing reformulation + page fetches + LLM
-    summarisation, which can take minutes) looks like a wedged loop and trips
-    the watchdog into a false restart. This refreshes the beacon every
-    ``interval_seconds`` for up to ``max_seconds`` — a busy-but-alive handler
-    survives, while one that truly hangs past ``max_seconds`` still goes stale
-    and triggers recovery.
-    """
-    stop = threading.Event()
-    deadline = time.monotonic() + max_seconds
-
-    def _beat() -> None:
-        while not stop.wait(interval_seconds):
-            if time.monotonic() >= deadline:
-                return
-            heartbeat.touch()
-
-    thread = threading.Thread(target=_beat, name="hb-beacon", daemon=True)
-    thread.start()
-    try:
-        yield
-    finally:
-        stop.set()
-
-
-def _is_conflict_error(exc: BaseException) -> bool:
-    """True when exc looks like a Telegram 409 Conflict (duplicate poller)."""
-    msg = str(exc)
-    return "409" in msg or "Conflict" in msg or "terminated by other getUpdates" in msg
-
-
-def _drain_pending_updates(
-    client: TelegramBotClient,
-    *,
-    max_attempts: int = 6,
-    backoff_seconds: float = 5.0,
-    sleep_fn: Callable[[float], None] = time.sleep,
-) -> int | None:
-    """Drain queued updates at startup, tolerating transient 409 Conflicts.
-
-    Telegram holds the previous session's long-poll slot for up to
-    poll_timeout seconds after a restart; calling getUpdates during that
-    window returns 409 Conflict. We retry with backoff instead of letting the
-    RuntimeError propagate to SystemExit (which kills the poll loop while
-    non-daemon threads keep the process alive — the silent-death failure mode
-    documented in CLAUDE.md).
-
-    Returns the next offset to start from, or None if nothing was pending.
-    """
-    for attempt in range(1, max_attempts + 1):
-        try:
-            pending = client.get_updates(timeout=0)
-            if pending:
-                return int(pending[-1]["update_id"]) + 1
-            return None
-        except RuntimeError as exc:
-            if not _is_conflict_error(exc):
-                raise
-            logger.warning(
-                "Startup drain hit 409 Conflict (attempt %d/%d); sleeping %.0fs before retry",
-                attempt, max_attempts, backoff_seconds,
-            )
-            sleep_fn(backoff_seconds)
-    logger.error(
-        "Startup drain gave up after %d 409 attempts; continuing with offset=None",
-        max_attempts,
-    )
-    return None
-
-
-def start_poll_watchdog(
-    *,
-    heartbeat: PollHeartbeat,
-    client: TelegramBotClient,
-    alert_chat_ids: frozenset[str],
-    max_age_seconds: float,
-    check_interval_seconds: float = 30.0,
-    exit_on_stale: bool = True,
-) -> threading.Thread:
-    """Daemon thread that detects a wedged poll loop and forces a restart.
-
-    When the poll loop dies but daemon monitor threads keep the process alive,
-    launchd sees a healthy process while the bot is non-functional. This
-    watchdog notices the stale heartbeat, sends an alert to the admin chat,
-    then hard-exits so launchd KeepAlive respawns a clean instance.
-    """
-
-    def _run() -> None:
-        alerted = False
-        while True:
-            time.sleep(check_interval_seconds)
-            if not heartbeat.is_stale(max_age_seconds):
-                alerted = False
-                continue
-            logger.error(
-                "Poll loop heartbeat stale > %.0fs — poll loop likely wedged",
-                max_age_seconds,
-            )
-            if not alerted:
-                for cid in alert_chat_ids:
-                    try:
-                        client.send_message(
-                            chat_id=cid,
-                            text="⚠️ OpenClaw poll loop 心跳停止，準備重啟。",
-                        )
-                    except Exception:  # alert path must never crash the watchdog
-                        logger.exception(
-                            "Watchdog alert send failed chat_id=%s", mask_identifier(cid)
-                        )
-                alerted = True
-            if exit_on_stale:
-                logger.error("Watchdog forcing exit so launchd KeepAlive respawns")
-                os._exit(1)
-
-    thread = threading.Thread(target=_run, name="poll-watchdog", daemon=True)
-    thread.start()
-    return thread
-
-
 def run_telegram_polling(
     *,
     token: str,
@@ -2866,6 +2353,7 @@ def run_telegram_polling(
     drop_pending_updates: bool = True,
     heartbeat_path: Path | None = None,
     watchdog_enabled: bool = True,
+    processor_factory: "Callable[..., TelegramCommandProcessor] | None" = None,
 ) -> int:
     if not allowed_chat_ids:
         raise RuntimeError(
@@ -2886,7 +2374,7 @@ def run_telegram_polling(
     if drop_pending_updates:
         offset = _drain_pending_updates(client)
 
-    processor = TelegramCommandProcessor(
+    processor = (processor_factory or TelegramCommandProcessor)(
         lookup_renderer=lookup_renderer,
         board_loader=board_loader,
         catalog_renderer=catalog_renderer,
@@ -3051,126 +2539,8 @@ def _handle_condition_callback(
     return "未知操作", None, None
 
 
-def _handle_sns_bulk_update_callback(
-    *,
-    processor: TelegramCommandProcessor,
-    action: str,
-    chat_id: str | int,
-    original_text: str,
-) -> tuple[str | None, str | None, dict[str, object] | None]:
-    """Resolve a `bulk:c` / `bulk:x` callback (confirm / cancel of an SNS
-    bulk filter-add preview). Returns (toast, edit_text, edit_reply_markup).
-
-    The pending preview state is popped on either action so a second tap is
-    harmless. Confirm applies the keyword merge via
-    ``sns_monitor.bulk_filter.apply_bulk_keyword_filter_add`` against the
-    rule ids captured at preview time — fresh DB lookups, so any concurrent
-    deletion shows up as fewer updates.
-    """
-    pending = processor.pop_pending_sns_bulk_update(chat_id)
-    if pending is None:
-        return "操作已過期，請重新輸入", f"{original_text}\n\n（操作已過期）", None
-
-    if action == "x":
-        return "已取消", f"{original_text}\n\n（已取消）", None
-
-    if action != "c":
-        return "未知操作", None, None
-
-    if processor._sns_db is None:
-        return "SNS 監控未啟用", f"{original_text}\n\n（SNS 監控未啟用）", None
-
-    try:
-        from sns_monitor.bulk_filter import (
-            apply_bulk_keyword_filter_add,
-            apply_bulk_keyword_filter_remove,
-            apply_bulk_schedule_update,
-        )
-    except ImportError:
-        logger.exception("sns_monitor.bulk_filter import failed in bulk callback")
-        return "套用失敗", f"{original_text}\n\n（套用失敗：模組載入錯誤）", None
-
-    fresh_accounts = []
-    for rule_id in pending.affected_rule_ids:
-        rule = processor._sns_db.get_watch_rule(rule_id)
-        if rule is not None:
-            fresh_accounts.append(rule)
-
-    if pending.action == "remove":
-        updated = apply_bulk_keyword_filter_remove(
-            processor._sns_db, fresh_accounts, pending.keywords
-        )
-        kw_display = "、".join(pending.keywords)
-        if not updated:
-            return (
-                "沒有需要更新的帳號",
-                f"{original_text}\n\n（沒有帳號需要更新，沒人有「{kw_display}」）",
-                None,
-            )
-        toast = f"已修改 {len(updated)} 個帳號"
-        new_text = f"{original_text}\n\n✓ 已從 {len(updated)} 個帳號 filter 移除「{kw_display}」"
-        return toast, new_text, None
-
-    if pending.action == "set_schedule":
-        if pending.schedule_minutes is None:
-            return "套用失敗", f"{original_text}\n\n（套用失敗：schedule_minutes 未設定）", None
-        updated = apply_bulk_schedule_update(
-            processor._sns_db, fresh_accounts, pending.schedule_minutes
-        )
-        if not updated:
-            return (
-                "沒有需要更新的帳號",
-                f"{original_text}\n\n（沒有帳號需要更新，全部已經是 {pending.schedule_minutes} 分鐘）",
-                None,
-            )
-        toast = f"已修改 {len(updated)} 個帳號"
-        new_text = f"{original_text}\n\n✓ 已把 {len(updated)} 個帳號的 schedule 改成 {pending.schedule_minutes} 分鐘"
-        return toast, new_text, None
-
-    # Default / "add"
-    updated = apply_bulk_keyword_filter_add(
-        processor._sns_db, fresh_accounts, pending.keywords
-    )
-
-    kw_display = "、".join(pending.keywords)
-    if not updated:
-        return (
-            "沒有需要更新的帳號",
-            f"{original_text}\n\n（沒有帳號需要更新，全部已經有「{kw_display}」）",
-            None,
-        )
-    toast = f"已修改 {len(updated)} 個帳號"
-    new_text = f"{original_text}\n\n✓ 已修改 {len(updated)} 個帳號 filter 加上「{kw_display}」"
-    return toast, new_text, None
-
-
-def _list_view_renderer(processor: TelegramCommandProcessor, list_kind: str):
-    """Return the ``render_*_view`` callable for the given list kind, or None.
-
-    Checks the processor's view registry first (injected by aka_no_claw for
-    kinds like km/kc), then falls back to built-in method lookup.
-    """
-    registered = processor._view_registry.get(list_kind)
-    if registered is not None:
-        return registered
-    return {
-        "wl": getattr(processor, "render_watchlist_view", None),
-        "hl": getattr(processor, "render_huntlist_view", None),
-    }.get(list_kind)
-
-
-def _list_item_deleter(processor: TelegramCommandProcessor, list_kind: str):
-    """Return ``(callable(item_id) -> bool, label)`` for the given list kind, or (None, None).
-
-    Checks the processor's deleter registry first (injected by aka_no_claw),
-    then falls back to built-in method dispatch.
-    """
-    registered = processor._deleter_registry.get(list_kind)
-    if registered is not None:
-        return registered
-    if list_kind == "wl":
-        return processor.delete_marketplace_watch_by_id, "Marketplace 追蹤"
-    return None, None
+# _handle_sns_bulk_update_callback — moved to openclaw_adapter.sns_commands
+# (aka_no_claw) as handle_sns_bulk_update_callback.
 
 
 def handle_telegram_callback_query(
@@ -3180,355 +2550,15 @@ def handle_telegram_callback_query(
     callback_query: dict[str, object],
     photo_renderer: PhotoLookupRenderer | None = None,
 ) -> None:
-    """Dispatch a Telegram callback_query (e.g. inline-button tap) to its handler.
-
-    Callback-data dispatch table:
-      - ``snsdel:<handle>``         → notification one-tap delete (legacy path
-        used by the SNS auto-add notice).
-      - ``pg:<list>:<page>:<mode>`` → repaginate / toggle a list view
-        (read mode ↔ edit mode), where ``list`` is ``sl`` / ``wl`` / ``hl``.
-      - ``del:<list>:<id>``         → delete one list row and re-render the
-        same page in edit mode (drops back a page if the row was the last
-        one on the last page).
-      - ``close:<list>``            → clear the inline keyboard and mark the
-        message as closed.
-      - ``popt:<N>`` / ``topt:<N>`` → pick option N from a pending photo /
-        text clarification — the same action the user would have triggered by
-        typing the digit N as a normal message.
-    """
-    callback_id = callback_query.get("id")
-    data = callback_query.get("data")
-    message = callback_query.get("message")
-    if not isinstance(callback_id, str) or not isinstance(data, str) or not isinstance(message, dict):
-        return
-
-    chat = message.get("chat")
-    chat_id = chat.get("id") if isinstance(chat, dict) else None
-    message_id = message.get("message_id")
-    original_text = message.get("text") if isinstance(message.get("text"), str) else ""
-
-    if chat_id is None or not isinstance(message_id, int):
-        return
-
-    if not processor.is_allowed_chat(chat_id):
-        logger.warning(
-            "Rejected Telegram callback_query from unauthorized chat_id=%s",
-            mask_identifier(chat_id),
-        )
-        try:
-            client.answer_callback_query(callback_query_id=callback_id)
-        except Exception:
-            logger.exception("answer_callback_query failed for unauthorized chat_id=%s", mask_identifier(chat_id))
-        return
-
-    prefix, _, payload = data.partition(":")
-    toast: str | None = "未知按鈕"
-    new_text: str | None = None
-    new_reply_markup: dict[str, object] | None = None
-    rerender = False
-
-    # Registry extension point: callback prefixes injected as data (e.g.
-    # aka_no_claw's quiz / voice / ragkeep / ragdel) route here without a
-    # hardcoded branch. Handler returns (toast, new_text, reply_markup).
-    cb = processor._callback_registry.get(prefix)
-    if cb is not None:
-        try:
-            toast, new_text, new_reply_markup = cb(payload, original_text, str(chat_id))
-            rerender = new_text is not None
-        except Exception:
-            logger.exception("registered callback failed prefix=%s", prefix)
-            toast = "操作失敗，請看 log"
-    elif prefix == "pg" and payload.count(":") == 2:
-        list_kind, page_str, mode = payload.split(":", 2)
-        renderer = _list_view_renderer(processor, list_kind)
-        if renderer is None:
-            toast = "未知清單"
-        else:
-            try:
-                page = int(page_str)
-            except ValueError:
-                page = 0
-            new_text, new_reply_markup, _ = renderer(page=page, mode=mode)
-            toast = None
-            rerender = True
-    elif prefix == "del" and payload.count(":") == 1:
-        list_kind, item_id = payload.split(":", 1)
-        deleter, label = _list_item_deleter(processor, list_kind)
-        renderer = _list_view_renderer(processor, list_kind)
-        if deleter is None or renderer is None:
-            toast = "未知清單"
-        else:
-            removed = deleter(item_id)
-            toast = "✓ 已刪除" if removed else "已經不在清單"
-            # Re-read the same page in edit mode; helper auto-clamps if the
-            # last item on the last page just vanished.
-            new_text, new_reply_markup, _ = renderer(page=_guess_current_page(original_text), mode=LIST_VIEW_MODE_EDIT)
-            rerender = True
-    elif prefix == "close" and payload:
-        list_kind = payload
-        if _list_view_renderer(processor, list_kind) is None:
-            toast = "未知清單"
-        else:
-            new_text = f"{original_text}\n\n（已關閉）"
-            new_reply_markup = None
-            toast = None
-            rerender = True
-    elif prefix == "cond" and payload:
-        # `cond:<watch_id>:open` | `cond:<watch_id>:t:<id>` | `cond:<watch_id>:done`
-        parts = payload.split(":")
-        watch_id = parts[0] if parts else ""
-        action = parts[1] if len(parts) >= 2 else ""
-        toast_out, edit_text, edit_kb = _handle_condition_callback(
-            processor=processor,
-            watch_id=watch_id,
-            action=action,
-            extra=parts[2] if len(parts) >= 3 else "",
-            original_text=original_text,
-        )
-        if toast_out is not None:
-            toast = toast_out
-        if edit_text is not None:
-            new_text = edit_text
-            new_reply_markup = edit_kb
-            rerender = True
-    elif prefix == "bulk" and payload in ("c", "x"):
-        # bulk SNS-filter update preview confirm / cancel.
-        toast_out, edit_text, edit_kb = _handle_sns_bulk_update_callback(
-            processor=processor,
-            action=payload,
-            chat_id=chat_id,
-            original_text=original_text,
-        )
-        if toast_out is not None:
-            toast = toast_out
-        if edit_text is not None:
-            new_text = edit_text
-            new_reply_markup = edit_kb
-            rerender = True
-    elif prefix in ("popt", "topt") and payload.isdigit():
-        option_n = int(payload)
-        is_photo = prefix == "popt"
-        # Peek at the pending state to find the prompt for this option — we
-        # need it for the audit line before `build_pending_*_reply_plan`
-        # consumes it.
-        pending = (
-            processor.get_pending_photo_clarification(chat_id) if is_photo
-            else processor.get_pending_text_clarification(chat_id)
-        )
-        if pending is None:
-            toast = "選項已處理或過期"
-            new_text = f"{original_text}\n\n（選項已過期）"
-            new_reply_markup = None
-            rerender = True
-        else:
-            picked_prompt = next(
-                (o.prompt for o in pending.options if o.option_number == option_n),
-                None,
-            )
-            if picked_prompt is None:
-                toast = "找不到該選項"
-            else:
-                new_text = f"{original_text}\n\n✓ 已選 {option_n}. {picked_prompt}"
-                new_reply_markup = None
-                rerender = True
-                toast = f"已選 {option_n}"
-                # Run the same plan the user would have triggered by typing N.
-                if is_photo:
-                    plan = processor.build_pending_photo_reply_plan(
-                        chat_id=chat_id, text=str(option_n), photo_renderer=photo_renderer
-                    )
-                else:
-                    plan = processor.build_pending_text_reply_plan(
-                        chat_id=chat_id, text=str(option_n)
-                    )
-                if plan is not None:
-                    try:
-                        _send_text_reply_plan(client=client, chat_id=chat_id, plan=plan)
-                    except Exception:
-                        logger.exception(
-                            "Sending clarification plan from callback failed chat_id=%s prefix=%s n=%d",
-                            mask_identifier(chat_id), prefix, option_n,
-                        )
-    elif prefix == "wedit" and payload:
-        # Open single-watch detailed edit view
-        result = _render_watch_edit_view(processor, payload)
-        if result:
-            new_text, new_reply_markup = result
-            rerender = True
-        else:
-            toast = "找不到該追蹤"
-
-    elif prefix == "wmkt" and payload.count(":") == 1:
-        # Toggle a marketplace on/off for a watch
-        watch_id, market = payload.split(":", 1)
-        watch_db = getattr(processor, "_watch_db", None)
-        watch_inbox = getattr(processor, "_watch_inbox", None)
-        if watch_db and watch_id:
-            watch = watch_db.get_marketplace_watch(watch_id)
-            if watch:
-                current = set(watch.markets)
-                name, emoji = _marketplace_source_display(market)
-                if market in current:
-                    if len(current) == 1:
-                        toast = "至少要保留一個平台"
-                    else:
-                        current.remove(market)
-                        new_mkt = tuple(m for m in DEFAULT_MARKETS if m in current)
-                        if watch_inbox is not None:
-                            watch_inbox.push("update_watch", {"watch_id": watch_id, "markets": list(new_mkt)})
-                        else:
-                            watch_db.update_marketplace_watch(watch_id, markets=new_mkt)
-                        toast = f"已移除 {emoji}{name}"
-                else:
-                    current.add(market)
-                    new_mkt = tuple(m for m in DEFAULT_MARKETS if m in current)
-                    if watch_inbox is not None:
-                        watch_inbox.push("update_watch", {"watch_id": watch_id, "markets": list(new_mkt)})
-                    else:
-                        watch_db.update_marketplace_watch(watch_id, markets=new_mkt)
-                    toast = f"已加入 {emoji}{name}"
-                result = _render_watch_edit_view(processor, watch_id)
-                if result:
-                    new_text, new_reply_markup = result
-                    rerender = True
-            else:
-                toast = "找不到該追蹤"
-
-    elif prefix == "wprc" and payload:
-        # Send ForceReply message asking for new price
-        watch_db = getattr(processor, "_watch_db", None)
-        if watch_db:
-            watch = watch_db.get_marketplace_watch(payload)
-            if watch:
-                fr_text = (
-                    f"請輸入「{watch.query}」的新目標上限（日圓整數，例：25000）：\n"
-                    f"[wprc:{payload}]"
-                )
-                try:
-                    client.send_message(
-                        chat_id=chat_id,
-                        text=fr_text,
-                        reply_markup={"force_reply": True, "selective": True},
-                    )
-                except Exception:
-                    logger.exception("wprc: ForceReply send failed watch_id=%s", payload)
-                    toast = "發送失敗"
-            else:
-                toast = "找不到該追蹤"
-
-    elif prefix == "fbprc" and payload:
-        # Price-feedback callback: store pending state + send ForceReply asking for URL.
-        feedback_service = getattr(processor, "_feedback_service", None)
-        watch_db = getattr(processor, "_watch_db", None)
-        if feedback_service is None or watch_db is None:
-            toast = "回饋功能未啟用"
-        else:
-            item = watch_db.find_item(payload)
-            if item is None:
-                toast = "找不到該品項，可能已過期"
-            else:
-                fair_value = watch_db.latest_fair_value_for(payload)
-                processor.set_pending_price_feedback(
-                    PendingTelegramPriceFeedback(
-                        chat_id=str(chat_id),
-                        item_id=payload,
-                        original_fair_value_jpy=fair_value,
-                    )
-                )
-                fr_text = (
-                    "請貼上你覺得合理價格的參考 URL（必須是公開可讀的網頁）：\n"
-                    f"[fbprc:{payload}]"
-                )
-                try:
-                    client.send_message(
-                        chat_id=chat_id,
-                        text=fr_text,
-                        reply_markup={"force_reply": True, "selective": True},
-                    )
-                    toast = "好的，等你貼 URL"
-                except Exception:
-                    logger.exception("fbprc: ForceReply send failed item_id=%s", payload)
-                    toast = "發送失敗"
-
-    elif prefix == "fbpos" and payload:
-        # Positive-feedback callback: one-tap thumbs-up, no ForceReply.
-        # Writes a polarity='positive' row directly via feedback_service.
-        feedback_service = getattr(processor, "_feedback_service", None)
-        watch_db = getattr(processor, "_watch_db", None)
-        if feedback_service is None or watch_db is None:
-            toast = "回饋功能未啟用"
-        else:
-            item = watch_db.find_item(payload)
-            if item is None:
-                toast = "找不到該品項，可能已過期"
-            else:
-                fair_value = watch_db.latest_fair_value_for(payload)
-                try:
-                    from tcg_tracker.catalog import TcgCardSpec as _TcgCardSpec
-                    spec = _TcgCardSpec.from_tracked_item(item)
-                except Exception:
-                    logger.exception("fbpos: failed to build spec from item_id=%s", payload)
-                    toast = "解析品項失敗"
-                else:
-                    try:
-                        feedback_service.submit_positive(
-                            item=item,
-                            spec=spec,
-                            chat_id=chat_id,
-                            original_fair_value_jpy=fair_value,
-                        )
-                        toast = "👍 已記錄"
-                    except Exception:
-                        logger.exception("fbpos: submit_positive failed item_id=%s", payload)
-                        toast = "回饋寫入失敗"
-
-    elif prefix == "wback":
-        # Return from watch edit view to watchlist edit mode
-        text, kb, _ = processor.render_watchlist_view(mode=LIST_VIEW_MODE_EDIT)
-        new_text = text
-        new_reply_markup = kb
-        rerender = True
-
-    elif prefix == "noop":
-        pass  # label buttons — silently acknowledge, no action
-    else:
-        logger.warning("Unknown callback_query prefix=%r data=%r", prefix, data)
-
-    if rerender and new_text is not None:
-        try:
-            client.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text=new_text,
-                reply_markup=new_reply_markup,
-            )
-        except Exception:
-            logger.exception(
-                "edit_message_text failed chat_id=%s message_id=%s",
-                mask_identifier(chat_id),
-                message_id,
-            )
-
-    try:
-        client.answer_callback_query(callback_query_id=callback_id, text=toast)
-    except Exception:
-        logger.exception("answer_callback_query failed callback_id=%s", callback_id)
-
-
-_PAGE_HEADER_RE = re.compile(r"第\s*(\d+)\s*/\s*(\d+)\s*頁")
-
-
-def _guess_current_page(message_text: str) -> int:
-    """Pull the 0-based page index out of a list-view header line.
-
-    The header looks like "📋 SNS 監控規則  第 2/3 頁（共 13 筆）"; we read
-    the "2" and return it as a 0-based index (so 2 → 1). Returns 0 if no
-    header is found.
-    """
-    match = _PAGE_HEADER_RE.search(message_text)
-    if not match:
-        return 0
-    return max(0, int(match.group(1)) - 1)
+    """Thin wrapper: dispatch delegated to telegram_core.polling (Phase 3).
+    Kept here (same name/signature) so existing call sites and tests are
+    unaffected by the extraction."""
+    return _core_handle_telegram_callback_query(
+        client=client,
+        processor=processor,
+        callback_query=callback_query,
+        photo_renderer=photo_renderer,
+    )
 
 
 def handle_telegram_message(
@@ -3538,257 +2568,15 @@ def handle_telegram_message(
     photo_renderer: PhotoLookupRenderer,
     message: dict[str, object],
 ) -> tuple[str, ...]:
-    chat = message.get("chat")
-    if not isinstance(chat, dict):
-        return ()
-    chat_id = chat.get("id")
-    if chat_id is None:
-        return ()
-    if not processor.is_allowed_chat(chat_id):
-        logger.warning("Rejected Telegram message from unauthorized chat_id=%s", mask_identifier(chat_id))
-        return ()
-
-    replies: list[str] = []
-    text = message.get("text")
-    text_value = text if isinstance(text, str) else None
-    photo_items = message.get("photo")
-    has_photo = isinstance(photo_items, list) and bool(photo_items)
-
-    # ForceReply price-feedback URL — check before intake ack so it doesn't misfire NLP
-    if text_value and not has_photo:
-        reply_to = message.get("reply_to_message")
-        if isinstance(reply_to, dict):
-            rt_text = reply_to.get("text") or ""
-            fbprc_m = _FBPRC_TAG_RE.search(rt_text) if isinstance(rt_text, str) else None
-            if fbprc_m:
-                pending = processor.pop_pending_price_feedback(chat_id)
-                url = text_value.strip()
-                if not (url.startswith("http://") or url.startswith("https://")):
-                    client.send_message(chat_id=chat_id, text="⚠️ 這看起來不是合法 URL，回饋已取消。")
-                    return ("⚠️ 不是合法 URL",)
-                if pending is None:
-                    client.send_message(chat_id=chat_id, text="⚠️ 該回饋對話已過期，請重新點擊「不合理」。")
-                    return ("⚠️ 過期",)
-                feedback_service = getattr(processor, "_feedback_service", None)
-                watch_db = getattr(processor, "_watch_db", None)
-                if feedback_service is None or watch_db is None:
-                    client.send_message(chat_id=chat_id, text="⚠️ 回饋服務未啟用。")
-                    return ("⚠️ 未啟用",)
-                item = watch_db.find_item(pending.item_id)
-                if item is None:
-                    client.send_message(chat_id=chat_id, text="⚠️ 找不到對應品項。")
-                    return ("⚠️ 品項遺失",)
-                # Build TcgCardSpec from TrackedItem
-                try:
-                    from tcg_tracker.catalog import TcgCardSpec as _TcgCardSpec
-                    spec = _TcgCardSpec.from_tracked_item(item)
-                except Exception as exc:
-                    logger.exception("fbprc consumer: failed to build spec from item_id=%s: %s", pending.item_id, exc)
-                    client.send_message(chat_id=chat_id, text="⚠️ 解析品項失敗。")
-                    return ("⚠️ 解析失敗",)
-                try:
-                    outcome = feedback_service.submit(
-                        item=item,
-                        spec=spec,
-                        chat_id=chat_id,
-                        original_fair_value_jpy=pending.original_fair_value_jpy,
-                        claimed_url=url,
-                    )
-                except Exception:
-                    logger.exception("Feedback service failed for chat_id=%s url=%s", chat_id, url)
-                    client.send_message(chat_id=chat_id, text="⚠️ 抓取／分析時出現錯誤，已記錄。")
-                    return ("⚠️ 內部錯誤",)
-                client.send_message(chat_id=chat_id, text=outcome.summary_for_user)
-                return (outcome.summary_for_user,)
-
-            wprc_m = _WPRC_TAG_RE.search(rt_text) if isinstance(rt_text, str) else None
-            if wprc_m:
-                watch_id = wprc_m.group(1)
-                price_str = text_value.strip().replace(",", "").replace("¥", "").replace("円", "")
-                watch_db = getattr(processor, "_watch_db", None)
-                if price_str.isdigit() and watch_db:
-                    new_price = int(price_str)
-                    watch = watch_db.get_marketplace_watch(watch_id)
-                    if watch:
-                        watch_db.update_marketplace_watch(watch_id, price_threshold_jpy=new_price)
-                        result = _render_watch_edit_view(processor, watch_id)
-                        reply_text = f"✓ 已更新上限 ¥{new_price:,}"
-                        reply_markup = result[1] if result else None
-                        msg_text = f"{reply_text}\n\n{result[0]}" if result else reply_text
-                        client.send_message(chat_id=chat_id, text=msg_text, reply_markup=reply_markup)
-                        return (reply_text,)
-                else:
-                    client.send_message(chat_id=chat_id, text="⚠️ 請輸入純數字，例：25000")
-                    return ("⚠️ 格式錯誤",)
-
-    # Immediate intake ack — the downstream pipeline can take a while
-    # (vision/OCR/LLM calls), so let the user know we've received their
-    # message before we start the real work.
-    if has_photo:
-        _photo_caption = message.get("caption")
-        _photo_caption = _photo_caption if isinstance(_photo_caption, str) else None
-        if processor.caption_requests_image_translation(_photo_caption):
-            intake_ack = "已理解為：圖片文字翻譯，正在 OCR 並翻成繁體中文…（約 1–2 分鐘）"
-        else:
-            intake_ack = "已收到圖片，開始解讀使用者意圖"
-    elif text_value is not None:
-        intake_ack = "已收到訊息，開始解讀使用者意圖"
-    else:
-        intake_ack = None
-    if intake_ack is not None:
-        try:
-            client.send_message(chat_id=chat_id, text=intake_ack)
-        except Exception:
-            logger.exception("Intake ack send failed chat_id=%s", mask_identifier(chat_id))
-        else:
-            replies.append(intake_ack)
-
-    pending_plan = processor.build_pending_photo_reply_plan(
-        chat_id=chat_id,
-        text=text_value,
+    """Thin wrapper: dispatch delegated to telegram_core.polling (Phase 3).
+    Kept here (same name/signature) so existing call sites and tests are
+    unaffected by the extraction."""
+    return _core_handle_telegram_message(
+        client=client,
+        processor=processor,
         photo_renderer=photo_renderer,
+        message=message,
     )
-    if pending_plan is not None:
-        replies.extend(_send_text_reply_plan(client=client, chat_id=chat_id, plan=pending_plan))
-        return tuple(replies)
-
-    if not has_photo:
-        text_pending_plan = processor.build_pending_text_reply_plan(
-            chat_id=chat_id,
-            text=text_value,
-        )
-        if text_pending_plan is not None:
-            replies.extend(_send_text_reply_plan(client=client, chat_id=chat_id, plan=text_pending_plan))
-            return tuple(replies)
-
-    if has_photo:
-        final_reply, ack, reply_markup = _handle_photo_message(
-            client=client,
-            processor=processor,
-            photo_renderer=photo_renderer,
-            chat_id=chat_id,
-            message=message,
-        )
-        if ack:
-            client.send_message(chat_id=chat_id, text=ack)
-            replies.append(ack)
-        client.send_message(chat_id=chat_id, text=final_reply, reply_markup=reply_markup)
-        replies.append(final_reply)
-        return tuple(replies)
-    if text_value is not None and _extract_command_name(text_value) in REPUTATION_SNAPSHOT_COMMANDS:
-        if not processor.is_allowed_chat(chat_id):
-            return ()
-        ack = build_processing_ack(text=text_value)
-        if ack:
-            client.send_message(chat_id=chat_id, text=ack)
-            replies.append(ack)
-        delivery = processor.build_reputation_delivery(_extract_command_remainder(text_value))
-        _send_reputation_delivery(client=client, chat_id=chat_id, delivery=delivery)
-        replies.append(delivery.summary_text)
-        return tuple(replies)
-
-    plan = processor.build_reply_plan(chat_id=chat_id, text=text_value)
-    replies.extend(_send_text_reply_plan(client=client, chat_id=chat_id, plan=plan))
-    return tuple(replies)
-
-
-def _send_text_reply_plan(
-    *,
-    client: TelegramBotClient,
-    chat_id: str | int,
-    plan: TelegramTextReplyPlan,
-) -> list[str]:
-    """Send a TelegramTextReplyPlan to Telegram and return the texts sent.
-
-    Single-source-of-truth for the "ack → reputation delivery → reply"
-    sequence. Used by both the message-handler and the callback-query
-    dispatcher so they can't drift.
-    """
-    sent: list[str] = []
-    if plan.ack:
-        client.send_message(chat_id=chat_id, text=plan.ack)
-        sent.append(plan.ack)
-    if plan.reputation_delivery_factory is not None:
-        delivery = plan.reputation_delivery_factory()
-        _send_reputation_delivery(client=client, chat_id=chat_id, delivery=delivery)
-        sent.append(delivery.summary_text)
-        return sent
-    # Slow ops (e.g. /new codegen) opt-in to background threading via
-    # plan.run_in_background so the Telegram polling loop stays unblocked.
-    # All other reply_factory calls run synchronously so tests stay simple.
-    if plan.run_in_background and plan.reply_factory is not None:
-        def _bg_factory(
-            _client=client, _chat_id=chat_id, _plan=plan,
-        ) -> None:
-            try:
-                reply, factory_markup = _plan._execute_unpacked()
-                if reply:
-                    markup = factory_markup if factory_markup is not None else _plan.reply_markup
-                    _client.send_message(chat_id=_chat_id, text=reply, reply_markup=markup)
-            except Exception:
-                logger.exception(
-                    "Telegram background reply_factory failed chat_id=%s",
-                    mask_identifier(_chat_id),
-                )
-        threading.Thread(target=_bg_factory, daemon=True).start()
-        return sent
-    reply, factory_markup = plan._execute_unpacked()
-    if reply:
-        logger.debug(
-            "Telegram reply sending chat_id=%s text=%s",
-            mask_identifier(chat_id),
-            trim_for_log(reply, limit=320),
-        )
-        # Factory-provided markup (from e.g. lookup feedback keyboard) takes
-        # precedence over plan-level reply_markup; falls back to it when None.
-        markup = factory_markup if factory_markup is not None else plan.reply_markup
-        client.send_message(chat_id=chat_id, text=reply, reply_markup=markup)
-        sent.append(reply)
-    return sent
-
-
-def send_telegram_test_message(
-    *,
-    token: str,
-    chat_id: str,
-    message: str,
-    ssl_context: ssl.SSLContext | None = None,
-) -> int:
-    client = TelegramBotClient(token, ssl_context=ssl_context)
-    logger.info("Telegram test message sending chat_id=%s text=%s", mask_identifier(chat_id), trim_for_log(message))
-    client.send_message(chat_id=chat_id, text=message)
-    print(f"Sent Telegram test message to chat {chat_id}.")
-    return 0
-
-
-def _send_reputation_delivery(
-    *,
-    client: TelegramBotClient,
-    chat_id: str | int,
-    delivery: TelegramReputationDelivery,
-) -> None:
-    cleanup_paths = list(delivery.cleanup_paths)
-    try:
-        logger.debug(
-            "Telegram reputation delivery sending chat_id=%s text=%s attachments=%s",
-            mask_identifier(chat_id),
-            trim_for_log(delivery.summary_text, limit=320),
-            [attachment.path.name for attachment in delivery.attachments],
-        )
-        client.send_message(chat_id=chat_id, text=delivery.summary_text)
-        for attachment in delivery.attachments:
-            if attachment.kind == "document":
-                client.send_document(chat_id=chat_id, document_path=attachment.path, caption=attachment.caption)
-            elif attachment.kind == "photo":
-                client.send_photo(chat_id=chat_id, photo_path=attachment.path, caption=attachment.caption)
-            else:
-                logger.warning("Unknown Telegram attachment kind=%s path=%s", attachment.kind, attachment.path)
-    finally:
-        for path in cleanup_paths:
-            try:
-                path.unlink(missing_ok=True)
-            except Exception:
-                logger.debug("Could not remove temporary reputation artifact path=%s", path)
 
 
 def _handle_photo_message(
@@ -3957,17 +2745,6 @@ def _match_photo_clarification_option(
     return None
 
 
-def _extract_photo_clarification_override(content: str) -> str | None:
-    stripped = content.strip()
-    for prefix in ("否，", "否,", "否:", "否：", "否 ", "都不是，", "都不是,", "都不是:", "都不是：", "不是，", "不是,", "no,", "no:"):
-        if stripped.lower().startswith(prefix.lower()):
-            remainder = stripped[len(prefix):].strip()
-            return remainder or ""
-    if stripped in {"否", "都不是", "不是", "no"}:
-        return ""
-    return None
-
-
 def _resolve_photo_override_to_option(
     override_text: str,
     options: tuple[TelegramPhotoIntentOption, ...],
@@ -4009,16 +2786,6 @@ def _build_photo_identify_reply(
     item_label = "卡盒" if pending.parsed_item_kind == "sealed_box" else "卡片"
     title_suffix = f"：{pending.parsed_title}" if pending.parsed_title else ""
     return f"我目前看起來比較像 {_display_game_name(pending.parsed_game)}{item_label}{title_suffix}"
-
-
-def _is_text_intent_ambiguous(intent: "TelegramNaturalLanguageIntent | None") -> bool:
-    if intent is None:
-        return True
-    if intent.intent == "unknown":
-        return True
-    if intent.confidence is None:
-        return False
-    return intent.confidence < TEXT_AMBIGUITY_CONFIDENCE_THRESHOLD
 
 
 def _build_text_intent_candidates(
@@ -4211,43 +2978,6 @@ def _describe_intent_for_clarification(
     return None
 
 
-def _build_text_clarification_reply(
-    original_text: str,
-    options: tuple[TelegramTextIntentOption, ...],
-    top_intent: "TelegramNaturalLanguageIntent | None",
-) -> tuple[str, dict[str, object] | None]:
-    if top_intent is not None and top_intent.intent != "unknown":
-        head = "我看了一下你的訊息，但我還不想先亂猜你的意圖。"
-    else:
-        head = "我還不太確定你想叫我做什麼，所以先不亂動手。"
-    lines = [head, "請點按鈕（或回覆數字）："]
-    for option in options:
-        lines.append(f"{option.option_number}. {option.prompt}")
-    lines.append(f"{len(options) + 1}. 都不是，請回答：否，[您的意圖]")
-    return "\n".join(lines), _build_clarification_keyboard("topt", options)
-
-
-def _build_pending_text_retry_reply(
-    options: tuple[TelegramTextIntentOption, ...],
-) -> tuple[str, dict[str, object] | None]:
-    lines = ["我現在在等你確認剛剛那則訊息要怎麼處理，請點按鈕（或回覆數字）："]
-    for option in options:
-        lines.append(f"{option.option_number}. {option.prompt}")
-    lines.append("或輸入：否，[您的意圖]")
-    return "\n".join(lines), _build_clarification_keyboard("topt", options)
-
-
-def _match_text_clarification_option(
-    content: str,
-    options: tuple[TelegramTextIntentOption, ...],
-) -> TelegramTextIntentOption | None:
-    stripped = content.strip()
-    for option in options:
-        if stripped == str(option.option_number):
-            return option
-    return None
-
-
 def _parse_photo_caption_for_lookup(caption: str | None) -> tuple[str | None, str | None]:
     if caption is None:
         return None, None
@@ -4329,54 +3059,8 @@ def _format_lookup_ack_command(query: TelegramLookupQuery) -> str:
     return f"/price {query.game} {query.name}"
 
 
-def _encode_multipart_body(
-    *,
-    boundary: str,
-    fields: dict[str, str | None],
-    file_field: str,
-    file_path: Path,
-    content_type: str,
-) -> bytes:
-    body = bytearray()
-    for key, value in fields.items():
-        if value is None:
-            continue
-        body.extend(f"--{boundary}\r\n".encode("utf-8"))
-        body.extend(f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode("utf-8"))
-        body.extend(str(value).encode("utf-8"))
-        body.extend(b"\r\n")
-
-    body.extend(f"--{boundary}\r\n".encode("utf-8"))
-    body.extend(
-        (
-            f'Content-Disposition: form-data; name="{file_field}"; filename="{file_path.name}"\r\n'
-            f"Content-Type: {content_type}\r\n\r\n"
-        ).encode("utf-8")
-    )
-    body.extend(file_path.read_bytes())
-    body.extend(b"\r\n")
-    body.extend(f"--{boundary}--\r\n".encode("utf-8"))
-    return bytes(body)
-
-
-def _extract_command_name(text: str | None) -> str | None:
-    if text is None:
-        return None
-    content = text.strip()
-    if not content or not content.startswith("/"):
-        return None
-    command, *_ = content.split(maxsplit=1)
-    return command.split("@", 1)[0].lower()
-
-
-def _extract_command_remainder(text: str | None) -> str:
-    if text is None:
-        return ""
-    content = text.strip()
-    if not content:
-        return ""
-    _, _, remainder = content.partition(" ")
-    return remainder.strip()
+# _encode_multipart_body moved to telegram_core.transport with TelegramBotClient
+# (only that class used it; no remaining call sites in this module).
 
 
 def _value_or_none(parts: list[str], index: int) -> str | None:
