@@ -1899,6 +1899,35 @@ def test_callback_query_snsdel_deletes_rule_and_edits_message() -> None:
     assert "已刪除" in client.answered_callbacks[0]["text"]
 
 
+def test_callback_query_uses_async_handler_hook_and_returns_early() -> None:
+    client = FakeTelegramClient()
+
+    class _AsyncProcessor(TelegramCommandProcessor):
+        def handle_callback_query_async(self, **kwargs):
+            client.answer_callback_query(
+                callback_query_id=kwargs["callback_id"],
+                text="背景處理中",
+            )
+            return True
+
+    processor = _AsyncProcessor(
+        allowed_chat_ids=frozenset({"123"}),
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+    )
+
+    handle_telegram_callback_query(
+        client=client,
+        processor=processor,
+        callback_query=_callback_update(chat_id="123", data="goal:__goal_confirm__"),
+    )
+
+    assert len(client.answered_callbacks) == 1
+    assert client.answered_callbacks[0]["text"] == "背景處理中"
+    assert client.edited_messages == []
+
+
 def _setup_snsfb_processor(tmp_path):
     """Build a processor whose _sns_db is a real SnsDatabase pointing at a
     tmp file, seeded with one AccountWatch rule. Returns (processor, db, rule_id).

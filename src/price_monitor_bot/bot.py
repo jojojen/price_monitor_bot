@@ -315,7 +315,13 @@ class RegisteredCommand:
     handler: "Callable[[str, str], object]"
     ack: str | None = None
     background: bool = False
-    usage: str | None = None    # short argument hint, e.g. "playbest=播放最愛清單"; used to ground workflow drafting
+    # Short argument hint, e.g. "playbest=播放最愛清單"; used to ground workflow
+    # drafting and web chat tool routing.
+    usage: str | None = None
+    # Optional router-only guidance; kept on the same registry row as `usage`
+    # so chat/workflow share one source of truth for command semantics.
+    chat_tool_purpose: str | None = None
+    chat_tool_query_hint: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -3222,6 +3228,23 @@ def handle_telegram_callback_query(
         return
 
     prefix, _, payload = data.partition(":")
+    async_callback_handler = getattr(processor, "handle_callback_query_async", None)
+    if callable(async_callback_handler):
+        try:
+            handled_async = async_callback_handler(
+                client=client,
+                callback_id=callback_id,
+                chat_id=str(chat_id),
+                message_id=message_id,
+                prefix=prefix,
+                payload=payload,
+                original_text=original_text,
+            )
+        except Exception:
+            logger.exception("async callback handler failed prefix=%s", prefix)
+            handled_async = False
+        if handled_async:
+            return
     toast: str | None = "未知按鈕"
     new_text: str | None = None
     new_reply_markup: dict[str, object] | None = None
