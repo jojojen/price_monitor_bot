@@ -9,6 +9,7 @@ description = "Standalone TCG price-monitoring and Telegram bot module."
 requires-python = ">=3.12"
 dependencies = [
   "telegram-nl",
+  "telegram-core",
   "beautifulsoup4>=4.14,<5",
   "ImageHash>=4.3,<5",
   "Pillow>=11,<12",

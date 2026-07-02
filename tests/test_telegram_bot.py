@@ -18,6 +18,7 @@ from price_monitor_bot.natural_language import (
     _normalize_intent,
     fallback_route_telegram_natural_language,
 )
+import price_monitor_bot.bot as _bot_module
 from price_monitor_bot.bot import (
     PendingTelegramPhotoClarification,
     PendingTelegramTextClarification,
@@ -42,6 +43,7 @@ from price_monitor_bot.bot import (
     handle_telegram_message,
     parse_lookup_command,
     parse_reputation_snapshot_command,
+    run_telegram_polling,
     start_poll_watchdog,
 )
 
@@ -1787,7 +1789,7 @@ def _processor_with_sns_db(sns_db) -> TelegramCommandProcessor:
     (not importable from this venv), so we inline minimal equivalents here so
     the dispatch-mechanism tests remain valid.
     """
-    from price_monitor_bot.list_view import LIST_VIEW_MODE_READ, ListRow, build_list_view
+    from telegram_core.list_view import LIST_VIEW_MODE_READ, ListRow, build_list_view
 
     # -- inline SNS list view (mirrors build_snslist_view_fn logic) -----------
     def _sl_view(*, page: int = 0, mode: str = LIST_VIEW_MODE_READ):
@@ -2615,6 +2617,374 @@ def test_callback_query_cond_done_returns_to_watchlist_edit_mode() -> None:
     assert any("wback:" in r[0]["callback_data"] for r in kb_rows)
 
 
+# ── Single-watch edit view: wedit / wmkt / wprc / wback callbacks ───────────
+# Characterization tests locked in BEFORE the Phase 3 telegram_core polling
+# extraction (docs/TELEGRAM_CORE_EXTRACTION_PLAN.md Phase 3). These branches
+# had zero prior test coverage; they must keep passing UNMODIFIED once the
+# dispatch moves into telegram_core.polling with domain prefixes converted
+# to registry/hook-based routing.
+
+# A real-looking 40-hex-char watch id — _WPRC_TAG_RE requires exactly this
+# shape ([a-f0-9]{40}) to recognise a ForceReply price-update reply.
+_WPRC_WATCH_ID = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
+
+
+class _FakeWatchEditDatabase:
+    """Fake watch_db supporting the kwarg shapes wmkt/wprc actually use:
+    update_marketplace_watch(watch_id, markets=...) and
+    update_marketplace_watch(watch_id, price_threshold_jpy=...)."""
+
+    def __init__(self, watch: "_FakeMercariWatch") -> None:
+        self._w = watch
+        self.update_calls: list[dict] = []
+
+    def get_marketplace_watch(self, watch_id):
+        return self._w if watch_id == self._w.watch_id else None
+
+    def list_marketplace_watchlist(self, *, market: str | None = None):
+        if market is None or market in self._w.markets:
+            return [self._w]
+        return []
+
+    def update_marketplace_watch(self, watch_id, **kwargs):
+        self.update_calls.append({"watch_id": watch_id, **kwargs})
+        if "markets" in kwargs:
+            self._w.markets = tuple(kwargs["markets"])
+            for m in self._w.markets:
+                self._w.market_options.setdefault(m, {})
+        if "price_threshold_jpy" in kwargs:
+            self._w.price_threshold_jpy = kwargs["price_threshold_jpy"]
+        return True
+
+
+def _setup_watch_edit_callback(**watch_kwargs):
+    watch = _FakeMercariWatch(_WPRC_WATCH_ID, "alpha", **watch_kwargs)
+    db = _FakeWatchEditDatabase(watch)
+    proc = TelegramCommandProcessor(
+        allowed_chat_ids=frozenset({"123"}),
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        watch_db=db,
+    )
+    return proc, db, FakeTelegramClient()
+
+
+def test_callback_query_wedit_opens_single_watch_edit_view() -> None:
+    processor, db, client = _setup_watch_edit_callback()
+
+    handle_telegram_callback_query(
+        client=client,
+        processor=processor,
+        callback_query={
+            "id": "cbq-wedit",
+            "data": f"wedit:{_WPRC_WATCH_ID}",
+            "message": {
+                "message_id": 5,
+                "chat": {"id": "123"},
+                "text": "📋 Marketplace 追蹤  第 1/1 頁（共 1 筆）",
+            },
+        },
+    )
+
+    edited = client.edited_messages[0]
+    assert "✏️  alpha" in edited["text"]
+    assert "💰 上限：¥5,000" in edited["text"]
+    assert db.update_calls == []  # opening the view must not write
+
+
+def test_callback_query_wedit_unknown_watch_shows_toast() -> None:
+    processor, db, client = _setup_watch_edit_callback()
+
+    handle_telegram_callback_query(
+        client=client,
+        processor=processor,
+        callback_query={
+            "id": "cbq-wedit-missing",
+            "data": "wedit:doesnotexist",
+            "message": {"message_id": 5, "chat": {"id": "123"}, "text": "…"},
+        },
+    )
+
+    assert client.edited_messages == []
+    assert client.answered_callbacks[0]["text"] == "找不到該追蹤"
+
+
+def test_callback_query_wmkt_toggle_off_updates_db_and_rerenders() -> None:
+    processor, db, client = _setup_watch_edit_callback(markets=("mercari", "rakuma"))
+
+    handle_telegram_callback_query(
+        client=client,
+        processor=processor,
+        callback_query={
+            "id": "cbq-wmkt-off",
+            "data": f"wmkt:{_WPRC_WATCH_ID}:rakuma",
+            "message": {"message_id": 5, "chat": {"id": "123"}, "text": "✏️  alpha\n…"},
+        },
+    )
+
+    assert db.update_calls == [{"watch_id": _WPRC_WATCH_ID, "markets": ("mercari",)}]
+    assert client.answered_callbacks[0]["text"] == "已移除 🟣Rakuma"
+    edited = client.edited_messages[0]
+    platform_line = edited["text"].split("🛍 平台：")[1].split("\n")[0]
+    assert "🟣Rakuma" not in platform_line
+
+
+def test_callback_query_wmkt_toggle_on_adds_market() -> None:
+    processor, db, client = _setup_watch_edit_callback(markets=("mercari",))
+
+    handle_telegram_callback_query(
+        client=client,
+        processor=processor,
+        callback_query={
+            "id": "cbq-wmkt-on",
+            "data": f"wmkt:{_WPRC_WATCH_ID}:yuyutei",
+            "message": {"message_id": 5, "chat": {"id": "123"}, "text": "✏️  alpha\n…"},
+        },
+    )
+
+    assert db.update_calls == [{"watch_id": _WPRC_WATCH_ID, "markets": ("mercari", "yuyutei")}]
+    assert client.answered_callbacks[0]["text"] == "已加入 📚遊々亭"
+
+
+def test_callback_query_wmkt_refuses_to_remove_last_market() -> None:
+    processor, db, client = _setup_watch_edit_callback(markets=("mercari",))
+
+    handle_telegram_callback_query(
+        client=client,
+        processor=processor,
+        callback_query={
+            "id": "cbq-wmkt-last",
+            "data": f"wmkt:{_WPRC_WATCH_ID}:mercari",
+            "message": {"message_id": 5, "chat": {"id": "123"}, "text": "✏️  alpha\n…"},
+        },
+    )
+
+    assert db.update_calls == []
+    assert client.answered_callbacks[0]["text"] == "至少要保留一個平台"
+    # Refusing the removal still re-renders the (unchanged) edit view — the
+    # early-return only skips the DB write, not the rerender that follows it.
+    edited = client.edited_messages[0]
+    assert "🛍 平台：🛒Mercari" in edited["text"]
+
+
+def test_callback_query_wprc_sends_force_reply_with_tag() -> None:
+    processor, db, client = _setup_watch_edit_callback(price=5000)
+
+    handle_telegram_callback_query(
+        client=client,
+        processor=processor,
+        callback_query={
+            "id": "cbq-wprc",
+            "data": f"wprc:{_WPRC_WATCH_ID}",
+            "message": {"message_id": 5, "chat": {"id": "123"}, "text": "✏️  alpha\n…"},
+        },
+    )
+
+    assert len(client.sent_messages) == 1
+    sent = client.sent_messages[0]
+    assert "alpha" in sent
+    assert f"[wprc:{_WPRC_WATCH_ID}]" in sent
+    # wprc doesn't edit or rerender the original message, only sends a new one.
+    assert client.edited_messages == []
+
+
+def test_callback_query_wprc_unknown_watch_shows_toast() -> None:
+    processor, db, client = _setup_watch_edit_callback()
+
+    handle_telegram_callback_query(
+        client=client,
+        processor=processor,
+        callback_query={
+            "id": "cbq-wprc-missing",
+            "data": "wprc:doesnotexist",
+            "message": {"message_id": 5, "chat": {"id": "123"}, "text": "…"},
+        },
+    )
+
+    assert client.sent_messages == []
+    assert client.answered_callbacks[0]["text"] == "找不到該追蹤"
+
+
+def test_wprc_reply_updates_price_threshold_and_returns_to_edit_view() -> None:
+    """User replies to the [wprc:<id>] ForceReply prompt with a bare number
+    -> handle_telegram_message matches the tag, writes the new threshold,
+    and sends back the refreshed single-watch edit view."""
+    processor, db, client = _setup_watch_edit_callback(price=5000)
+
+    replies = handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda q: "unused",
+        message={
+            "chat": {"id": "123"},
+            "text": "25,000",
+            "reply_to_message": {"text": f"請輸入新目標上限：\n[wprc:{_WPRC_WATCH_ID}]"},
+        },
+    )
+
+    assert db.update_calls == [{"watch_id": _WPRC_WATCH_ID, "price_threshold_jpy": 25000}]
+    assert replies == ("✓ 已更新上限 ¥25,000",)
+    sent = client.sent_messages[0]
+    assert "✓ 已更新上限 ¥25,000" in sent
+    assert "💰 上限：¥25,000" in sent
+
+
+def test_wprc_reply_rejects_non_digit_price() -> None:
+    processor, db, client = _setup_watch_edit_callback(price=5000)
+
+    replies = handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda q: "unused",
+        message={
+            "chat": {"id": "123"},
+            "text": "not a number",
+            "reply_to_message": {"text": f"請輸入新目標上限：\n[wprc:{_WPRC_WATCH_ID}]"},
+        },
+    )
+
+    assert db.update_calls == []
+    assert replies == ("⚠️ 格式錯誤",)
+    assert "請輸入純數字" in client.sent_messages[0]
+
+
+def test_callback_query_wback_returns_to_watchlist_edit_mode() -> None:
+    processor, db, client = _setup_watch_edit_callback()
+
+    handle_telegram_callback_query(
+        client=client,
+        processor=processor,
+        callback_query={
+            "id": "cbq-wback",
+            "data": "wback",
+            "message": {"message_id": 5, "chat": {"id": "123"}, "text": "✏️  alpha\n…"},
+        },
+    )
+
+    edited = client.edited_messages[0]
+    assert "Marketplace 追蹤" in edited["text"]
+    assert edited["reply_markup"] is not None
+
+
+def test_callback_query_noop_answers_default_toast_without_rerender() -> None:
+    processor, _, client = _setup_watch_edit_callback()
+
+    handle_telegram_callback_query(
+        client=client,
+        processor=processor,
+        callback_query={
+            "id": "cbq-noop",
+            "data": "noop",
+            "message": {"message_id": 5, "chat": {"id": "123"}, "text": "label row"},
+        },
+    )
+
+    assert client.edited_messages == []
+    # `noop` is a silent-ack path: it never sets `toast`, so the pre-set
+    # default "未知按鈕" is what gets sent back to the client.
+    assert client.answered_callbacks[0]["text"] == "未知按鈕"
+
+
+def test_callback_query_unknown_prefix_answers_default_toast_and_logs(caplog) -> None:
+    processor, _, client = _setup_watch_edit_callback()
+
+    with caplog.at_level("WARNING"):
+        handle_telegram_callback_query(
+            client=client,
+            processor=processor,
+            callback_query={
+                "id": "cbq-unknown",
+                "data": "totally_unrecognized:xyz",
+                "message": {"message_id": 5, "chat": {"id": "123"}, "text": "…"},
+            },
+        )
+
+    assert client.edited_messages == []
+    assert client.answered_callbacks[0]["text"] == "未知按鈕"
+    assert any("Unknown callback_query prefix" in r.message for r in caplog.records)
+
+
+# ── fbpos: one-tap positive price feedback (no ForceReply) ─────────────────
+
+
+def test_callback_query_fbpos_writes_positive_feedback_and_shows_toast(tmp_path: Path) -> None:
+    from market_monitor.storage import MonitorDatabase
+
+    watch_db = MonitorDatabase(tmp_path / "fbpos.sqlite3")
+    watch_db.bootstrap()
+    item = TrackedItem(
+        item_id="tcg-fbpos0001",
+        item_type="tcg_sealed_box",
+        category="tcg",
+        title="MEGA アビスアイ",
+        attributes={"game": "pokemon", "item_kind": "sealed_box"},
+    )
+    watch_db.upsert_item(item)
+
+    fake_service = _FakeFeedbackService()
+    fake_service.positive_calls = []
+
+    def _submit_positive(*, item, spec, chat_id, original_fair_value_jpy):
+        fake_service.positive_calls.append({
+            "item_id": item.item_id, "chat_id": chat_id, "fair_value": original_fair_value_jpy,
+        })
+
+    fake_service.submit_positive = _submit_positive
+    processor = TelegramCommandProcessor(
+        allowed_chat_ids=frozenset({"123"}),
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        watch_db=watch_db,
+        feedback_service=fake_service,
+    )
+    client = FakeTelegramClient()
+
+    handle_telegram_callback_query(
+        client=client,
+        processor=processor,
+        callback_query={
+            "id": "cbq-fbpos",
+            "data": f"fbpos:{item.item_id}",
+            "message": {"message_id": 9, "chat": {"id": "123"}, "text": "lookup result"},
+        },
+    )
+
+    assert len(fake_service.positive_calls) == 1
+    assert fake_service.positive_calls[0]["item_id"] == item.item_id
+    assert client.answered_callbacks[0]["text"] == "👍 已記錄"
+    assert client.edited_messages == []  # fbpos never rerenders the message
+
+
+def test_callback_query_fbpos_missing_item_shows_toast(tmp_path: Path) -> None:
+    from market_monitor.storage import MonitorDatabase
+
+    watch_db = MonitorDatabase(tmp_path / "fbpos2.sqlite3")
+    watch_db.bootstrap()
+    processor = TelegramCommandProcessor(
+        allowed_chat_ids=frozenset({"123"}),
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        watch_db=watch_db,
+        feedback_service=_FakeFeedbackService(),
+    )
+    client = FakeTelegramClient()
+
+    handle_telegram_callback_query(
+        client=client,
+        processor=processor,
+        callback_query={
+            "id": "cbq-fbpos-missing",
+            "data": "fbpos:doesnotexist",
+            "message": {"message_id": 9, "chat": {"id": "123"}, "text": "lookup result"},
+        },
+    )
+
+    assert client.answered_callbacks[0]["text"] == "找不到該品項，可能已過期"
+
+
 # ── Paginated /hunt view ──────────────────────────────────────────────────────
 
 def _make_huntlist_processor(candidates: list[dict[str, object]]) -> tuple[TelegramCommandProcessor, dict]:
@@ -2623,7 +2993,7 @@ def _make_huntlist_processor(candidates: list[dict[str, object]]) -> tuple[Teleg
     Returns (processor, scratch) where scratch is a dict the test can inspect
     to see which candidate_id the deleter was called with.
     """
-    from price_monitor_bot.list_view import LIST_VIEW_MODE_READ, ListRow, build_list_view
+    from telegram_core.list_view import LIST_VIEW_MODE_READ, ListRow, build_list_view
 
     scratch: dict[str, object] = {"removed": [], "candidates": list(candidates)}
 
@@ -3015,161 +3385,8 @@ def test_fallback_does_not_misroute_single_handle_add_filter() -> None:
     assert intent.intent == "sns_add_account"
 
 
-# Live SnsDatabase round-trips for the bulk e2e path. The price_monitor_bot
-# venv doesn't import sns_monitor; skip these tests there.
-import pytest as _pytest
-try:
-    from sns_monitor.storage import SnsDatabase as _RealSnsDatabase  # noqa: F401
-    _HAVE_SNS_MONITOR = True
-except ImportError:
-    _HAVE_SNS_MONITOR = False
-
-
-@_pytest.mark.skipif(not _HAVE_SNS_MONITOR, reason="sns_monitor package not installed in this venv")
-def _make_bulk_processor_with_tcg_rules(tmp_path) -> tuple[TelegramCommandProcessor, object]:
-    from sns_monitor.models import AccountWatch
-    from sns_monitor.storage import SnsDatabase
-
-    db = SnsDatabase(tmp_path / "sns.sqlite3")
-    db.bootstrap()
-    for name, domains in [
-        ("poke_news", ("pokemon", "tcg")),
-        ("yugioh_jp", ("yugioh",)),
-        ("politics_bot", ("politic",)),  # should NOT be picked up
-    ]:
-        db.save_watch_rule(
-            AccountWatch(
-                rule_id=SnsDatabase._watch_rule_id("account", name),
-                screen_name=name,
-                user_id=None,
-                label=f"@{name}",
-                include_keywords=(),
-                domains=domains,
-                enabled=True,
-                schedule_minutes=15,
-                chat_id="0",
-                last_checked_at=None,
-            )
-        )
-    proc = TelegramCommandProcessor(
-        allowed_chat_ids=frozenset({"123"}),
-        lookup_renderer=lambda query: query.name,
-        board_loader=lambda: (_stub_board(),),
-        catalog_renderer=lambda: "catalog",
-        sns_db=db,
-    )
-    return proc, db
-
-
-@_pytest.mark.skipif(not _HAVE_SNS_MONITOR, reason="sns_monitor package not installed in this venv")
-def test_sns_bulk_add_filter_preview_lists_affected_and_sets_pending(tmp_path) -> None:
-    processor, _ = _make_bulk_processor_with_tcg_rules(tmp_path)
-
-    plan = processor._build_sns_bulk_add_filter_plan(
-        chat_id="123", target_domain="tcg", keywords=("抽選",)
-    )
-
-    assert "找到 2 個" in plan.reply
-    assert "@poke_news" in plan.reply
-    assert "@yugioh_jp" in plan.reply
-    assert "@politics_bot" not in plan.reply
-    kb = plan.reply_markup
-    assert kb is not None
-    flat = [b for row in kb["inline_keyboard"] for b in row]
-    assert {b["callback_data"] for b in flat} == {"bulk:c", "bulk:x"}
-    # Pending state must be installed.
-    pending = processor.get_pending_sns_bulk_update("123")
-    assert pending is not None
-    assert pending.bulk_target_domain == "tcg"
-    assert pending.keywords == ("抽選",)
-    assert len(pending.affected_rule_ids) == 2
-
-
-@_pytest.mark.skipif(not _HAVE_SNS_MONITOR, reason="sns_monitor package not installed in this venv")
-def test_sns_bulk_add_filter_confirm_callback_updates_db(tmp_path) -> None:
-    processor, db = _make_bulk_processor_with_tcg_rules(tmp_path)
-    # Set up pending via the preview builder.
-    processor._build_sns_bulk_add_filter_plan(
-        chat_id="123", target_domain="tcg", keywords=("抽選",)
-    )
-    client = FakeTelegramClient()
-
-    handle_telegram_callback_query(
-        client=client,
-        processor=processor,
-        callback_query={
-            "id": "cbq-bulk-c",
-            "data": "bulk:c",
-            "message": {
-                "message_id": 100,
-                "chat": {"id": "123"},
-                "text": "🎯 找到 2 個 tcg 相關帳號…",
-            },
-        },
-    )
-
-    # Both TCG rules now have the new keyword; politics_bot is untouched.
-    for handle in ("poke_news", "yugioh_jp"):
-        rule = db.get_watch_rule(_RealSnsDatabase._watch_rule_id("account", handle))
-        assert rule.include_keywords == ("抽選",)
-    politics = db.get_watch_rule(_RealSnsDatabase._watch_rule_id("account", "politics_bot"))
-    assert politics.include_keywords == ()
-    assert "✓ 已修改 2 個帳號" in client.edited_messages[0]["text"]
-    assert processor.get_pending_sns_bulk_update("123") is None
-
-
-@_pytest.mark.skipif(not _HAVE_SNS_MONITOR, reason="sns_monitor package not installed in this venv")
-def test_sns_bulk_add_filter_cancel_callback_leaves_db_untouched(tmp_path) -> None:
-    processor, db = _make_bulk_processor_with_tcg_rules(tmp_path)
-    processor._build_sns_bulk_add_filter_plan(
-        chat_id="123", target_domain="tcg", keywords=("抽選",)
-    )
-    client = FakeTelegramClient()
-
-    handle_telegram_callback_query(
-        client=client,
-        processor=processor,
-        callback_query={
-            "id": "cbq-bulk-x",
-            "data": "bulk:x",
-            "message": {
-                "message_id": 100,
-                "chat": {"id": "123"},
-                "text": "🎯 找到 2 個 tcg 相關帳號…",
-            },
-        },
-    )
-
-    for handle in ("poke_news", "yugioh_jp", "politics_bot"):
-        rule = db.get_watch_rule(_RealSnsDatabase._watch_rule_id("account", handle))
-        assert rule.include_keywords == ()
-    assert "已取消" in client.edited_messages[0]["text"]
-    assert processor.get_pending_sns_bulk_update("123") is None
-
-
-@_pytest.mark.skipif(not _HAVE_SNS_MONITOR, reason="sns_monitor package not installed in this venv")
-def test_sns_bulk_add_filter_callback_with_no_pending_shows_expired_toast(tmp_path) -> None:
-    processor, _ = _make_bulk_processor_with_tcg_rules(tmp_path)
-    # No pending — user is tapping a stale button.
-    client = FakeTelegramClient()
-
-    handle_telegram_callback_query(
-        client=client,
-        processor=processor,
-        callback_query={
-            "id": "cbq-bulk-stale",
-            "data": "bulk:c",
-            "message": {
-                "message_id": 100,
-                "chat": {"id": "123"},
-                "text": "old preview text",
-            },
-        },
-    )
-
-    assert client.answered_callbacks[0]["text"] == "操作已過期，請重新輸入"
-    # The message gets edited with the expired marker, but no DB write.
-    assert "已過期" in client.edited_messages[0]["text"]
+# SNS bulk preview/confirm/cancel e2e tests — moved to
+# aka_no_claw/tests/test_sns_bulk.py with the snsbulk flow (P3).
 
 
 # ── Price-feedback loop UI (Phase 1) ────────────────────────────────────────
@@ -3716,6 +3933,27 @@ def test_registry_callback_does_not_shadow_builtin_prefix() -> None:
     assert client.edited_messages == []
 
 
+def test_registry_callback_for_a_builtin_prefix_name_wins_over_the_builtin() -> None:
+    """The registry lookup (`processor._callback_registry.get(prefix)`) runs
+    BEFORE the elif chain for pg/del/close/cond/etc — registering a handler
+    under one of those names pre-empts the builtin entirely. Phase 3 (moving
+    domain prefixes like `cond`/`bulk` to registry dispatch) depends on this
+    exact precedence holding."""
+    processor = _registry_processor(
+        callback_handlers={"pg": lambda payload, original_text, chat_id: ("intercepted", "new text", None)}
+    )
+    client = FakeTelegramClient()
+
+    handle_telegram_callback_query(
+        client=client,
+        processor=processor,
+        callback_query=_callback_update(chat_id="123", data="pg:sl:0:r", text="old text"),
+    )
+
+    assert client.edited_messages[0]["text"] == "new text"
+    assert client.answered_callbacks[0]["text"] == "intercepted"
+
+
 # --- #52 live catalog fallback: unknown_text_handler intercept ----------------
 
 def _catalog_processor(handler):
@@ -3775,3 +4013,81 @@ def test_unknown_text_handler_exception_falls_through() -> None:
     # A throwing handler is swallowed; routing falls through to the menu.
     assert plan.reply != "大阪 晴"
     assert ("/search" in plan.reply) or ("Unknown command" in plan.reply)
+
+
+# --- run_telegram_polling processor injection (telegram_core extraction P0) -
+
+
+class _FakePollingClient:
+    """Enough of TelegramBotClient to get run_telegram_polling into its loop
+    and back out again without a real network call."""
+
+    def __init__(self, token: str, ssl_context=None) -> None:
+        self.token = token
+
+    def get_me(self) -> dict:
+        return {"username": "fake_bot"}
+
+    def get_updates(self, *, offset=None, timeout=20) -> list:
+        raise KeyboardInterrupt  # exit the poll loop immediately
+
+
+def test_run_telegram_polling_uses_injected_processor_factory(monkeypatch) -> None:
+    """#54-follow-on (telegram_core extraction Phase 0): the monkey-patch that
+    used to overwrite ``price_monitor_bot.bot.TelegramCommandProcessor`` at
+    module scope is gone — aka now injects its processor subclass via the
+    ``processor_factory`` parameter instead."""
+    monkeypatch.setattr(_bot_module, "TelegramBotClient", _FakePollingClient)
+    monkeypatch.setattr(_bot_module, "_drain_pending_updates", lambda client: None)
+    monkeypatch.setattr(_bot_module, "start_poll_watchdog", lambda **kwargs: None)
+
+    factory_calls: list[dict] = []
+
+    def factory(**kwargs):
+        factory_calls.append(kwargs)
+        return object()  # loop raises KeyboardInterrupt before touching processor
+
+    result = run_telegram_polling(
+        token="fake-token",
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        allowed_chat_ids=frozenset({"123"}),
+        processor_factory=factory,
+        watchdog_enabled=False,
+    )
+
+    assert result == 0
+    assert len(factory_calls) == 1
+    assert factory_calls[0]["lookup_renderer"] is not None
+
+
+def test_run_telegram_polling_without_factory_uses_default_processor_class(monkeypatch) -> None:
+    """No ``processor_factory`` passed → falls back to the module-level
+    ``TelegramCommandProcessor`` exactly like before the injection point
+    existed, so price_monitor_bot's own standalone usage is unaffected."""
+    monkeypatch.setattr(_bot_module, "TelegramBotClient", _FakePollingClient)
+    monkeypatch.setattr(_bot_module, "_drain_pending_updates", lambda client: None)
+    monkeypatch.setattr(_bot_module, "start_poll_watchdog", lambda **kwargs: None)
+
+    constructed: list = []
+    real_processor_cls = _bot_module.TelegramCommandProcessor
+
+    class _RecordingProcessor(real_processor_cls):
+        def __init__(self, **kwargs):
+            constructed.append(kwargs)
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr(_bot_module, "TelegramCommandProcessor", _RecordingProcessor)
+
+    result = run_telegram_polling(
+        token="fake-token",
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        allowed_chat_ids=frozenset({"123"}),
+        watchdog_enabled=False,
+    )
+
+    assert result == 0
+    assert len(constructed) == 1
