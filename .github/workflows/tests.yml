@@ -41,7 +41,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install \
             pytest \
-            beautifulsoup4 imagehash pillow truststore
+            beautifulsoup4 imagehash pillow playwright truststore
 
       - name: Print resolved sibling revisions
         run: |
