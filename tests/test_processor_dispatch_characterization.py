@@ -13,6 +13,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import pytest
+
 from tcg_tracker.hot_cards import HotCardBoard, HotCardEntry
 
 from price_monitor_bot.bot import RegisteredCommand, TelegramCommandProcessor
@@ -55,26 +57,25 @@ def _make_processor(**kwargs) -> TelegramCommandProcessor:
     return TelegramCommandProcessor(**kwargs)
 
 
-def test_builtin_help_wins_over_a_registered_help_handler() -> None:
-    """/start and /help are checked before registry dispatch — a registered
-    handler for the same name is unreachable."""
-    processor = _make_processor(
-        command_handlers={"/help": RegisteredCommand(lambda remainder, chat_id: "registry help")},
-    )
-    reply = processor.build_reply(chat_id="123", text="/help")
-    assert reply != "registry help"
-    assert "/trend pokemon" in reply  # the real catalog, unchanged
+def test_builtin_help_collision_rejected_at_construction() -> None:
+    """/start and /help are checked before registry dispatch, so a registered
+    handler for the same name could never be reached. Since telegram_core
+    D2.5 (aka_no_claw#77) that dead registration fails fast at construction
+    instead of being silently shadowed."""
+    with pytest.raises(ValueError, match="silently shadowed"):
+        _make_processor(
+            command_handlers={"/help": RegisteredCommand(lambda remainder, chat_id: "registry help")},
+        )
 
 
-def test_builtin_ping_and_status_are_not_overridable_by_registry() -> None:
-    processor = _make_processor(
-        command_handlers={
-            "/ping": RegisteredCommand(lambda remainder, chat_id: "registry pong"),
-            "/status": RegisteredCommand(lambda remainder, chat_id: "registry status"),
-        },
-    )
-    assert processor.build_reply(chat_id="123", text="/ping") == "pong"
-    assert processor.build_reply(chat_id="123", text="/status") == "OpenClaw Telegram bot is online."
+def test_builtin_ping_and_status_collisions_rejected_at_construction() -> None:
+    with pytest.raises(ValueError, match="silently shadowed"):
+        _make_processor(
+            command_handlers={
+                "/ping": RegisteredCommand(lambda remainder, chat_id: "registry pong"),
+                "/status": RegisteredCommand(lambda remainder, chat_id: "registry status"),
+            },
+        )
 
 
 def test_registry_dispatch_wins_over_hardcoded_price_command_set() -> None:

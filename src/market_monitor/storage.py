@@ -10,6 +10,8 @@ from hashlib import sha1
 from pathlib import Path
 from typing import Any, Iterator
 
+SCHEMA_VERSION = 1
+
 from .models import (
     CardImageFingerprint,
     DomainTrust,
@@ -304,6 +306,10 @@ class MonitorDatabase:
     def bootstrap(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as connection:
+            # Stamp schema version only if currently at 0 (implicit v0 or fresh DB).
+            current_version = connection.execute("PRAGMA user_version").fetchone()[0]
+            if current_version == 0:
+                connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             connection.executescript(SCHEMA_BASE)
             # Two cascading migrations:
             #   (a) legacy mercari_* tables    → marketplace_* v1 (single-source rows)

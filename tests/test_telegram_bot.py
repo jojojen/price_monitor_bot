@@ -3888,17 +3888,16 @@ def test_registry_command_error_returns_friendly_plan() -> None:
     assert "爆炸" in reply
 
 
-def test_registry_does_not_shadow_builtin_commands() -> None:
-    # A registry must never intercept built-ins like /ping.
-    called = []
-    processor = _registry_processor(
-        command_handlers={
-            "/ping": RegisteredCommand(lambda r, c: called.append(1) or "hijacked")
-        }
-    )
-    plan = processor.build_reply_plan(chat_id="123", text="/ping")
-    assert plan.execute() == "pong"
-    assert called == []
+def test_registry_builtin_collision_rejected_at_construction() -> None:
+    # A registry must never intercept built-ins like /ping. Since
+    # telegram_core D2.5 (aka_no_claw#77) such a dead registration fails
+    # fast at construction instead of being silently shadowed.
+    with pytest.raises(ValueError, match="silently shadowed"):
+        _registry_processor(
+            command_handlers={
+                "/ping": RegisteredCommand(lambda r, c: "hijacked")
+            }
+        )
 
 
 def test_registry_callback_routes_and_rerenders() -> None:
