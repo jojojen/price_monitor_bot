@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -795,7 +796,7 @@ def test_pending_photo_clarification_expires(tmp_path: Path) -> None:
             caption=None,
             file_id="photo-1",
             options=_ambiguous_photo_analysis().options,
-            created_at=0.0,
+            created_at=time.monotonic() - 1000.0,  # Set to 1000 seconds in the past to exceed TTL
         )
     )
     assert processor.get_pending_photo_clarification("123") is None
