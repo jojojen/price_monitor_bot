@@ -1,0 +1,55 @@
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build + offline test suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Companion repos, checked out as subdirectories (sibling deps declared
+      # as bare names in pyproject.toml, not resolvable from PyPI). These are
+      # injected via PYTHONPATH to the test suite below.
+      - uses: actions/checkout@v4
+        with:
+          repository: jojojen/telegram_nl
+          path: _deps/telegram_nl
+
+      - uses: actions/checkout@v4
+        with:
+          repository: jojojen/telegram_core
+          path: _deps/telegram_core
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Byte-compile source tree (syntax gate)
+        run: python -m compileall -q src tests
+
+      - name: Install runtime + test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install \
+            pytest \
+            beautifulsoup4 imagehash pillow truststore
+
+      - name: Print resolved sibling revisions
+        run: |
+          echo "price_monitor_bot: $(git rev-parse HEAD)"
+          echo "telegram_nl:       $(git -C _deps/telegram_nl rev-parse HEAD)"
+          echo "telegram_core:     $(git -C _deps/telegram_core rev-parse HEAD)"
+
+      - name: Run offline test suite
+        run: |
+          PYTHONPATH=.:src:_deps/telegram_nl/src:_deps/telegram_core/src \
+          python -m pytest -q -rs
