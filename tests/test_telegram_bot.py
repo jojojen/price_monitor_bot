@@ -25,6 +25,7 @@ from price_monitor_bot.bot import (
     PendingTelegramTextClarification,
     PhotoLookupReply,
     PollHeartbeat,
+    PollWatchdog,
     RegisteredCommand,
     TelegramCommandProcessor,
     TelegramFileAttachment,
@@ -3645,7 +3646,9 @@ def test_drain_pending_updates_reraises_non_conflict_error() -> None:
         _drain_pending_updates(_Client(), sleep_fn=lambda _: None)
 
 
-def test_start_poll_watchdog_sends_alert_on_stale_heartbeat(tmp_path: Path) -> None:
+def test_start_poll_watchdog_sends_alert_on_stale_heartbeat(
+    tmp_path: Path, poll_watchdog_factory
+) -> None:
     import time as _time
 
     hb = PollHeartbeat(tmp_path / "hb_wd")
@@ -3659,7 +3662,7 @@ def test_start_poll_watchdog_sends_alert_on_stale_heartbeat(tmp_path: Path) -> N
     # Write a heartbeat that is already 200s stale.
     (tmp_path / "hb_wd").write_text(str(_time.time() - 200))
 
-    start_poll_watchdog(
+    watchdog = poll_watchdog_factory(
         heartbeat=hb,
         client=_Client(),
         alert_chat_ids=frozenset(["999"]),
@@ -3667,8 +3670,180 @@ def test_start_poll_watchdog_sends_alert_on_stale_heartbeat(tmp_path: Path) -> N
         check_interval_seconds=0.05,
         exit_on_stale=False,
     )
+    watchdog.start()
     _time.sleep(0.2)
     assert any("心跳停止" in m for m in alerted)
+    # The factory stops+joins on teardown, so this watchdog cannot leak its
+    # daemon thread into later tests (the root cause of issue #3).
+
+
+class _NoopClient:
+    def send_message(self, *, chat_id, text, **_kw):
+        return {}
+
+
+def _fresh_heartbeat(tmp_path: Path, name: str = "hb") -> PollHeartbeat:
+    hb = PollHeartbeat(tmp_path / name)
+    hb.touch()  # fresh, not stale
+    return hb
+
+
+def test_watchdog_normal_start_stop_lifecycle(tmp_path: Path, poll_watchdog_factory) -> None:
+    wd = poll_watchdog_factory(
+        heartbeat=_fresh_heartbeat(tmp_path),
+        client=_NoopClient(),
+        alert_chat_ids=frozenset(["1"]),
+        max_age_seconds=10.0,
+        check_interval_seconds=0.02,
+        exit_on_stale=False,
+    )
+    assert wd.is_alive() is False
+    wd.start()
+    assert wd.is_alive() is True
+    wd.stop()
+    wd.join(timeout=2.0)
+    assert wd.is_alive() is False
+
+
+def test_watchdog_stop_before_start_is_safe(tmp_path: Path, poll_watchdog_factory) -> None:
+    wd = poll_watchdog_factory(
+        heartbeat=_fresh_heartbeat(tmp_path),
+        client=_NoopClient(),
+        alert_chat_ids=frozenset(["1"]),
+        max_age_seconds=10.0,
+        exit_on_stale=False,
+    )
+    # Must not raise and must not spawn a thread.
+    wd.stop()
+    wd.join(timeout=1.0)
+    assert wd.is_alive() is False
+
+
+def test_watchdog_double_stop_is_idempotent(tmp_path: Path, poll_watchdog_factory) -> None:
+    wd = poll_watchdog_factory(
+        heartbeat=_fresh_heartbeat(tmp_path),
+        client=_NoopClient(),
+        alert_chat_ids=frozenset(["1"]),
+        max_age_seconds=10.0,
+        check_interval_seconds=0.02,
+        exit_on_stale=False,
+    )
+    wd.start()
+    wd.stop()
+    wd.stop()  # second stop must be a no-op, not an error
+    wd.join(timeout=2.0)
+    assert wd.is_alive() is False
+
+
+def test_watchdog_double_start_keeps_single_thread(tmp_path: Path, poll_watchdog_factory) -> None:
+    import time as _time
+
+    wd = poll_watchdog_factory(
+        heartbeat=_fresh_heartbeat(tmp_path),
+        client=_NoopClient(),
+        alert_chat_ids=frozenset(["1"]),
+        max_age_seconds=10.0,
+        check_interval_seconds=0.02,
+        exit_on_stale=False,
+    )
+    wd.start()
+    first = wd._thread
+    wd.start()  # idempotent: must not spawn a second thread
+    assert wd._thread is first
+    wd.stop()
+    wd.join(timeout=2.0)
+    _time.sleep(0)  # yield
+
+
+def test_watchdog_stop_is_prompt_even_with_long_interval(
+    tmp_path: Path, poll_watchdog_factory
+) -> None:
+    """stop() must wake the loop immediately (Event.wait), not after a full
+    check interval. With a 30s interval, a sleep-based loop would keep the
+    thread alive well past join(timeout=2)."""
+    import time as _time
+
+    wd = poll_watchdog_factory(
+        heartbeat=_fresh_heartbeat(tmp_path),
+        client=_NoopClient(),
+        alert_chat_ids=frozenset(["1"]),
+        max_age_seconds=10.0,
+        check_interval_seconds=30.0,
+        exit_on_stale=False,
+    )
+    wd.start()
+    _time.sleep(0.05)
+    started = _time.monotonic()
+    wd.stop()
+    wd.join(timeout=2.0)
+    assert wd.is_alive() is False
+    assert _time.monotonic() - started < 1.0
+
+
+def test_watchdog_stop_prompt_when_client_send_blocks(
+    tmp_path: Path, poll_watchdog_factory
+) -> None:
+    """Even if the alert transport is slow, a stop() between checks brings the
+    watchdog down promptly (the block is bounded and the loop re-checks stop)."""
+    import threading
+    import time as _time
+
+    release = threading.Event()
+
+    class _SlowClient:
+        def send_message(self, *, chat_id, text, **_kw):
+            release.wait(timeout=0.3)
+            return {}
+
+    hb = PollHeartbeat(tmp_path / "hb_slow")
+    (tmp_path / "hb_slow").write_text(str(_time.time() - 200))  # already stale
+
+    wd = poll_watchdog_factory(
+        heartbeat=hb,
+        client=_SlowClient(),
+        alert_chat_ids=frozenset(["1"]),
+        max_age_seconds=10.0,
+        check_interval_seconds=0.02,
+        exit_on_stale=False,
+    )
+    wd.start()
+    _time.sleep(0.1)  # let it enter the (slow) alert path at least once
+    wd.stop()
+    release.set()
+    wd.join(timeout=2.0)
+    assert wd.is_alive() is False
+
+
+def test_watchdog_no_stale_warning_after_orderly_shutdown(
+    tmp_path: Path, poll_watchdog_factory, caplog
+) -> None:
+    """After stop()+join(), no further 'likely wedged' warning may be emitted,
+    even though the heartbeat stays stale. This is the exact symptom from #3:
+    a stopped watchdog must go silent."""
+    import logging as _logging
+    import time as _time
+
+    hb = PollHeartbeat(tmp_path / "hb_quiet")
+    (tmp_path / "hb_quiet").write_text(str(_time.time() - 200))  # stale forever
+
+    wd = poll_watchdog_factory(
+        heartbeat=hb,
+        client=_NoopClient(),
+        alert_chat_ids=frozenset(["1"]),
+        max_age_seconds=10.0,
+        check_interval_seconds=0.02,
+        exit_on_stale=False,
+    )
+    with caplog.at_level(_logging.ERROR, logger="telegram_core.polling"):
+        wd.start()
+        _time.sleep(0.1)
+        wd.stop()
+        wd.join(timeout=2.0)
+        # Drop everything logged while it was legitimately running; only what is
+        # emitted AFTER an orderly shutdown should count.
+        caplog.clear()
+        _time.sleep(0.15)  # would span several check intervals if still running
+    assert "likely wedged" not in caplog.text
 
 
 # ── /quiz command + quiz: callback ────────────────────────────────────────────

@@ -25,6 +25,8 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -105,6 +107,63 @@ def regression_db_path(tmp_path_factory) -> Path:
 @pytest.fixture(scope="session", autouse=True)
 def _wire_regression_db_path(regression_db_path: Path) -> None:
     os.environ.setdefault("OPENCLAW_REGRESSION_DB_PATH", str(regression_db_path))
+
+
+# Thread names owned by the poll-loop machinery (telegram_core.polling). Tests
+# must not leave any of these alive after they finish — a leaked "poll-watchdog"
+# keeps logging "poll loop likely wedged" into later tests (issue #3).
+_PROJECT_WORKER_THREAD_NAMES = ("poll-watchdog", "hb-beacon")
+
+
+def _project_worker_threads() -> list[str]:
+    return [
+        t.name
+        for t in threading.enumerate()
+        if t.is_alive() and t.name in _PROJECT_WORKER_THREAD_NAMES
+    ]
+
+
+@pytest.fixture
+def poll_watchdog_factory():
+    """Create PollWatchdog instances that are guaranteed to be stopped+joined.
+
+    Centralizes worker creation so every started watchdog has an owner and a
+    cleanup path (issue #3, Phase 2). The teardown runs unconditionally in
+    ``finally``, so even a failing/raising test cannot leak the daemon thread.
+    """
+    from price_monitor_bot.bot import PollWatchdog
+
+    created: list[PollWatchdog] = []
+
+    def _make(**kwargs) -> PollWatchdog:
+        wd = PollWatchdog(**kwargs)
+        created.append(wd)
+        return wd
+
+    try:
+        yield _make
+    finally:
+        for wd in created:
+            wd.stop()
+            wd.join(timeout=5.0)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _assert_no_leaked_workers():
+    """Session-end guard: no project-owned worker thread may survive the run.
+
+    Scoped to project-owned thread names only (not "all Python threads"), as the
+    issue requires, so pytest's own internal threads don't trip it."""
+    yield
+    # Give any just-stopped thread a brief grace to unwind before asserting.
+    deadline = time.monotonic() + 2.0
+    while _project_worker_threads() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    leaked = _project_worker_threads()
+    assert not leaked, (
+        f"project-owned worker threads survived the test session: {leaked!r} — "
+        "a poll watchdog / heartbeat beacon was started without a shutdown path"
+    )
 
 
 @pytest.fixture(autouse=True)

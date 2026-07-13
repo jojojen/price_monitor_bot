@@ -63,6 +63,7 @@ from telegram_core.transport import (
 )
 from telegram_core.polling import (
     PollHeartbeat,
+    PollWatchdog,
     _drain_pending_updates,
     _guess_current_page,
     _heartbeat_beacon,
@@ -2410,8 +2411,9 @@ def run_telegram_polling(
     heartbeat = PollHeartbeat(hb_path)
     heartbeat.touch()
     stale_after = float(max(120, poll_timeout * 4))
+    watchdog: PollWatchdog | None = None
     if watchdog_enabled and allowed_chat_ids:
-        start_poll_watchdog(
+        watchdog = start_poll_watchdog(
             heartbeat=heartbeat,
             client=client,
             alert_chat_ids=allowed_chat_ids,
@@ -2459,6 +2461,10 @@ def run_telegram_polling(
     except KeyboardInterrupt:
         logger.info("Telegram polling stopped by KeyboardInterrupt")
         print("Telegram polling stopped.")
+    finally:
+        if watchdog is not None:
+            watchdog.stop()
+            watchdog.join(timeout=5.0)
     return 0
 
 
